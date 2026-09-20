@@ -35,6 +35,7 @@
 #include "touge/frame.h"
 #include "touge/mesh.h"
 #include "touge/ride.h"
+#include "touge/rideclock.h"
 #include "touge/schedule.h"
 
 class TougeFastModule : public SinglePortModule, private concurrency::OSThread {

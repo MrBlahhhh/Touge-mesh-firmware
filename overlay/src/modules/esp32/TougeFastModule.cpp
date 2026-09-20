@@ -11,6 +11,7 @@
 #include "touge/cipher.h"
 #include <Preferences.h>
 #include <esp_random.h>
+#include <esp_timer.h>
 #include <string.h>
 
 using namespace touge;
@@ -65,6 +66,19 @@ const uint32_t SYNC_EVERY_MS = 2000;
 const char *NVS_NAMESPACE = "tougefast";
 const char *NVS_ID_KEY = "idceil";
 
+// The clock, at file scope because an interrupt handler cannot be handed a
+// context pointer and there is one 2.4 GHz radio anyway.
+RideClock rideClock;
+
+#ifdef PIN_GPS_PPS
+// IRAM, because the handler must not fault while flash is busy. Meshtastic
+// sets this pin to INPUT and never attaches anything, so it is ours to take.
+void IRAM_ATTR onGpsPulse()
+{
+    rideClock.onPulse((uint64_t)esp_timer_get_time());
+}
+#endif
+
 uint8_t speedToMph(float metresPerSecond) {
     float mph = metresPerSecond * 2.23694f;
     if (mph < 0) return 0;
@@ -79,6 +93,17 @@ TougeFastModule::TougeFastModule()
 {
     mesh_.reset();
     schedule_.reset();
+    rideClock.reset();
+
+    // The whole scheme rests on a second being a whole number of cycles: that
+    // is what makes the pulse a cycle boundary and a missed pulse harmless.
+    static_assert(1000 % CYCLE_MS == 0, "the cycle must divide a second exactly");
+
+#ifdef PIN_GPS_PPS
+    pinMode(PIN_GPS_PPS, INPUT);
+    attachInterrupt(digitalPinToInterrupt(PIN_GPS_PPS), onGpsPulse, RISING);
+#endif
+
     loadIdCounter();
 }
 
@@ -151,7 +176,8 @@ void TougeFastModule::syncChannel()
     // across a channel change would leave cars from the last ride on the map.
     mesh_.reset();
     schedule_.reset();
-    schedule_.rebuild(nodeDB->getNodeNum(), mesh_.riders(), MAX_RIDERS);
+    schedule_.rebuild(nodeDB->getNodeNum(), rideClock.locked((uint64_t)esp_timer_get_time()),
+                      mesh_.riders(), MAX_RIDERS);
     wantBeacon_ = false;
     sentOnce_ = false;
     mesh_.seedIds(idCeiling_ ? idCeiling_ - ID_BLOCK : nodeDB->getNodeNum());
@@ -217,7 +243,20 @@ void TougeFastModule::beacon(uint32_t nowMs)
 
     // Our turn comes round once a cycle, so the wait is bounded by that and
     // the gate above decides everything else.
-    if (!schedule_.inSlot(nowMs, CYCLE_MS)) return;
+    //
+    // GPS first. A pulse-disciplined cycle needs no reference car, so nobody's
+    // departure costs the ride its clock, and two cars meeting for the first
+    // time are already in step. When the receiver has no fix this falls back
+    // to the cycle recovered from the reference car's beacons rather than
+    // going quiet.
+    uint32_t phase = 0;
+    bool mine;
+    if (rideClock.phaseMs((uint64_t)esp_timer_get_time(), CYCLE_MS, phase)) {
+        mine = schedule_.inSlotAtPhase(phase, CYCLE_MS);
+    } else {
+        mine = schedule_.inSlot(nowMs, CYCLE_MS);
+    }
+    if (!mine) return;
 
     wantBeacon_ = false;
     lastBeaconMs_ = nowMs;
@@ -232,6 +271,8 @@ void TougeFastModule::beacon(uint32_t nowMs)
     p.speedMph = speedToMph((float)localPosition.ground_speed);
     p.hasFix = true;
     p.phoneAttached = false;
+    // Tells everyone else whether we are fit to be the reference car.
+    p.clockLocked = rideClock.locked((uint64_t)esp_timer_get_time());
 
     uint8_t battery = powerStatus ? (uint8_t)powerStatus->getBatteryChargePercent() : 255;
     p.batteryPct = battery;
@@ -338,7 +379,9 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
                 mesh_.note(f.src, p, HEARD_FAST, rx.rssi, FAST_HOPS - f.hops, nowMs);
                 // A new car changes everyone's rank, so the schedule is rebuilt
                 // rather than drifting until the next car happens to arrive.
-                if (mesh_.count() != before) schedule_.rebuild(nodeId_, mesh_.riders(), MAX_RIDERS);
+                if (mesh_.count() != before)
+                    schedule_.rebuild(nodeId_, rideClock.locked((uint64_t)esp_timer_get_time()),
+                                      mesh_.riders(), MAX_RIDERS);
             }
         }
 
@@ -346,7 +389,7 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         // landing is the start of a cycle. Only a frame heard directly is any
         // use for this: one that came via a neighbour carries that neighbour's
         // forwarding jitter and would drag the whole schedule sideways.
-        if (f.src == schedule_.referenceId() && f.hops == FAST_HOPS) schedule_.syncTo(rx.rxMs);
+        if (f.src == schedule_.referenceId() && f.hops == FAST_HOPS) schedule_.syncTo(rx.rxMs, CYCLE_MS);
 
         inject(f, body, f.len, rx.rssi);
 

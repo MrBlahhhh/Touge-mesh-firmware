@@ -15,6 +15,7 @@
 #include "sha256.h"
 #include "mesh.h"
 #include "schedule.h"
+#include "rideclock.h"
 
 using namespace touge;
 
@@ -531,7 +532,7 @@ void test_slot_is_our_rank_among_known_cars() {
 
   // Ids 100, 300, 500, 900. Ours is 300, so one car sorts below us.
   Schedule s;
-  s.rebuild(300, riders, MAX_RIDERS);
+  s.rebuild(300, false, riders, MAX_RIDERS);
   TEST_ASSERT_EQUAL_UINT8(1, s.slot());
   TEST_ASSERT_EQUAL_UINT8(4, s.known());
   TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
@@ -550,7 +551,7 @@ void test_every_car_computes_a_different_slot() {
     for (int other = 0; other < 4; other++)
       if (other != me) addRider(full[me], n++, ids[other]);
     Schedule s;
-    s.rebuild(ids[me], full[me], MAX_RIDERS);
+    s.rebuild(ids[me], false, full[me], MAX_RIDERS);
     slots[me] = s.slot();
     // Everyone agrees who the reference is, whoever is asking.
     TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
@@ -566,7 +567,7 @@ void test_the_lowest_node_number_is_the_reference() {
   addRider(riders, 1, 900);
 
   Schedule s;
-  s.rebuild(100, riders, MAX_RIDERS);
+  s.rebuild(100, false, riders, MAX_RIDERS);
   TEST_ASSERT_TRUE(s.weAreReference());
   TEST_ASSERT_EQUAL_UINT8(0, s.slot());
 }
@@ -576,7 +577,7 @@ void test_a_car_alone_does_not_wait_for_a_schedule() {
   // for a sync here would mean never transmitting at all.
   Schedule s;
   Rider none[MAX_RIDERS] = {};
-  s.rebuild(300, none, MAX_RIDERS);
+  s.rebuild(300, false, none, MAX_RIDERS);
   TEST_ASSERT_EQUAL_UINT8(1, s.known());
   TEST_ASSERT_TRUE(s.inSlot(0, 250));
   TEST_ASSERT_TRUE(s.inSlot(123, 250));
@@ -587,16 +588,19 @@ void test_slot_window_opens_once_per_cycle() {
   addRider(riders, 0, 100); // the reference
   addRider(riders, 1, 900);
 
-  Schedule s;
-  s.rebuild(300, riders, MAX_RIDERS); // ids 100, 300, 900: we are slot 1
-  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
-
-  s.syncTo(1000); // the reference's beacon landed here, so a cycle began
-  TEST_ASSERT_TRUE(s.synced());
-
   const uint32_t cycle = 250;
   const uint32_t width = Schedule::slotWidthMs(cycle); // 250 / 9 = 27
   TEST_ASSERT_EQUAL_UINT32(27, width);
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS); // ids 100, 300, 900: we are slot 1
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+  // Nobody is locked, so the reference is the lowest number and it holds slot
+  // zero. Its beacon lands on the cycle start with nothing to subtract.
+  TEST_ASSERT_EQUAL_UINT8(0, s.referenceSlot());
+
+  s.syncTo(1000, cycle); // the reference's beacon landed here, so a cycle began
+  TEST_ASSERT_TRUE(s.synced());
 
   // Slot 1 runs from 27 ms to 54 ms after the cycle starts.
   TEST_ASSERT_FALSE(s.inSlot(1000, cycle));
@@ -615,12 +619,12 @@ void test_slots_keep_running_across_the_millis_wrap() {
   addRider(riders, 0, 100);
   addRider(riders, 1, 900);
 
-  Schedule s;
-  s.rebuild(300, riders, MAX_RIDERS);
-  s.syncTo(0xFFFFFF00);
-
   const uint32_t cycle = 250;
   const uint32_t width = Schedule::slotWidthMs(cycle);
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  s.syncTo(0xFFFFFF00, cycle);
   // 0xFFFFFF00 + 250 wraps past zero. Unsigned subtraction carries the phase
   // through; signed would put the slot 49 days away.
   TEST_ASSERT_TRUE(s.inSlot((uint32_t)(0xFFFFFF00 + cycle + width), cycle));
@@ -632,7 +636,7 @@ void test_more_cars_than_slots_doubles_up_rather_than_falling_off() {
 
   // Our id sorts above all eight, so our rank is 8 and there are 9 slots.
   Schedule s;
-  s.rebuild(1000, riders, MAX_RIDERS);
+  s.rebuild(1000, false, riders, MAX_RIDERS);
   TEST_ASSERT_TRUE(s.slot() < MAX_SLOTS);
 }
 
@@ -644,9 +648,262 @@ void test_a_duplicate_node_number_does_not_corrupt_the_rank() {
   addRider(riders, 1, 300); // same as ours
 
   Schedule s;
-  s.rebuild(300, riders, MAX_RIDERS);
+  s.rebuild(300, false, riders, MAX_RIDERS);
   TEST_ASSERT_EQUAL_UINT8(1, s.slot());
   TEST_ASSERT_EQUAL_UINT8(2, s.known());
+}
+
+// ---- The GPS-disciplined clock ---------------------------------------------
+
+static const uint64_t SEC = 1000000ULL;
+
+void test_the_cycle_must_divide_a_second() {
+  // Everything else here rests on this. A cycle that does not divide a second
+  // would put the cycle boundary somewhere new after every pulse.
+  TEST_ASSERT_TRUE(cycleDividesSecond(250));
+  TEST_ASSERT_TRUE(cycleDividesSecond(200));
+  TEST_ASSERT_TRUE(cycleDividesSecond(1000));
+  TEST_ASSERT_FALSE(cycleDividesSecond(300));
+  TEST_ASSERT_FALSE(cycleDividesSecond(0));
+  TEST_ASSERT_FALSE(cycleDividesSecond(1500));
+}
+
+void test_no_phase_before_the_first_pulse() {
+  RideClock c;
+  c.reset();
+  uint32_t phase = 99;
+  TEST_ASSERT_FALSE(c.phaseMs(SEC, 250, phase));
+  TEST_ASSERT_FALSE(c.locked(SEC));
+}
+
+void test_phase_counts_from_the_pulse() {
+  RideClock c;
+  c.reset();
+  c.onPulse(10 * SEC);
+
+  uint32_t phase = 0;
+  TEST_ASSERT_TRUE(c.phaseMs(10 * SEC, 250, phase));
+  TEST_ASSERT_EQUAL_UINT32(0, phase);
+
+  TEST_ASSERT_TRUE(c.phaseMs(10 * SEC + 30000, 250, phase)); // 30 ms in
+  TEST_ASSERT_EQUAL_UINT32(30, phase);
+
+  // 260 ms after the pulse is 10 ms into the second cycle of that second.
+  TEST_ASSERT_TRUE(c.phaseMs(10 * SEC + 260000, 250, phase));
+  TEST_ASSERT_EQUAL_UINT32(10, phase);
+}
+
+void test_a_missed_pulse_does_not_move_the_cycle() {
+  // The reason the cycle has to divide a second: a whole second later is a
+  // whole number of cycles later, so one dropped pulse costs nothing.
+  RideClock c;
+  c.reset();
+  c.onPulse(10 * SEC);
+
+  uint32_t phase = 0;
+  TEST_ASSERT_TRUE(c.phaseMs(10 * SEC + 1200000, 250, phase)); // 1.2 s later
+  TEST_ASSERT_EQUAL_UINT32(200, phase);
+}
+
+void test_a_stopped_clock_reports_no_phase() {
+  // A receiver that loses its fix holds the last edge forever. Trusting it
+  // would look locked while drifting a second further out every second, which
+  // is worse than having no clock at all.
+  RideClock c;
+  c.reset();
+  c.onPulse(10 * SEC);
+
+  uint32_t phase = 0;
+  TEST_ASSERT_TRUE(c.phaseMs(10 * SEC + PULSE_STALE_US, 250, phase));
+  TEST_ASSERT_FALSE(c.phaseMs(10 * SEC + PULSE_STALE_US + 1, 250, phase));
+  TEST_ASSERT_FALSE(c.locked(10 * SEC + 10 * SEC));
+
+  // A fresh pulse brings it straight back.
+  c.onPulse(20 * SEC);
+  TEST_ASSERT_TRUE(c.phaseMs(20 * SEC, 250, phase));
+}
+
+void test_clock_refuses_a_cycle_it_cannot_keep() {
+  RideClock c;
+  c.reset();
+  c.onPulse(10 * SEC);
+  uint32_t phase = 0;
+  TEST_ASSERT_FALSE(c.phaseMs(10 * SEC, 300, phase));
+}
+
+void test_two_cars_on_gps_agree_without_ever_meeting() {
+  // The point of the whole exercise. Two cars that have never exchanged a
+  // packet, whose local microsecond counters are nowhere near each other,
+  // still put the cycle boundary in the same place because both pulses mark
+  // the same UTC second.
+  RideClock a, b;
+  a.reset();
+  b.reset();
+
+  const uint64_t aBoot = 5 * SEC;       // a has been up five seconds
+  const uint64_t bBoot = 98765 * SEC;   // b for rather longer
+  a.onPulse(aBoot);
+  b.onPulse(bBoot);
+
+  for (uint32_t offset = 0; offset < 250; offset += 7) {
+    uint32_t pa = 0, pb = 1;
+    TEST_ASSERT_TRUE(a.phaseMs(aBoot + offset * 1000, 250, pa));
+    TEST_ASSERT_TRUE(b.phaseMs(bBoot + offset * 1000, 250, pb));
+    TEST_ASSERT_EQUAL_UINT32(pa, pb);
+  }
+}
+
+void test_gps_slots_need_no_reference_car() {
+  // Without GPS a car that is not the reference and has heard no reference
+  // beacon free-runs, because it has nothing better to do. With GPS it keeps
+  // to its slot regardless, which is what removes the dependence on one car
+  // staying in range.
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 100);
+  addRider(riders, 1, 900);
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS); // slot 1 of 9
+  TEST_ASSERT_FALSE(s.synced());
+  TEST_ASSERT_TRUE(s.inSlot(0, 250)); // no epoch, so it free-runs
+
+  const uint32_t width = Schedule::slotWidthMs(250);
+  TEST_ASSERT_FALSE(s.inSlotAtPhase(0, 250));
+  TEST_ASSERT_TRUE(s.inSlotAtPhase(width, 250));
+  TEST_ASSERT_FALSE(s.inSlotAtPhase(width * 2, 250));
+}
+
+// ---- The mixed ride --------------------------------------------------------
+//
+// Some cars have a GNSS receiver of their own and some only have a phone.
+// Those two populations run off different clocks, and the only thing keeping
+// them on one cycle is that the reference car is always one of the locked ones.
+
+static void addLockedRider(Rider *r, size_t i, uint32_t id) {
+  addRider(r, i, id);
+  r[i].pos.clockLocked = true;
+}
+
+void test_a_locked_car_outranks_a_lower_numbered_free_running_one() {
+  // The bug this exists to catch: with the reference picked purely by node
+  // number, an unlocked car at 100 would take the job, free-run on its own
+  // timebase, and every phone-only car would sync to a cycle that the
+  // GPS-locked cars know nothing about. They would then collide every time
+  // rather than occasionally, which is worse than having no schedule at all.
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 100);       // lowest, but free-running
+  addLockedRider(riders, 1, 700); // locked
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT32(700, s.referenceId());
+}
+
+void test_the_lowest_locked_car_wins_among_several() {
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 100);
+  addLockedRider(riders, 1, 900);
+  addLockedRider(riders, 2, 500);
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT32(500, s.referenceId());
+}
+
+void test_our_own_lock_counts_too() {
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 100);
+  addRider(riders, 1, 900);
+
+  Schedule s;
+  s.rebuild(300, true, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT32(300, s.referenceId());
+  TEST_ASSERT_TRUE(s.weAreReference());
+}
+
+void test_nobody_locked_falls_back_to_the_lowest_number() {
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 100);
+  addRider(riders, 1, 900);
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
+}
+
+void test_sync_backs_out_the_reference_slot() {
+  // The consequence of letting a locked car outrank a lower-numbered one: the
+  // reference no longer holds slot zero, so its beacon marks its own slot
+  // rather than the start of the cycle. Not subtracting that would put every
+  // phone-only car a slot or two ahead of everyone else.
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 100);       // slot 0, free-running
+  addLockedRider(riders, 1, 700); // slot 2, and the reference
+
+  const uint32_t cycle = 250;
+  const uint32_t width = Schedule::slotWidthMs(cycle);
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS); // ids 100, 300, 700: we are slot 1
+  TEST_ASSERT_EQUAL_UINT32(700, s.referenceId());
+  TEST_ASSERT_EQUAL_UINT8(2, s.referenceSlot());
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+
+  // Its beacon lands at t=1000, two slots into the cycle, so the cycle began
+  // two slot widths earlier and our own slot is one width after that.
+  s.syncTo(1000, cycle);
+  TEST_ASSERT_TRUE(s.inSlot(1000 - width, cycle));
+  TEST_ASSERT_FALSE(s.inSlot(1000, cycle));
+  TEST_ASSERT_FALSE(s.inSlot(1000 - width * 2, cycle));
+}
+
+void test_a_mixed_ride_puts_everyone_on_one_cycle() {
+  // End to end. One car has GPS, one does not, and they must end up agreeing
+  // on where the cycle boundary is despite getting there different ways.
+  const uint32_t cycle = 250;
+  const uint32_t width = Schedule::slotWidthMs(cycle);
+
+  // The GPS car, id 700. Its pulse landed at a known microsecond.
+  RideClock clock;
+  clock.reset();
+  const uint64_t pulse = 4242 * SEC;
+  clock.onPulse(pulse);
+
+  Rider gpsRoster[MAX_RIDERS] = {};
+  addRider(gpsRoster, 0, 300);
+  Schedule gps;
+  gps.rebuild(700, true, gpsRoster, MAX_RIDERS); // ids 300, 700: we are slot 1
+  TEST_ASSERT_TRUE(gps.weAreReference());
+  TEST_ASSERT_EQUAL_UINT8(1, gps.slot());
+
+  // Find the instant its slot opens, which is when its beacon goes out.
+  uint64_t sendAt = 0;
+  for (uint32_t ms = 0; ms < cycle; ms++) {
+    uint32_t phase = 0;
+    TEST_ASSERT_TRUE(clock.phaseMs(pulse + (uint64_t)ms * 1000, cycle, phase));
+    if (gps.inSlotAtPhase(phase, cycle)) {
+      sendAt = pulse + (uint64_t)ms * 1000;
+      break;
+    }
+  }
+  TEST_ASSERT_EQUAL_UINT64(pulse + (uint64_t)width * 1000, sendAt);
+
+  // The phone-only car, id 300, hears that beacon and syncs to it. Its own
+  // millis() has nothing to do with the other car's microsecond counter.
+  const uint32_t heardAtMs = 55555;
+  Rider phoneRoster[MAX_RIDERS] = {};
+  addLockedRider(phoneRoster, 0, 700);
+  Schedule phone;
+  phone.rebuild(300, false, phoneRoster, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT32(700, phone.referenceId());
+  TEST_ASSERT_EQUAL_UINT8(1, phone.referenceSlot());
+  TEST_ASSERT_EQUAL_UINT8(0, phone.slot());
+  phone.syncTo(heardAtMs, cycle);
+
+  // Slot 0 belongs to the phone car, and it runs from one slot width before
+  // the beacon it just heard. The two cars never share a slot.
+  TEST_ASSERT_TRUE(phone.inSlot(heardAtMs - width, cycle));
+  TEST_ASSERT_FALSE(phone.inSlot(heardAtMs, cycle));
 }
 
 void setUp() {}
@@ -693,5 +950,19 @@ int main(int, char**) {
   RUN_TEST(test_slots_keep_running_across_the_millis_wrap);
   RUN_TEST(test_more_cars_than_slots_doubles_up_rather_than_falling_off);
   RUN_TEST(test_a_duplicate_node_number_does_not_corrupt_the_rank);
+  RUN_TEST(test_the_cycle_must_divide_a_second);
+  RUN_TEST(test_no_phase_before_the_first_pulse);
+  RUN_TEST(test_phase_counts_from_the_pulse);
+  RUN_TEST(test_a_missed_pulse_does_not_move_the_cycle);
+  RUN_TEST(test_a_stopped_clock_reports_no_phase);
+  RUN_TEST(test_clock_refuses_a_cycle_it_cannot_keep);
+  RUN_TEST(test_two_cars_on_gps_agree_without_ever_meeting);
+  RUN_TEST(test_gps_slots_need_no_reference_car);
+  RUN_TEST(test_a_locked_car_outranks_a_lower_numbered_free_running_one);
+  RUN_TEST(test_the_lowest_locked_car_wins_among_several);
+  RUN_TEST(test_our_own_lock_counts_too);
+  RUN_TEST(test_nobody_locked_falls_back_to_the_lowest_number);
+  RUN_TEST(test_sync_backs_out_the_reference_slot);
+  RUN_TEST(test_a_mixed_ride_puts_everyone_on_one_cycle);
   return UNITY_END();
 }

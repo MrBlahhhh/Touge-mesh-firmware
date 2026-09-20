@@ -81,7 +81,8 @@ size_t encodePosition(const Position& p, uint8_t* out, size_t cap) {
   out[8] = (uint8_t)((p.headingDeg % 360) / 2);
   out[9] = p.speedMph;
   out[10] = p.batteryPct;
-  out[11] = (uint8_t)((p.hasFix ? 0x01 : 0) | (p.phoneAttached ? 0x02 : 0));
+  out[11] = (uint8_t)((p.hasFix ? 0x01 : 0) | (p.phoneAttached ? 0x02 : 0) |
+                      (p.clockLocked ? 0x04 : 0));
   if (nameLen > 0) memcpy(out + POSITION_MIN, p.name, nameLen);
   return POSITION_MIN + nameLen;
 }
@@ -96,6 +97,7 @@ bool decodePosition(const uint8_t* in, size_t len, Position& out) {
   out.batteryPct = in[10];
   out.hasFix = (in[11] & 0x01) != 0;
   out.phoneAttached = (in[11] & 0x02) != 0;
+  out.clockLocked = (in[11] & 0x04) != 0;
 
   size_t nameLen = len - POSITION_MIN;
   // A sender on a newer build may carry a longer name than this build knows

@@ -71,6 +71,10 @@ struct Position {
   uint8_t batteryPct = 255; // 255 means unknown
   bool hasFix = false;
   bool phoneAttached = false;
+  // Whether this car's cycle is locked to its own GPS pulse. Everyone needs to
+  // know, because the reference car has to be one of the locked ones or the
+  // cars with GPS and the cars without end up on two different cycles.
+  bool clockLocked = false;
   // Carried only now and then. A name on every ping is pure airtime, and the
   // roster on the other end only needs to learn it once.
   char name[16] = {0};

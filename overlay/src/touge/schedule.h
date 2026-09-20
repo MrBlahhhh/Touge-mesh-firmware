@@ -45,22 +45,35 @@ class Schedule {
   // same ids and lands on the same answer, so no slot has to be handed out.
   // Cars that have not heard each other yet will disagree for a cycle or two;
   // that is what the jitter inside the slot is for.
-  void rebuild(uint32_t selfId, const Rider* riders, size_t maxRiders);
+  void rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders);
 
   uint8_t slot() const { return slot_; }
   uint8_t known() const { return known_; }
   uint32_t referenceId() const { return referenceId_; }
+  uint8_t referenceSlot() const { return referenceSlot_; }
   bool weAreReference() const { return known_ > 0 && referenceId_ == selfId_; }
 
-  // Pin the cycle to the reference car's beacon. It holds slot zero by
-  // construction, so the moment its beacon lands is the start of a cycle.
-  void syncTo(uint32_t heardAtMs);
+  // Pin the cycle to the reference car's beacon. The reference does not
+  // necessarily hold slot zero, because a GPS-locked car outranks a
+  // lower-numbered one that is free-running, so its own slot is subtracted to
+  // recover the start of the cycle.
+  void syncTo(uint32_t heardAtMs, uint32_t cycleMs);
   bool synced() const { return haveEpoch_; }
 
-  // True while we are inside our own slot. False when there is no schedule to
-  // speak of, in which case the caller should fall back to free-running: one
-  // car alone on a channel has nothing to collide with.
+  // True while we are inside our own slot, with the cycle recovered from the
+  // reference car's beacons. Falls back to free-running when there is no
+  // schedule to speak of: one car alone on a channel has nothing to collide
+  // with, and waiting for a sync that will never come means never speaking.
   bool inSlot(uint32_t nowMs, uint32_t cycleMs) const;
+
+  // The same question when a GPS pulse has already told us where in the cycle
+  // we are. Nothing about the reference car enters into it, which is the whole
+  // point: there is no node whose leaving costs everyone their clock, and two
+  // cars that have never heard each other are in step before they meet.
+  //
+  // The roster is still what decides which slot is ours. GPS says when the
+  // slots are, not whose they are.
+  bool inSlotAtPhase(uint32_t phaseMs, uint32_t cycleMs) const;
 
   // How wide one slot is. Exposed for the caller's jitter, which has to fit
   // inside it or it would push a transmission into the next car's slot.
@@ -70,6 +83,7 @@ class Schedule {
   uint32_t selfId_ = 0;
   uint32_t referenceId_ = 0;
   uint8_t slot_ = 0;
+  uint8_t referenceSlot_ = 0;
   uint8_t known_ = 0;
   uint32_t epochMs_ = 0;
   bool haveEpoch_ = false;

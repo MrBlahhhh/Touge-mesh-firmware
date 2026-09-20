@@ -167,13 +167,70 @@ out the same ordering from the same roster and transmits only in its own:
 - **Slot is rank.** How many node numbers on the ride sort below yours. No
   sorting, no allocation, no handing slots out, and every car computing it over
   the same roster gets the same answer.
-- **The lowest node number is the reference** and holds slot zero, so its
-  beacon landing is the start of a cycle. There is nothing to elect. Only a
-  frame heard directly is used for sync; one that came via a neighbour carries
-  that neighbour's forwarding jitter.
 - **A car alone free-runs.** No schedule worth keeping and nothing to collide
   with, and waiting for a sync that will never arrive would mean never
   transmitting at all.
+
+The roster says *whose* slot is whose. Something else has to say *when* the
+slots are, and there are two answers.
+
+### Where the cycle comes from
+
+**GPS, when there is a fix.** The GNSS pulse-per-second output marks the UTC
+second to well under a microsecond. Only the position inside the cycle ever
+matters, and because the cycle divides a second exactly, every second boundary
+is also a cycle boundary — so the time since the last pulse is the phase, and
+no date, no UTC seconds and no shared epoch are needed. A missed pulse is
+harmless for the same reason: 1200 ms after the last edge is still 200 ms into
+a cycle. `static_assert` holds the cycle to a divisor of 1000.
+
+This is what makes the schedule robust rather than merely present:
+
+- **No reference car.** Nobody's turning off down a side road costs the ride
+  its clock.
+- **Cars that have never met are already in step.** Two groups merging do not
+  have to converge first.
+- **Microseconds instead of milliseconds.** The old limit was the jitter on
+  whatever path a beacon took to reach you.
+
+A receiver that loses its fix freezes the last edge, which would look locked
+while drifting a second further out every second, so a pulse older than
+`PULSE_STALE_US` counts as no clock at all. The edge timestamp is written in an
+interrupt and read in a task, and a 64-bit value is two stores on a 32-bit
+core, so the reader retries across a sequence counter rather than risking a
+torn read that would put the clock wildly out.
+
+Meshtastic sets `PIN_GPS_PPS` to `INPUT` and never attaches a handler, so the
+pin is free.
+
+**The reference car, when there is no fix.** The fallback: one car's beacons
+mark the cycle for everyone else. Only a frame heard directly is used, since
+one relayed by a neighbour carries that neighbour's forwarding jitter. Good to
+a few milliseconds against a 27 ms slot, and it keeps the ride working in a
+tunnel, or on a board with no receiver fitted at all.
+
+### Mixed rides, which is the normal case
+
+Some cars will have a GNSS receiver on the board and some will only have a
+phone. That is fine, but it constrains who gets to be the reference, and
+getting it wrong is worse than having no schedule:
+
+**The reference must be a car whose own clock is GPS-locked.** Cars with a fix
+take the cycle from their pulse; cars without take it from the reference's
+beacons. If the reference is itself free-running, those two groups end up on
+cycles that have nothing to do with each other, and they collide *every time*
+rather than occasionally. So a locked car always wins the job and the lowest
+node number only breaks the tie. Every beacon carries a flag saying whether the
+sender's clock is locked, which is how everyone agrees on the choice.
+
+**The reference is therefore not always slot zero.** It used to be, back when
+it was simply the lowest number. Now a locked car can outrank a lower-numbered
+free-running one, so its beacon marks its own slot rather than the cycle start,
+and `syncTo` subtracts `referenceSlot` to recover the boundary.
+
+If nobody on the ride has a fix, the lowest number takes it and everyone
+free-runs together, which is consistent because none of them has anything
+better to agree on.
 
 Cardo's DMC does this (US10277748) with a leader election and a designated
 synchronizer. This is the same idea with the negotiation removed.
