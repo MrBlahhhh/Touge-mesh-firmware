@@ -107,11 +107,16 @@ bool FastRadio::begin(const FastNet& net) {
 
 bool FastRadio::retune(const FastNet& net) {
   if (!net.valid) return false;
-  if (net.wifiChannel == channel_) return true;
+  return retuneTo(net.wifiChannel);
+}
 
-  esp_err_t err = esp_wifi_set_channel(net.wifiChannel, WIFI_SECOND_CHAN_NONE);
-  if (err != ESP_OK) return false;
-  channel_ = net.wifiChannel;
+bool FastRadio::retuneTo(uint8_t channel) {
+  // Twelve to fourteen are not legal everywhere we ship, and a board that sets
+  // one goes deaf with no error reported anywhere.
+  if (channel < 1 || channel > 11) return false;
+  if (channel == channel_) return true;
+  if (esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) return false;
+  channel_ = channel;
   return true;
 }
 

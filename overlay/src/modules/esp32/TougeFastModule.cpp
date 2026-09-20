@@ -68,6 +68,22 @@ const uint32_t ID_BLOCK = 65536;
 // somebody reconfigures the ride.
 const uint32_t SYNC_EVERY_MS = 2000;
 
+// Silence long enough to mean something is wrong rather than that the road is
+// quiet. Every car beacons at least once per idle heartbeat, so four seconds
+// is more than one missed beacon from everybody at once.
+const uint32_t LOST_MS = 4000;
+
+// A second on each candidate while searching. Long enough to catch a beacon
+// from a car on its idle heartbeat, short enough that three channels is three
+// seconds rather than a minute.
+const uint32_t SCAN_DWELL_MS = 1000;
+
+// How long the reference watches before deciding the channel is unusable, and
+// the share of expected beacons below which it moves the ride. Generous: a hop
+// costs everyone a few seconds of scanning, so it has to be worth it.
+const uint32_t HOP_WINDOW_MS = 10000;
+const uint32_t HOP_KEEP_PCT = 40;
+
 const char *NVS_NAMESPACE = "tougefast";
 const char *NVS_ID_KEY = "idceil";
 
@@ -187,11 +203,20 @@ void TougeFastModule::syncChannel()
     sentOnce_ = false;
     mesh_.seedIds(idCeiling_ ? idCeiling_ - ID_BLOCK : nodeDB->getNodeNum());
 
+    // Which of the three non-overlapping channels this ride starts on. Derived,
+    // so two groups in the same car park usually begin apart.
+    hop_.begin(net_.chanByte);
+    lastHeardMs_ = millis();
+    lastScanMs_ = lastHeardMs_;
+    lastHopCheckMs_ = lastHeardMs_;
+    heardInWindow_ = 0;
+
     if (!fastRadio.begin(net_)) {
         LOG_WARN("touge: ESP-NOW would not start, LoRa only");
         started_ = false;
         return;
     }
+    fastRadio.retuneTo(hop_.channel());
     started_ = true;
     LOG_INFO("touge: fast lane up on wifi channel %u", (unsigned)fastRadio.channel());
 }
@@ -286,6 +311,10 @@ void TougeFastModule::beacon(uint32_t nowMs)
     // off it. Until this has gone out once we are invisible to their claim,
     // which is why an unclaimed car free-runs rather than waiting its turn.
     p.slot = schedule_.slot();
+    // And which channel we think the ride is on. Every car carries this, so a
+    // car that missed a hop learns it from whoever it hears next rather than
+    // from an announcement it had one chance at.
+    p.hop = hopPack(hop_.index(), hop_.generation());
 
     uint8_t battery = powerStatus ? (uint8_t)powerStatus->getBatteryChargePercent() : 255;
     p.batteryPct = battery;
@@ -388,12 +417,25 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         // replay the header with a payload of their own. Recording that first
         // would let them silence the genuine frame behind it.
         if (bodyLen == 0) continue;
+
+        // Authenticated, so it is genuinely one of ours. That makes it evidence
+        // the channel works, which is what the hop decision is measuring.
+        lastHeardMs_ = nowMs;
+        heardInWindow_++;
+
         if (!mesh_.firstSight(f.src, f.id, nowMs)) continue;
 
         if (f.type == FRAME_POSITION) {
             Position p;
             if (decodePosition(body, bodyLen, p)) {
                 mesh_.note(f.src, p, HEARD_FAST, rx.rssi, FAST_HOPS - f.hops, nowMs);
+                // A newer belief about the channel wins, wherever it comes
+                // from. Only acted on after the tag has already passed, so a
+                // stranger cannot walk the ride off its channel.
+                if (hop_.observe(p.hop)) {
+                    LOG_INFO("touge: following a hop to channel %u", (unsigned)hop_.channel());
+                    fastRadio.retuneTo(hop_.channel());
+                }
                 // Every position, not only the ones that change the head count.
                 // A car can keep its seat on the roster and still move slot, or
                 // gain a GPS fix and become the right car to keep time by, and
@@ -452,12 +494,66 @@ int32_t TougeFastModule::runOnce()
     sendDeferred(now);
     beacon(now);
     mesh_.age(now);
+    hopKeeping(now);
 
     // Fast enough that a 20 ms audio frame is never sitting in the queue long,
     // and slow enough that an idle board is not spinning. It also has to be
     // well under FORWARD_JITTER_MS: at a 20 ms pass every held frame would
     // come due in the same sweep and the jitter would buy nothing.
     return 5;
+}
+
+void TougeFastModule::hopKeeping(uint32_t nowMs)
+{
+    if (!started_) return;
+
+    uint32_t quiet = (uint32_t)(nowMs - lastHeardMs_);
+
+    // The scan, and the reason any of the rest of this is safe to do.
+    //
+    // A car that has heard nothing for a while is either alone, or on a
+    // channel the ride has left. It cannot tell which, and it must not assume
+    // the first: that is the failure where a car sits deaf on an abandoned
+    // channel forever, with the news it needs carried only on the channel it
+    // is no longer listening to.
+    //
+    // So it goes and looks. Three candidates, a second on each, and it is back
+    // with the group within a few seconds however it came to be lost - a
+    // missed hop, switched off during one, or simply joining late.
+    if (quiet >= LOST_MS) {
+        if ((uint32_t)(nowMs - lastScanMs_) >= SCAN_DWELL_MS) {
+            lastScanMs_ = nowMs;
+            uint8_t ch = hop_.scanNext();
+            LOG_DEBUG("touge: quiet for %ums, listening on channel %u", (unsigned)quiet, (unsigned)ch);
+            fastRadio.retuneTo(ch);
+        }
+        return;
+    }
+
+    // Only the car keeping time decides to move, so the ride does not have
+    // several cars hopping it in different directions at once.
+    if (!schedule_.weAreReference()) return;
+    if ((uint32_t)(nowMs - lastHopCheckMs_) < HOP_WINDOW_MS) return;
+    lastHopCheckMs_ = nowMs;
+
+    // Expected against received over the window. Every car beacons at least
+    // once per idle heartbeat, so a roster that is present but barely audible
+    // is interference rather than an empty road.
+    size_t cars = mesh_.count();
+    uint32_t expect = (uint32_t)cars * (HOP_WINDOW_MS / GATE_IDLE_MS);
+    uint32_t got = heardInWindow_;
+    heardInWindow_ = 0;
+    if (cars == 0 || expect == 0) return;
+
+    if (got * 100 / expect < HOP_KEEP_PCT) {
+        hop_.advance();
+        LOG_INFO("touge: %u of %u expected beacons, hopping to channel %u", (unsigned)got,
+                 (unsigned)expect, (unsigned)hop_.channel());
+        fastRadio.retuneTo(hop_.channel());
+        // Everyone else is still on the old channel and will not hear the next
+        // beacon. They go quiet, they scan, they find us. That is the design
+        // rather than a shortcoming of it.
+    }
 }
 
 void TougeFastModule::sendDeferred(uint32_t nowMs)

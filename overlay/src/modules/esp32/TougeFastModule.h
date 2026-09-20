@@ -35,6 +35,7 @@
 #include "touge/frame.h"
 #include "touge/mesh.h"
 #include "touge/ride.h"
+#include "touge/hop.h"
 #include "touge/rideclock.h"
 #include "touge/schedule.h"
 
@@ -57,6 +58,10 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
 
     void drainRadio(uint32_t nowMs);
     void sendDeferred(uint32_t nowMs);
+
+    // Follows the ride onto another channel when this one is unusable, and
+    // goes looking for it when we have lost track of where it went.
+    void hopKeeping(uint32_t nowMs);
     void beacon(uint32_t nowMs);
 
     // Hands a frame heard on 2.4 GHz to the rest of Meshtastic as though it
@@ -75,6 +80,7 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     touge::Mesh mesh_;
     touge::FastNet net_;
     touge::Schedule schedule_;
+    touge::Hop hop_;
 
     uint8_t keySeen_[touge::PSK_LEN] = {0};
     uint8_t keySeenLen_ = 0;
@@ -85,6 +91,10 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     uint32_t lastBeaconMs_ = 0;
     uint32_t lastNameMs_ = 0;
     uint32_t lastSyncMs_ = 0;
+    uint32_t lastHeardMs_ = 0;
+    uint32_t lastScanMs_ = 0;
+    uint32_t lastHopCheckMs_ = 0;
+    uint32_t heardInWindow_ = 0;
     // The gate has opened and we are waiting for our slot.
     bool wantBeacon_ = false;
     // Where we were when we last transmitted, for the distance gate.

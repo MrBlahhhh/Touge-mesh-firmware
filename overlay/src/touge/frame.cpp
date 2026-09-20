@@ -86,6 +86,7 @@ size_t encodePosition(const Position& p, uint8_t* out, size_t cap) {
   // a byte on every ping forever.
   out[11] = (uint8_t)((p.hasFix ? 0x01 : 0) | (p.phoneAttached ? 0x02 : 0) |
                       (p.clockLocked ? 0x04 : 0) | ((p.slot & 0x0F) << 4));
+  out[12] = p.hop;
   if (nameLen > 0) memcpy(out + POSITION_MIN, p.name, nameLen);
   return POSITION_MIN + nameLen;
 }
@@ -102,6 +103,7 @@ bool decodePosition(const uint8_t* in, size_t len, Position& out) {
   out.phoneAttached = (in[11] & 0x02) != 0;
   out.clockLocked = (in[11] & 0x04) != 0;
   out.slot = (uint8_t)((in[11] >> 4) & 0x0F);
+  out.hop = in[12];
 
   size_t nameLen = len - POSITION_MIN;
   // A sender on a newer build may carry a longer name than this build knows

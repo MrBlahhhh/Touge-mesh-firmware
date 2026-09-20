@@ -17,6 +17,7 @@
 #include "schedule.h"
 #include "rideclock.h"
 #include "hmac.h"
+#include "hop.h"
 
 using namespace touge;
 
@@ -1158,6 +1159,131 @@ void test_tags_match_compares_everything() {
   TEST_ASSERT_FALSE(tagsMatch(NULL, b, 8));
 }
 
+// ---- Hopping ---------------------------------------------------------------
+
+void test_the_candidates_do_not_overlap_each_other() {
+  // One, six and eleven are the only three channels in the band that do not
+  // overlap. Hopping between adjacent ones would move the ride without moving
+  // it out of the interference, which is the entire point of moving.
+  TEST_ASSERT_EQUAL_UINT8(1, HOP_CHANNELS[0]);
+  TEST_ASSERT_EQUAL_UINT8(6, HOP_CHANNELS[1]);
+  TEST_ASSERT_EQUAL_UINT8(11, HOP_CHANNELS[2]);
+  for (size_t i = 0; i < FAST_CHANNELS; i++) {
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT8(1, HOP_CHANNELS[i]);
+    TEST_ASSERT_LESS_OR_EQUAL_UINT8(11, HOP_CHANNELS[i]);
+  }
+}
+
+void test_generation_comparison_survives_the_wrap() {
+  // Six bits, so it wraps every 64 hops. A straight comparison would make
+  // generation 0 look older than 63 forever, and the ride would stop following
+  // hops the first time the counter went round.
+  TEST_ASSERT_TRUE(hopNewer(2, 1));
+  TEST_ASSERT_FALSE(hopNewer(1, 2));
+  TEST_ASSERT_FALSE(hopNewer(1, 1));
+  TEST_ASSERT_TRUE(hopNewer(0, 63));
+  TEST_ASSERT_FALSE(hopNewer(63, 0));
+  TEST_ASSERT_TRUE(hopNewer(5, 60));
+  TEST_ASSERT_FALSE(hopNewer(60, 5));
+}
+
+void test_hop_packs_into_one_byte() {
+  for (uint8_t idx = 0; idx < FAST_CHANNELS; idx++) {
+    for (uint8_t gen = 0; gen < 64; gen++) {
+      uint8_t gotIdx = 0xFF, gotGen = 0xFF;
+      hopUnpack(hopPack(idx, gen), gotIdx, gotGen);
+      TEST_ASSERT_EQUAL_UINT8(idx, gotIdx);
+      TEST_ASSERT_EQUAL_UINT8(gen, gotGen);
+    }
+  }
+}
+
+void test_a_newer_belief_wins_and_an_older_one_is_ignored() {
+  Hop h;
+  h.begin(0);
+  TEST_ASSERT_EQUAL_UINT8(1, h.channel());
+  TEST_ASSERT_EQUAL_UINT8(0, h.generation());
+
+  // A car on a later generation moves us.
+  TEST_ASSERT_TRUE(h.observe(hopPack(2, 1)));
+  TEST_ASSERT_EQUAL_UINT8(11, h.channel());
+  TEST_ASSERT_EQUAL_UINT8(1, h.generation());
+
+  // A car still on the old one does not drag us back.
+  TEST_ASSERT_FALSE(h.observe(hopPack(0, 0)));
+  TEST_ASSERT_EQUAL_UINT8(11, h.channel());
+
+  // The same generation on a different channel is not newer either, so two
+  // cars cannot fight over one generation number.
+  TEST_ASSERT_FALSE(h.observe(hopPack(1, 1)));
+  TEST_ASSERT_EQUAL_UINT8(11, h.channel());
+}
+
+void test_a_belief_naming_a_channel_that_does_not_exist_is_refused() {
+  // Two bits carry four values and there are three channels. The tag should
+  // stop a corrupted byte getting this far, but a bad index would index off
+  // the end of the table.
+  Hop h;
+  h.begin(0);
+  TEST_ASSERT_FALSE(h.observe(hopPack(3, 9)));
+  TEST_ASSERT_EQUAL_UINT8(1, h.channel());
+  TEST_ASSERT_EQUAL_UINT8(0, h.generation());
+}
+
+void test_advancing_moves_the_channel_and_the_generation() {
+  Hop h;
+  h.begin(0);
+  uint8_t was = h.channel();
+  h.advance();
+  TEST_ASSERT_NOT_EQUAL(was, h.channel());
+  TEST_ASSERT_EQUAL_UINT8(1, h.generation());
+
+  // Round the houses and back, without ever naming a channel off the list.
+  for (int i = 0; i < 20; i++) {
+    h.advance();
+    bool known = false;
+    for (size_t c = 0; c < FAST_CHANNELS; c++)
+      if (h.channel() == HOP_CHANNELS[c]) known = true;
+    TEST_ASSERT_TRUE(known);
+  }
+}
+
+void test_a_lost_car_visits_every_candidate() {
+  // The floor under everything else. A car that missed a hop, or was switched
+  // off during one, or joined the ride late, has three places to look and no
+  // dependence on ever having heard the announcement.
+  Hop h;
+  h.begin(0);
+  bool seen[FAST_CHANNELS] = {false, false, false};
+  for (int i = 0; i < FAST_CHANNELS; i++) {
+    uint8_t ch = h.scanNext();
+    for (size_t c = 0; c < FAST_CHANNELS; c++)
+      if (ch == HOP_CHANNELS[c]) seen[c] = true;
+  }
+  for (size_t c = 0; c < FAST_CHANNELS; c++) TEST_ASSERT_TRUE(seen[c]);
+}
+
+void test_searching_does_not_change_what_we_believe() {
+  // A car hunting for the group must not announce wherever it happened to
+  // stop. It takes the group's answer when it finds them; it does not impose
+  // the one it guessed on the way.
+  Hop h;
+  h.begin(1);
+  uint8_t gen = h.generation();
+  uint8_t idx = h.index();
+  h.scanNext();
+  h.scanNext();
+  TEST_ASSERT_EQUAL_UINT8(gen, h.generation());
+  TEST_ASSERT_EQUAL_UINT8(idx, h.index());
+}
+
+void test_two_rides_do_not_have_to_start_together() {
+  Hop a, b;
+  a.begin(0);
+  b.begin(1);
+  TEST_ASSERT_NOT_EQUAL(a.channel(), b.channel());
+}
+
 void setUp() {}
 void tearDown() {}
 
@@ -1228,5 +1354,14 @@ int main(int, char**) {
   RUN_TEST(test_a_frame_tag_covers_what_names_the_frame);
   RUN_TEST(test_the_tag_does_not_cover_the_hop_count);
   RUN_TEST(test_tags_match_compares_everything);
+  RUN_TEST(test_the_candidates_do_not_overlap_each_other);
+  RUN_TEST(test_generation_comparison_survives_the_wrap);
+  RUN_TEST(test_hop_packs_into_one_byte);
+  RUN_TEST(test_a_newer_belief_wins_and_an_older_one_is_ignored);
+  RUN_TEST(test_a_belief_naming_a_channel_that_does_not_exist_is_refused);
+  RUN_TEST(test_advancing_moves_the_channel_and_the_generation);
+  RUN_TEST(test_a_lost_car_visits_every_candidate);
+  RUN_TEST(test_searching_does_not_change_what_we_believe);
+  RUN_TEST(test_two_rides_do_not_have_to_start_together);
   return UNITY_END();
 }

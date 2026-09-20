@@ -82,12 +82,17 @@ struct Position {
   // yet. Free on the wire: it rides in the spare half of the flags byte, since
   // there are nine slots and four bits to put them in.
   uint8_t slot = 0x0F;
+  // Which channel this car believes the ride is on, and how recent that belief
+  // is: two bits of index, six of generation. Carried by every car rather than
+  // announced by one, so a car that missed a hop hears about it from whoever
+  // it hears from next instead of having had one chance at a command.
+  uint8_t hop = 0;
   // Carried only now and then. A name on every ping is pure airtime, and the
   // roster on the other end only needs to learn it once.
   char name[16] = {0};
 };
 
-static const size_t POSITION_MIN = 12;
+static const size_t POSITION_MIN = 13;
 
 size_t encodePosition(const Position& p, uint8_t* out, size_t cap);
 bool decodePosition(const uint8_t* in, size_t len, Position& out);

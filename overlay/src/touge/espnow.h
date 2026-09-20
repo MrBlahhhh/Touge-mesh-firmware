@@ -54,6 +54,10 @@ class FastRadio {
   // which happens when the phone reconfigures the primary channel mid-ride.
   bool retune(const FastNet& net);
 
+  // Move to a channel by number, for hopping and for searching. Separate from
+  // retune because that one is about a change of ride and this one is not.
+  bool retuneTo(uint8_t channel);
+
   void end();
 
   bool ready() const { return ready_; }
