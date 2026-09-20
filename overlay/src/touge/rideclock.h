@@ -31,6 +31,24 @@ namespace touge {
 // looks locked while drifting further out of step every second.
 static const uint64_t PULSE_STALE_US = 2500000;
 
+// A pulse is only believed once it has proved itself by arriving on time.
+//
+// The failure this exists for: a board whose variant declares a PPS pin but
+// has no receiver fitted, which is exactly a bare V4 without the expansion
+// kit. The pin floats, noise triggers the handler, and the board would
+// otherwise announce itself as GPS-locked and be handed the job of keeping
+// time for every car on the ride.
+//
+// Real pulses land a second apart to within microseconds; the tolerance here
+// is for interrupt latency, not for the receiver. Noise has to hit inside a
+// ten-millisecond window three times running to get through.
+static const uint64_t PULSE_PERIOD_US = 1000000;
+static const uint64_t PULSE_TOLERANCE_US = 10000;
+// A dropped pulse leaves a two-second gap, which is still a real edge and must
+// not cost the lock. Three seconds of silence is a receiver in trouble.
+static const uint32_t PULSE_MAX_SKIP = 2;
+static const uint32_t PULSE_LOCK_RUN = 3;
+
 // A cycle that does not divide a second would put the cycle boundary in a
 // different place after every pulse, and the schedule would walk.
 bool cycleDividesSecond(uint32_t cycleMs);
@@ -63,6 +81,9 @@ class RideClock {
   volatile uint32_t seq_ = 0;
   volatile uint64_t lastPulse_ = 0;
   volatile uint32_t pulses_ = 0;
+  // Consecutive pulses that arrived when one was due. Below PULSE_LOCK_RUN the
+  // clock reports nothing at all.
+  volatile uint32_t good_ = 0;
 };
 
 } // namespace touge

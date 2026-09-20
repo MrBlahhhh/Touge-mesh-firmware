@@ -657,6 +657,66 @@ void test_a_duplicate_node_number_does_not_corrupt_the_rank() {
 
 static const uint64_t SEC = 1000000ULL;
 
+// A pulse has to prove itself before it is believed, so a test that wants a
+// locked clock has to feed a run of well-spaced edges ending at `lastAt`.
+static void lockClock(RideClock &c, uint64_t lastAt) {
+  for (uint32_t i = PULSE_LOCK_RUN; i > 0; i--)
+    c.onPulse(lastAt - (uint64_t)i * PULSE_PERIOD_US);
+  c.onPulse(lastAt);
+}
+
+void test_one_pulse_is_not_enough_to_be_believed() {
+  // The failure being guarded against: a board whose variant declares a PPS
+  // pin with no receiver fitted, which is a bare V4 without the expansion kit.
+  // The pin floats, noise fires the handler, and an unguarded clock would have
+  // that board announce itself as the one keeping time for the whole ride.
+  RideClock c;
+  c.reset();
+  c.onPulse(10 * SEC);
+  TEST_ASSERT_FALSE(c.locked(10 * SEC));
+
+  c.onPulse(11 * SEC);
+  TEST_ASSERT_FALSE(c.locked(11 * SEC));
+  c.onPulse(12 * SEC);
+  TEST_ASSERT_FALSE(c.locked(12 * SEC));
+
+  // Fourth edge, third good gap.
+  c.onPulse(13 * SEC);
+  TEST_ASSERT_TRUE(c.locked(13 * SEC));
+}
+
+void test_edges_at_the_wrong_spacing_never_lock() {
+  RideClock c;
+  c.reset();
+  // Noise: plausible rate, wrong period. Ten of them and it is still not a
+  // clock, because none of them landed when a pulse was due.
+  for (int i = 1; i <= 10; i++) c.onPulse((uint64_t)i * 700000ULL);
+  TEST_ASSERT_FALSE(c.locked(7 * SEC));
+
+  // Just outside the tolerance is still wrong.
+  RideClock d;
+  d.reset();
+  for (int i = 1; i <= 10; i++)
+    d.onPulse((uint64_t)i * (PULSE_PERIOD_US + PULSE_TOLERANCE_US + 1000));
+  TEST_ASSERT_FALSE(d.locked(11 * SEC));
+}
+
+void test_a_dropped_pulse_does_not_cost_the_lock() {
+  // Two seconds is still a real edge, just a second late. Losing the lock over
+  // it would mean a receiver that stutters once never keeps one.
+  RideClock c;
+  c.reset();
+  lockClock(c, 10 * SEC);
+  TEST_ASSERT_TRUE(c.locked(10 * SEC));
+
+  c.onPulse(12 * SEC);
+  TEST_ASSERT_TRUE(c.locked(12 * SEC));
+
+  // Three is a receiver in trouble, and the run starts over.
+  c.onPulse(15 * SEC);
+  TEST_ASSERT_FALSE(c.locked(15 * SEC));
+}
+
 void test_the_cycle_must_divide_a_second() {
   // Everything else here rests on this. A cycle that does not divide a second
   // would put the cycle boundary somewhere new after every pulse.
@@ -679,7 +739,7 @@ void test_no_phase_before_the_first_pulse() {
 void test_phase_counts_from_the_pulse() {
   RideClock c;
   c.reset();
-  c.onPulse(10 * SEC);
+  lockClock(c, 10 * SEC);
 
   uint32_t phase = 0;
   TEST_ASSERT_TRUE(c.phaseMs(10 * SEC, 250, phase));
@@ -698,7 +758,7 @@ void test_a_missed_pulse_does_not_move_the_cycle() {
   // whole number of cycles later, so one dropped pulse costs nothing.
   RideClock c;
   c.reset();
-  c.onPulse(10 * SEC);
+  lockClock(c, 10 * SEC);
 
   uint32_t phase = 0;
   TEST_ASSERT_TRUE(c.phaseMs(10 * SEC + 1200000, 250, phase)); // 1.2 s later
@@ -711,22 +771,23 @@ void test_a_stopped_clock_reports_no_phase() {
   // is worse than having no clock at all.
   RideClock c;
   c.reset();
-  c.onPulse(10 * SEC);
+  lockClock(c, 10 * SEC);
 
   uint32_t phase = 0;
   TEST_ASSERT_TRUE(c.phaseMs(10 * SEC + PULSE_STALE_US, 250, phase));
   TEST_ASSERT_FALSE(c.phaseMs(10 * SEC + PULSE_STALE_US + 1, 250, phase));
   TEST_ASSERT_FALSE(c.locked(10 * SEC + 10 * SEC));
 
-  // A fresh pulse brings it straight back.
-  c.onPulse(20 * SEC);
+  // A fresh run of pulses brings it back. One would not: a single edge after
+  // a long silence is exactly what noise looks like.
+  lockClock(c, 20 * SEC);
   TEST_ASSERT_TRUE(c.phaseMs(20 * SEC, 250, phase));
 }
 
 void test_clock_refuses_a_cycle_it_cannot_keep() {
   RideClock c;
   c.reset();
-  c.onPulse(10 * SEC);
+  lockClock(c, 10 * SEC);
   uint32_t phase = 0;
   TEST_ASSERT_FALSE(c.phaseMs(10 * SEC, 300, phase));
 }
@@ -742,8 +803,8 @@ void test_two_cars_on_gps_agree_without_ever_meeting() {
 
   const uint64_t aBoot = 5 * SEC;       // a has been up five seconds
   const uint64_t bBoot = 98765 * SEC;   // b for rather longer
-  a.onPulse(aBoot);
-  b.onPulse(bBoot);
+  lockClock(a, aBoot);
+  lockClock(b, bBoot);
 
   for (uint32_t offset = 0; offset < 250; offset += 7) {
     uint32_t pa = 0, pb = 1;
@@ -867,7 +928,7 @@ void test_a_mixed_ride_puts_everyone_on_one_cycle() {
   RideClock clock;
   clock.reset();
   const uint64_t pulse = 4242 * SEC;
-  clock.onPulse(pulse);
+  lockClock(clock, pulse);
 
   Rider gpsRoster[MAX_RIDERS] = {};
   addRider(gpsRoster, 0, 300);
@@ -952,6 +1013,9 @@ int main(int, char**) {
   RUN_TEST(test_a_duplicate_node_number_does_not_corrupt_the_rank);
   RUN_TEST(test_the_cycle_must_divide_a_second);
   RUN_TEST(test_no_phase_before_the_first_pulse);
+  RUN_TEST(test_one_pulse_is_not_enough_to_be_believed);
+  RUN_TEST(test_edges_at_the_wrong_spacing_never_lock);
+  RUN_TEST(test_a_dropped_pulse_does_not_cost_the_lock);
   RUN_TEST(test_phase_counts_from_the_pulse);
   RUN_TEST(test_a_missed_pulse_does_not_move_the_cycle);
   RUN_TEST(test_a_stopped_clock_reports_no_phase);
