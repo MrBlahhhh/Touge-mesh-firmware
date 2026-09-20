@@ -42,16 +42,21 @@ MODULES="$DEST/src/modules/Modules.cpp"
 if grep -q 'TougeFastModule.h' "$MODULES"; then
   echo "==> Modules.cpp already carries the include"
 else
-  if ! grep -q '#include "modules/esp32/PaxcounterModule.h"' "$MODULES"; then
+  # Immediately after the ESP32 include block opens, not next to another
+  # module's include.
+  #
+  # Anchoring on PaxcounterModule.h put ours *inside* `#if
+  # !MESHTASTIC_EXCLUDE_PAXCOUNTER`, so a build with paxcounter switched off
+  # lost our header while still constructing the module - a link error that
+  # has nothing to do with either feature. Sitting directly under `#ifdef
+  # ARCH_ESP32` it is guarded by our own condition and nobody else's.
+  if ! grep -q '^#ifdef ARCH_ESP32$' "$MODULES"; then
     echo "error: could not find the include anchor in Modules.cpp" >&2
     echo "       upstream moved; patch it by hand and update this script" >&2
     exit 1
   fi
-  sed -i.bak '/#include "modules\/esp32\/PaxcounterModule.h"/i\
-#if !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST)\
-#include "modules/esp32/TougeFastModule.h"\
-#endif
-' "$MODULES"
+  # First occurrence only: the same line opens the setup block further down.
+  perl -0pi -e 's{(#ifdef ARCH_ESP32\n)}{$1."#if !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST)\n#include \"modules/esp32/TougeFastModule.h\"\n#endif\n"}e' "$MODULES"
   echo "==> added the include"
 fi
 
@@ -65,17 +70,19 @@ else
   # there first to be able to say "this car is already on 2.4 GHz, its LoRa
   # position is two seconds old, do not let it overwrite what we have".
   # Constructed after PositionModule, the stale write has already happened.
-  if ! grep -q 'positionModule = new PositionModule();' "$MODULES"; then
+  # Before the guard PositionModule sits in, not inside it.
+  #
+  # Inserting directly above the constructor put ours inside `#if
+  # !MESHTASTIC_EXCLUDE_GPS`, which quietly ties the 2.4 GHz mesh to whether
+  # this build has a GPS stack compiled in. Those are unrelated, and the
+  # coupling would only show up as the fast lane silently never starting.
+  if ! grep -Pzoq '#if !MESHTASTIC_EXCLUDE_GPS\n    positionModule = new PositionModule\(\);' "$MODULES"; then
     echo "error: could not find the setup anchor in Modules.cpp" >&2
     echo "       upstream moved; the module must be constructed BEFORE" >&2
     echo "       PositionModule or 2.4 GHz will not take precedence" >&2
     exit 1
   fi
-  sed -i.bak '/positionModule = new PositionModule();/i\
-#if defined(ARCH_ESP32) \&\& !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST)\
-    tougeFastModule = new TougeFastModule();\
-#endif
-' "$MODULES"
+  perl -0pi -e 's{(#if !MESHTASTIC_EXCLUDE_GPS\n    positionModule = new PositionModule\(\);)}{"#if defined(ARCH_ESP32) && !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST)\n    tougeFastModule = new TougeFastModule();\n#endif\n".$1}e' "$MODULES"
   echo "==> added the constructor, ahead of PositionModule"
 fi
 
