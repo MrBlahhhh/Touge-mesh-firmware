@@ -198,7 +198,7 @@ void TougeFastModule::syncChannel()
 
 bool TougeFastModule::transmit(uint8_t type, const uint8_t *body, size_t len, uint8_t hops)
 {
-    if (!started_ || len > FRAME_MAX_PAYLOAD) return false;
+    if (!started_ || len > FRAME_MAX_BODY) return false;
 
     uint8_t payload[FRAME_MAX_PAYLOAD];
     memcpy(payload, body, len);
@@ -209,10 +209,14 @@ bool TougeFastModule::transmit(uint8_t type, const uint8_t *body, size_t len, ui
     f.id = mesh_.nextId();
     f.hops = hops;
     f.chan = net_.chanByte;
-    f.payload = payload;
-    f.len = (uint16_t)len;
 
-    cipherApply(net_.key, f.src, f.id, f.type, payload, len);
+    // Encrypted, then tagged over the ciphertext and the header fields that
+    // name it. The id has to be settled first, because it is both half the
+    // encryption nonce and part of what the tag covers.
+    size_t sealed = seal(net_.key, f.src, f.id, f.type, f.chan, payload, len, sizeof(payload));
+    if (sealed == 0) return false;
+    f.payload = payload;
+    f.len = (uint16_t)sealed;
 
     uint8_t wire[FRAME_MAX];
     size_t n = encodeFrame(f, wire, sizeof(wire));
@@ -363,8 +367,6 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         if (!decodeFrame(rx.data, rx.len, f)) continue;
         if (f.chan != net_.chanByte) continue;      // another group on this channel
         if (f.src == nodeId_) continue;             // our own frame, echoed back
-        if (!mesh_.firstSight(f.src, f.id, nowMs)) continue;
-
         if (f.len > FRAME_MAX_PAYLOAD) continue;
 
         // The ciphertext is kept as it arrived, because forwarding has to put
@@ -375,11 +377,18 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
 
         uint8_t body[FRAME_MAX_PAYLOAD];
         memcpy(body, sealed, f.len);
-        cipherApply(net_.key, f.src, f.id, f.type, body, f.len);
+        size_t bodyLen = unseal(net_.key, f.src, f.id, f.type, f.chan, body, f.len);
+        // Forged, corrupted, or from a ride we are not on. Dropped before it
+        // reaches the dedupe table on purpose: the sender and the packet id are
+        // in clear on the wire, so anyone can read them off a real frame and
+        // replay the header with a payload of their own. Recording that first
+        // would let them silence the genuine frame behind it.
+        if (bodyLen == 0) continue;
+        if (!mesh_.firstSight(f.src, f.id, nowMs)) continue;
 
         if (f.type == FRAME_POSITION) {
             Position p;
-            if (decodePosition(body, f.len, p)) {
+            if (decodePosition(body, bodyLen, p)) {
                 size_t before = mesh_.count();
                 mesh_.note(f.src, p, HEARD_FAST, rx.rssi, FAST_HOPS - f.hops, nowMs);
                 // A new car changes everyone's rank, so the schedule is rebuilt
@@ -396,7 +405,7 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         // forwarding jitter and would drag the whole schedule sideways.
         if (f.src == schedule_.referenceId() && f.hops == FAST_HOPS) schedule_.syncTo(rx.rxMs, CYCLE_MS);
 
-        inject(f, body, f.len, rx.rssi);
+        inject(f, body, bodyLen, rx.rssi);
 
         // Forward for anyone who cannot hear the sender directly. The frame
         // keeps the original sender and id so every copy in flight is the same

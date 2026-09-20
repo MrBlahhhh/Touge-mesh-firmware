@@ -16,6 +16,7 @@
 #include "mesh.h"
 #include "schedule.h"
 #include "rideclock.h"
+#include "hmac.h"
 
 using namespace touge;
 
@@ -967,6 +968,105 @@ void test_a_mixed_ride_puts_everyone_on_one_cycle() {
   TEST_ASSERT_FALSE(phone.inSlot(heardAtMs, cycle));
 }
 
+// ---- Authentication --------------------------------------------------------
+
+void test_hmac_matches_rfc_4231() {
+  // Pinned against the published vectors rather than against itself. A tag
+  // that is self-consistently wrong still rejects every forgery and still
+  // accepts every genuine frame, so nothing else in this file would notice.
+  uint8_t key[20];
+  memset(key, 0x0b, sizeof(key));
+  uint8_t out[SHA256_LEN];
+  char got[SHA256_LEN * 2 + 1];
+
+  hmacSha256(key, sizeof(key), (const uint8_t *)"Hi There", 8, out);
+  hex(out, SHA256_LEN, got);
+  TEST_ASSERT_EQUAL_STRING("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", got);
+
+  const char *jefe = "Jefe";
+  const char *q = "what do ya want for nothing?";
+  hmacSha256((const uint8_t *)jefe, 4, (const uint8_t *)q, 28, out);
+  hex(out, SHA256_LEN, got);
+  TEST_ASSERT_EQUAL_STRING("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", got);
+}
+
+void test_hmac_handles_a_key_longer_than_a_block() {
+  // Over 64 bytes the key is replaced by its own digest. Getting this wrong
+  // only shows up with long keys, and ours are 32, so it is checked here
+  // rather than discovered later.
+  uint8_t key[131];
+  memset(key, 0xaa, sizeof(key));
+  const char *data = "Test Using Larger Than Block-Size Key - Hash Key First";
+  uint8_t out[SHA256_LEN];
+  char got[SHA256_LEN * 2 + 1];
+  hmacSha256(key, sizeof(key), (const uint8_t *)data, 54, out);
+  hex(out, SHA256_LEN, got);
+  TEST_ASSERT_EQUAL_STRING("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54", got);
+}
+
+void test_a_frame_tag_covers_what_names_the_frame() {
+  // Everything the tag is supposed to bind has to change it. A field left out
+  // is a field an attacker can rewrite on a frame that still verifies.
+  const uint8_t key[PSK_LEN] = {1, 2, 3};
+  const uint8_t cipher[4] = {9, 9, 9, 9};
+  uint8_t base[TAG_LEN];
+  frameTag(key, PSK_LEN, 100, 200, FRAME_POSITION, 0x54, cipher, sizeof(cipher), base);
+
+  uint8_t other[TAG_LEN];
+  frameTag(key, PSK_LEN, 101, 200, FRAME_POSITION, 0x54, cipher, sizeof(cipher), other);
+  TEST_ASSERT_FALSE(tagsMatch(base, other, TAG_LEN)); // sender
+
+  frameTag(key, PSK_LEN, 100, 201, FRAME_POSITION, 0x54, cipher, sizeof(cipher), other);
+  TEST_ASSERT_FALSE(tagsMatch(base, other, TAG_LEN)); // packet id
+
+  frameTag(key, PSK_LEN, 100, 200, FRAME_VOICE, 0x54, cipher, sizeof(cipher), other);
+  TEST_ASSERT_FALSE(tagsMatch(base, other, TAG_LEN)); // type
+
+  frameTag(key, PSK_LEN, 100, 200, FRAME_POSITION, 0x55, cipher, sizeof(cipher), other);
+  TEST_ASSERT_FALSE(tagsMatch(base, other, TAG_LEN)); // channel
+
+  const uint8_t flipped[4] = {9, 9, 8, 9};
+  frameTag(key, PSK_LEN, 100, 200, FRAME_POSITION, 0x54, flipped, sizeof(flipped), other);
+  TEST_ASSERT_FALSE(tagsMatch(base, other, TAG_LEN)); // ciphertext
+
+  const uint8_t otherKey[PSK_LEN] = {1, 2, 4};
+  frameTag(otherKey, PSK_LEN, 100, 200, FRAME_POSITION, 0x54, cipher, sizeof(cipher), other);
+  TEST_ASSERT_FALSE(tagsMatch(base, other, TAG_LEN)); // another ride's key
+
+  // And the same inputs give the same tag, or nothing would ever verify.
+  frameTag(key, PSK_LEN, 100, 200, FRAME_POSITION, 0x54, cipher, sizeof(cipher), other);
+  TEST_ASSERT_TRUE(tagsMatch(base, other, TAG_LEN));
+}
+
+void test_the_tag_does_not_cover_the_hop_count() {
+  // Deliberate. Every forwarding node decrements the hop count, so a tag over
+  // it would make a forwarded frame fail its own check at the next node and
+  // multi-hop would silently stop working.
+  //
+  // frameTag has no hop parameter at all, which is the enforcement. This test
+  // exists so that adding one is a decision somebody has to make on purpose.
+  const uint8_t key[PSK_LEN] = {7};
+  const uint8_t cipher[2] = {1, 2};
+  uint8_t a[TAG_LEN], b[TAG_LEN];
+  frameTag(key, PSK_LEN, 5, 6, FRAME_POSITION, 0x11, cipher, sizeof(cipher), a);
+  frameTag(key, PSK_LEN, 5, 6, FRAME_POSITION, 0x11, cipher, sizeof(cipher), b);
+  TEST_ASSERT_TRUE(tagsMatch(a, b, TAG_LEN));
+}
+
+void test_tags_match_compares_everything() {
+  uint8_t a[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  uint8_t b[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  TEST_ASSERT_TRUE(tagsMatch(a, b, 8));
+  // A difference in the last byte must be caught as surely as one in the
+  // first; an early return there is what leaks the tag a byte at a time.
+  b[7] = 9;
+  TEST_ASSERT_FALSE(tagsMatch(a, b, 8));
+  b[7] = 8;
+  b[0] = 9;
+  TEST_ASSERT_FALSE(tagsMatch(a, b, 8));
+  TEST_ASSERT_FALSE(tagsMatch(NULL, b, 8));
+}
+
 void setUp() {}
 void tearDown() {}
 
@@ -1028,5 +1128,10 @@ int main(int, char**) {
   RUN_TEST(test_nobody_locked_falls_back_to_the_lowest_number);
   RUN_TEST(test_sync_backs_out_the_reference_slot);
   RUN_TEST(test_a_mixed_ride_puts_everyone_on_one_cycle);
+  RUN_TEST(test_hmac_matches_rfc_4231);
+  RUN_TEST(test_hmac_handles_a_key_longer_than_a_block);
+  RUN_TEST(test_a_frame_tag_covers_what_names_the_frame);
+  RUN_TEST(test_the_tag_does_not_cover_the_hop_count);
+  RUN_TEST(test_tags_match_compares_everything);
   return UNITY_END();
 }

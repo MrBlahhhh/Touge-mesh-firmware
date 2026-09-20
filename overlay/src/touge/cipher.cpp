@@ -1,8 +1,35 @@
 #include "cipher.h"
+#include "hmac.h"
 #include <string.h>
 #include "mbedtls/aes.h"
 
 namespace touge {
+
+size_t seal(const uint8_t key[PSK_LEN], uint32_t src, uint32_t id, uint8_t type, uint8_t chan,
+            uint8_t* buf, size_t len, size_t cap) {
+  if (buf == nullptr || cap < len + TAG_LEN) return 0;
+  cipherApply(key, src, id, type, buf, len);
+  // Over the ciphertext, not the plaintext, so a receiver can reject a forgery
+  // without ever decrypting it.
+  frameTag(key, PSK_LEN, src, id, type, chan, buf, len, buf + len);
+  return len + TAG_LEN;
+}
+
+size_t unseal(const uint8_t key[PSK_LEN], uint32_t src, uint32_t id, uint8_t type, uint8_t chan,
+              uint8_t* buf, size_t len) {
+  if (buf == nullptr || len < TAG_LEN) return 0;
+  size_t body = len - TAG_LEN;
+
+  uint8_t want[TAG_LEN];
+  frameTag(key, PSK_LEN, src, id, type, chan, buf, body, want);
+  // Checked before anything is decrypted, and the buffer is left as it was on
+  // failure. Handing back half-decrypted bytes that failed authentication is
+  // how a caller ends up parsing an attacker's choice of garbage.
+  if (!tagsMatch(want, buf + body, TAG_LEN)) return 0;
+
+  cipherApply(key, src, id, type, buf, body);
+  return body;
+}
 
 void cipherApply(const uint8_t psk[PSK_LEN], uint32_t src, uint32_t id, uint8_t type, uint8_t* buf,
                  size_t len) {

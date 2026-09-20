@@ -32,6 +32,9 @@ static const size_t FRAME_HEADER = 14;
 // sets the ceiling for both. A LoRa frame is much smaller in practice.
 static const size_t FRAME_MAX = 250;
 static const size_t FRAME_MAX_PAYLOAD = FRAME_MAX - FRAME_HEADER;
+// What is left for the plaintext once the authentication tag has taken its
+// share of the payload.
+static const size_t FRAME_MAX_BODY = FRAME_MAX_PAYLOAD - 8;
 
 struct Frame {
   uint8_t type = 0;
