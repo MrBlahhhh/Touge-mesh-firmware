@@ -84,6 +84,10 @@ const uint32_t SCAN_DWELL_MS = 1000;
 const uint32_t HOP_WINDOW_MS = 10000;
 const uint32_t HOP_KEEP_PCT = 40;
 
+// How often the state of the fast lane is printed. Often enough to watch a
+// bench of boards find each other, rare enough not to drown the log.
+const uint32_t STATUS_EVERY_MS = 5000;
+
 const char *NVS_NAMESPACE = "tougefast";
 const char *NVS_ID_KEY = "idceil";
 
@@ -495,12 +499,48 @@ int32_t TougeFastModule::runOnce()
     beacon(now);
     mesh_.age(now);
     hopKeeping(now);
+    status(now);
 
     // Fast enough that a 20 ms audio frame is never sitting in the queue long,
     // and slow enough that an idle board is not spinning. It also has to be
     // well under FORWARD_JITTER_MS: at a 20 ms pass every held frame would
     // come due in the same sweep and the jitter would buy nothing.
     return 5;
+}
+
+void TougeFastModule::status(uint32_t nowMs)
+{
+    // One line that says whether any of this is working.
+    //
+    // Everything interesting here is invisible from outside: which slot a car
+    // claimed, who it decided keeps time, whether its clock came from a GPS
+    // pulse or from somebody's beacons, how many forwards it did not bother
+    // making. None of it shows on the OLED and none of it reaches the phone,
+    // so bringing up a bench of boards without this is watching three LEDs
+    // and guessing.
+    if (!started_) return;
+    if ((uint32_t)(nowMs - lastStatusMs_) < STATUS_EVERY_MS) return;
+    lastStatusMs_ = nowMs;
+
+    const char *clock = rideClock.locked((uint64_t)esp_timer_get_time()) ? "gps"
+                        : schedule_.synced()                            ? "beacon"
+                                                                        : "free";
+    // A plain buffer rather than String(n).c_str(). The temporary would live
+    // just long enough to be correct, which is not a property worth relying on
+    // inside a log call somebody will reformat later.
+    char slotText[8];
+    if (schedule_.claimed()) {
+        snprintf(slotText, sizeof(slotText), "%u", (unsigned)schedule_.slot());
+    } else {
+        strncpy(slotText, "none", sizeof(slotText) - 1);
+        slotText[sizeof(slotText) - 1] = 0;
+    }
+
+    LOG_INFO("touge: ch=%u slot=%s/%u known=%u ref=%08x%s clock=%s fast=%u suppressed=%u dropped=%u",
+             (unsigned)fastRadio.channel(), slotText, (unsigned)MAX_SLOTS,
+             (unsigned)schedule_.known(), (unsigned)schedule_.referenceId(),
+             schedule_.weAreReference() ? " (us)" : "", clock, (unsigned)fastNeighbours(),
+             (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped());
 }
 
 void TougeFastModule::hopKeeping(uint32_t nowMs)

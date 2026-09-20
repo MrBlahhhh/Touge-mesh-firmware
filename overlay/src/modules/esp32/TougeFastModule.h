@@ -62,6 +62,10 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // Follows the ride onto another channel when this one is unusable, and
     // goes looking for it when we have lost track of where it went.
     void hopKeeping(uint32_t nowMs);
+
+    // One periodic line saying what the fast lane thinks is going on. None of
+    // it is visible anywhere else.
+    void status(uint32_t nowMs);
     void beacon(uint32_t nowMs);
 
     // Hands a frame heard on 2.4 GHz to the rest of Meshtastic as though it
@@ -94,6 +98,7 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     uint32_t lastHeardMs_ = 0;
     uint32_t lastScanMs_ = 0;
     uint32_t lastHopCheckMs_ = 0;
+    uint32_t lastStatusMs_ = 0;
     uint32_t heardInWindow_ = 0;
     // The gate has opened and we are waiting for our slot.
     bool wantBeacon_ = false;
