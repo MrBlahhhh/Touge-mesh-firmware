@@ -82,6 +82,10 @@ class Hop {
   {
     index_ = index;
     generation_ = generation;
+    // The scan cursor follows the belief, the same way observe() and advance()
+    // both move it. Leaving it pointing at the channel we failed to reach
+    // would start the next search one step off from where we actually are.
+    scan_ = index;
   }
 
  private:

@@ -189,9 +189,17 @@ void TougeFastModule::saveIdCounter()
 void TougeFastModule::syncChannel()
 {
     CryptoKey key = channels.getKey(channels.getPrimaryIndex());
-    // length of -1 means the channel has no usable key. Nothing to derive from
-    // and nothing worth broadcasting in clear, so the fast lane stays down.
-    if (key.length < 0) {
+    // No key, no fast lane. -1 is "no usable key" and 0 is "encryption off",
+    // and neither gives us anything to derive from.
+    //
+    // Zero used to fall through, which was worse than running unencrypted: a
+    // key derived from no bytes is the same key on every board on earth, so
+    // every open ride shared one 2.4 GHz secret. Anyone running this firmware
+    // could have read and injected positions and speech on any other open
+    // ride within earshot, while the tag checks all passed and made it look
+    // authenticated. Refusing matches what the LoRa side already does with a
+    // channel it cannot encrypt.
+    if (key.length <= 0) {
         if (started_) {
             LOG_INFO("touge: primary channel lost its key, fast lane down");
             fastRadio.end();
@@ -340,7 +348,18 @@ void TougeFastModule::beacon(uint32_t nowMs)
     p.batteryPct = battery;
 
     if ((uint32_t)(nowMs - lastNameMs_) >= NAME_EVERY_MS) {
-        strncpy(p.name, owner.short_name, sizeof(p.name) - 1);
+        // The long name, because the frame has room for it.
+        //
+        // This sent short_name, which is four characters, and the receiving
+        // end wrote whatever arrived into long_name as well. So a car called
+        // "mattpixel" reached every other car on the fast lane as "matt", and
+        // the same node showed one name on the phone holding its own radio
+        // and a different one on everybody else's. The field is sixteen bytes
+        // and a long name is fifteen at most here, so the short one was never
+        // buying anything.
+        strncpy(p.name, owner.long_name[0] ? owner.long_name : owner.short_name,
+                sizeof(p.name) - 1);
+        p.name[sizeof(p.name) - 1] = 0;
         lastNameMs_ = nowMs;
     }
 
@@ -429,8 +448,14 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
             // read. No name stored means there is nothing to downgrade.
             if (n && n->long_name[0] == 0) {
                 meshtastic_User u = meshtastic_User_init_default;
-                strncpy(u.short_name, p.name, sizeof(u.short_name) - 1);
+                // The frame carries the long name, so the short one is the
+                // first few characters of it rather than a copy. Copying the
+                // whole thing into a five byte field just truncates it in a
+                // second place.
                 strncpy(u.long_name, p.name, sizeof(u.long_name) - 1);
+                strncpy(u.short_name, p.name, sizeof(u.short_name) - 1);
+                u.long_name[sizeof(u.long_name) - 1] = 0;
+                u.short_name[sizeof(u.short_name) - 1] = 0;
                 nodeDB->updateUser(f.src, u, channels.getPrimaryIndex());
             }
         }
@@ -596,7 +621,16 @@ int32_t TougeFastModule::runOnce()
     if (!started_) return 5000; // nothing to do until there is a channel
 
     drainRadio(now);
-    sendDeferred(now);
+    // Nothing held goes out while we are lost.
+    //
+    // Once the scan starts, the radio is parked on whichever candidate it is
+    // listening to this second, not on the ride's channel. Forwards and speech
+    // sent from there reach nobody and spend airtime and battery doing it.
+    // Beacons are the exception and still go: a beacon carries our channel
+    // belief, so two lost cars that land on the same candidate can find each
+    // other with one.
+    const bool lost = (uint32_t)(now - lastHeardMs_) >= LOST_MS;
+    if (!lost) sendDeferred(now);
     beacon(now);
     mesh_.age(now);
     hopKeeping(now);
@@ -642,6 +676,45 @@ void TougeFastModule::status(uint32_t nowMs)
              (unsigned)schedule_.known(), (unsigned)schedule_.referenceId(),
              schedule_.weAreReference() ? " (us)" : "", clock, (unsigned)fastNeighbours(nowMs),
              (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped());
+
+    // The same line, to the phone.
+    //
+    // Everything above is the only honest account of whether the fast lane is
+    // working, and until now it went to a serial cable and nowhere else. So
+    // diagnosing a silent 2.4 GHz lane meant unplugging a board from a car and
+    // carrying it to a laptop, and from the app the lane was indistinguishable
+    // from a quiet road. The phone can infer per-car which lane a position
+    // came over, but not why the lane is down, what channel the radio settled
+    // on, or whether it can hear anybody at all.
+    //
+    // Goes out on the private port as JSON, which the app already parses and
+    // which ignores keys it does not know, so an older app sees nothing new
+    // rather than breaking. sendToPhone only queues for BLE; none of this
+    // touches the air.
+    {
+        char js[192];
+        int n = snprintf(
+            js, sizeof(js),
+            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u}}",
+            (unsigned)fastRadio.channel(), schedule_.claimed() ? (int)schedule_.slot() : -1,
+            (unsigned)schedule_.known(), (unsigned)fastNeighbours(nowMs), clock,
+            (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped());
+        if (n > 0 && (size_t)n < sizeof(js)) {
+            meshtastic_MeshPacket *sp = router->allocForSending();
+            if (sp) {
+                sp->from = nodeId_;
+                sp->to = NODENUM_BROADCAST;
+                sp->channel = channels.getPrimaryIndex();
+                sp->hop_limit = 0;
+                sp->hop_start = 0;
+                sp->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+                sp->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
+                memcpy(sp->decoded.payload.bytes, js, (size_t)n);
+                sp->decoded.payload.size = (uint16_t)n;
+                service->sendToPhone(sp);
+            }
+        }
+    }
 
     // Signal strength per car, which is the number that settles an argument
     // about antennas.
