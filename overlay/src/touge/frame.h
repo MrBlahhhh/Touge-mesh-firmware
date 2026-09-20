@@ -78,6 +78,10 @@ struct Position {
   // know, because the reference car has to be one of the locked ones or the
   // cars with GPS and the cars without end up on two different cycles.
   bool clockLocked = false;
+  // Which transmit slot this car holds, or SLOT_NONE if it has not claimed one
+  // yet. Free on the wire: it rides in the spare half of the flags byte, since
+  // there are nine slots and four bits to put them in.
+  uint8_t slot = 0x0F;
   // Carried only now and then. A name on every ping is pure airtime, and the
   // roster on the other end only needs to learn it once.
   char name[16] = {0};

@@ -282,6 +282,10 @@ void TougeFastModule::beacon(uint32_t nowMs)
     p.phoneAttached = false;
     // Tells everyone else whether we are fit to be the reference car.
     p.clockLocked = rideClock.locked((uint64_t)esp_timer_get_time());
+    // And which slot we are holding, which is how anyone else knows to stay
+    // off it. Until this has gone out once we are invisible to their claim,
+    // which is why an unclaimed car free-runs rather than waiting its turn.
+    p.slot = schedule_.slot();
 
     uint8_t battery = powerStatus ? (uint8_t)powerStatus->getBatteryChargePercent() : 255;
     p.batteryPct = battery;
@@ -389,13 +393,15 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         if (f.type == FRAME_POSITION) {
             Position p;
             if (decodePosition(body, bodyLen, p)) {
-                size_t before = mesh_.count();
                 mesh_.note(f.src, p, HEARD_FAST, rx.rssi, FAST_HOPS - f.hops, nowMs);
-                // A new car changes everyone's rank, so the schedule is rebuilt
-                // rather than drifting until the next car happens to arrive.
-                if (mesh_.count() != before)
-                    schedule_.rebuild(nodeId_, rideClock.locked((uint64_t)esp_timer_get_time()),
-                                      mesh_.riders(), MAX_RIDERS);
+                // Every position, not only the ones that change the head count.
+                // A car can keep its seat on the roster and still move slot, or
+                // gain a GPS fix and become the right car to keep time by, and
+                // either of those has to reach the schedule when it happens
+                // rather than when somebody else next turns up. Nine slots
+                // across eight riders is not work worth conserving.
+                schedule_.rebuild(nodeId_, rideClock.locked((uint64_t)esp_timer_get_time()),
+                                  mesh_.riders(), MAX_RIDERS);
             }
         }
 

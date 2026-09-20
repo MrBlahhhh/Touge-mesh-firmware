@@ -220,6 +220,8 @@ void test_position_round_trip() {
   p.batteryPct = 77;
   p.hasFix = true;
   p.phoneAttached = false;
+  p.clockLocked = true;
+  p.slot = 6;
   strcpy(p.name, "mattmoto");
 
   uint8_t buf[64];
@@ -235,6 +237,10 @@ void test_position_round_trip() {
   TEST_ASSERT_EQUAL_UINT8(77, got.batteryPct);
   TEST_ASSERT_TRUE(got.hasFix);
   TEST_ASSERT_FALSE(got.phoneAttached);
+  // Flags in the low nibble of one byte, slot in the high one. A packing slip
+  // here would have cars quietly reading each other's slot as a flag.
+  TEST_ASSERT_TRUE(got.clockLocked);
+  TEST_ASSERT_EQUAL_UINT8(6, got.slot);
   TEST_ASSERT_EQUAL_STRING("mattmoto", got.name);
 }
 
@@ -519,53 +525,118 @@ void test_distance_does_not_overflow_on_a_full_span_of_longitude() {
 
 // ---- Slots ----------------------------------------------------------------
 
+// A car nobody has heard claim a slot yet.
 static void addRider(Rider *r, size_t i, uint32_t id) {
   r[i].id = id;
   r[i].used = true;
   r[i].atMs = 0;
+  r[i].pos.slot = SLOT_NONE;
 }
 
-void test_slot_is_our_rank_among_known_cars() {
-  Rider riders[MAX_RIDERS] = {};
-  addRider(riders, 0, 500);
-  addRider(riders, 1, 100);
-  addRider(riders, 2, 900);
+static void addRiderOn(Rider *r, size_t i, uint32_t id, uint8_t slot) {
+  addRider(r, i, id);
+  r[i].pos.slot = slot;
+}
 
-  // Ids 100, 300, 500, 900. Ours is 300, so one car sorts below us.
+void test_we_take_the_lowest_free_slot() {
+  Rider riders[MAX_RIDERS] = {};
+  addRiderOn(riders, 0, 500, 0);
+  addRiderOn(riders, 1, 100, 2);
+
   Schedule s;
   s.rebuild(300, false, riders, MAX_RIDERS);
   TEST_ASSERT_EQUAL_UINT8(1, s.slot());
-  TEST_ASSERT_EQUAL_UINT8(4, s.known());
+  TEST_ASSERT_TRUE(s.claimed());
+  TEST_ASSERT_EQUAL_UINT8(3, s.known());
   TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
   TEST_ASSERT_FALSE(s.weAreReference());
 }
 
-void test_every_car_computes_a_different_slot() {
-  // The whole scheme rests on this: four cars with the same roster must each
-  // land on a slot of their own, with nobody handing them out.
+void test_a_claimed_slot_survives_a_car_joining() {
+  // The whole reason for claiming rather than deriving from rank. Under rank,
+  // a car arriving with a lower node number pushed everyone above it onto a
+  // new slot at the same instant, so gaining a car cost the convoy a cycle of
+  // collisions. A held slot does not move for an arrival.
+  Rider riders[MAX_RIDERS] = {};
+  addRiderOn(riders, 0, 500, 0);
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  uint8_t mine = s.slot();
+  TEST_ASSERT_EQUAL_UINT8(1, mine);
+
+  // A car with a lower number than ours turns up, on a slot of its own.
+  addRiderOn(riders, 1, 100, 2);
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT8(mine, s.slot());
+
+  // And one leaves.
+  riders[0].used = false;
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT8(mine, s.slot());
+}
+
+void test_the_lower_node_number_wins_a_contested_slot() {
+  // Two cars out of earshot of each other pick the same slot, then meet. Both
+  // apply the same rule to the same facts, so exactly one of them moves.
+  Rider riders[MAX_RIDERS] = {};
+  addRiderOn(riders, 0, 100, 3); // lower than us, and on our slot
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT8(0, s.slot()); // we took the lowest free one
+
+  // Now we are on 3 and the lower number arrives on it.
+  Schedule t;
+  Rider alone[MAX_RIDERS] = {};
+  addRiderOn(alone, 0, 900, 0);
+  t.rebuild(300, false, alone, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT8(1, t.slot());
+
+  addRiderOn(alone, 1, 100, 1); // lower number, takes our slot from under us
+  t.rebuild(300, false, alone, MAX_RIDERS);
+  TEST_ASSERT_NOT_EQUAL(1, t.slot());
+  TEST_ASSERT_TRUE(t.claimed());
+}
+
+void test_a_higher_node_number_does_not_take_our_slot() {
+  Rider riders[MAX_RIDERS] = {};
+  addRiderOn(riders, 0, 100, 0);
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+
+  // 900 sorts above us, so it is the one that has to move, not us.
+  addRiderOn(riders, 1, 900, 1);
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+}
+
+void test_every_car_lands_on_a_slot_of_its_own() {
+  // Four cars, each seeing the other three with the slots they have claimed.
+  // Nobody hands them out and nobody ends up doubled up.
   const uint32_t ids[4] = {900, 100, 500, 300};
-  Rider full[4][MAX_RIDERS] = {};
-  uint8_t slots[4];
+  const uint8_t held[4] = {3, 0, 2, 1};
 
   for (int me = 0; me < 4; me++) {
+    Rider roster[MAX_RIDERS] = {};
     size_t n = 0;
     for (int other = 0; other < 4; other++)
-      if (other != me) addRider(full[me], n++, ids[other]);
+      if (other != me) addRiderOn(roster, n++, ids[other], held[other]);
+
     Schedule s;
-    s.rebuild(ids[me], false, full[me], MAX_RIDERS);
-    slots[me] = s.slot();
-    // Everyone agrees who the reference is, whoever is asking.
+    s.rebuild(ids[me], false, roster, MAX_RIDERS);
+    // The free slot left over is exactly the one this car already holds.
+    TEST_ASSERT_EQUAL_UINT8(held[me], s.slot());
     TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
   }
-
-  for (int a = 0; a < 4; a++)
-    for (int b = a + 1; b < 4; b++) TEST_ASSERT_NOT_EQUAL(slots[a], slots[b]);
 }
 
 void test_the_lowest_node_number_is_the_reference() {
   Rider riders[MAX_RIDERS] = {};
-  addRider(riders, 0, 500);
-  addRider(riders, 1, 900);
+  addRiderOn(riders, 0, 500, 1);
+  addRiderOn(riders, 1, 900, 2);
 
   Schedule s;
   s.rebuild(100, false, riders, MAX_RIDERS);
@@ -586,18 +657,18 @@ void test_a_car_alone_does_not_wait_for_a_schedule() {
 
 void test_slot_window_opens_once_per_cycle() {
   Rider riders[MAX_RIDERS] = {};
-  addRider(riders, 0, 100); // the reference
-  addRider(riders, 1, 900);
+  addRiderOn(riders, 0, 100, 0); // the reference, on slot zero
+  addRiderOn(riders, 1, 900, 2);
 
   const uint32_t cycle = 250;
   const uint32_t width = Schedule::slotWidthMs(cycle); // 250 / 9 = 27
   TEST_ASSERT_EQUAL_UINT32(27, width);
 
   Schedule s;
-  s.rebuild(300, false, riders, MAX_RIDERS); // ids 100, 300, 900: we are slot 1
-  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
-  // Nobody is locked, so the reference is the lowest number and it holds slot
-  // zero. Its beacon lands on the cycle start with nothing to subtract.
+  s.rebuild(300, false, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot()); // lowest free, 100 holds 0 and 900 holds 2
+  // The reference advertises slot zero, so its beacon lands on the cycle start
+  // with nothing to subtract.
   TEST_ASSERT_EQUAL_UINT8(0, s.referenceSlot());
 
   s.syncTo(1000, cycle); // the reference's beacon landed here, so a cycle began
@@ -617,8 +688,8 @@ void test_slot_window_opens_once_per_cycle() {
 
 void test_slots_keep_running_across_the_millis_wrap() {
   Rider riders[MAX_RIDERS] = {};
-  addRider(riders, 0, 100);
-  addRider(riders, 1, 900);
+  addRiderOn(riders, 0, 100, 0);
+  addRiderOn(riders, 1, 900, 2);
 
   const uint32_t cycle = 250;
   const uint32_t width = Schedule::slotWidthMs(cycle);
@@ -632,26 +703,42 @@ void test_slots_keep_running_across_the_millis_wrap() {
 }
 
 void test_more_cars_than_slots_doubles_up_rather_than_falling_off() {
+  // Nine claimed slots and a tenth car. Doubling up costs those two a
+  // collision; falling off the end of the cycle would cost the newcomer every
+  // transmission it ever made.
   Rider riders[MAX_RIDERS] = {};
-  for (size_t i = 0; i < MAX_RIDERS; i++) addRider(riders, i, (uint32_t)(i + 1));
+  for (size_t i = 0; i < MAX_RIDERS; i++) addRiderOn(riders, i, (uint32_t)(i + 1), (uint8_t)i);
 
-  // Our id sorts above all eight, so our rank is 8 and there are 9 slots.
   Schedule s;
   s.rebuild(1000, false, riders, MAX_RIDERS);
+  TEST_ASSERT_TRUE(s.claimed());
   TEST_ASSERT_TRUE(s.slot() < MAX_SLOTS);
 }
 
-void test_a_duplicate_node_number_does_not_corrupt_the_rank() {
-  // Two boards with the same node number is a real failure, but it must not
-  // also push everybody else's slot along by one.
+void test_a_duplicate_node_number_does_not_corrupt_the_claim() {
+  // Two boards with the same node number is a real failure and nothing here
+  // can fix it, but it must not also corrupt the head count or hand our own
+  // slot away to what is really us.
   Rider riders[MAX_RIDERS] = {};
-  addRider(riders, 0, 100);
-  addRider(riders, 1, 300); // same as ours
+  addRiderOn(riders, 0, 100, 0);
+  addRiderOn(riders, 1, 300, 1); // our own number, claiming a slot
 
   Schedule s;
   s.rebuild(300, false, riders, MAX_RIDERS);
-  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
   TEST_ASSERT_EQUAL_UINT8(2, s.known());
+  TEST_ASSERT_TRUE(s.claimed());
+  // Slot 1 reads as free, because the only claim on it is from our own id.
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+}
+
+void test_an_unclaimed_car_free_runs_until_it_has_been_heard() {
+  // Chicken and egg: a car has to be heard before anyone will leave it a slot,
+  // and it has to transmit to be heard. So before its first beacon it ignores
+  // the schedule entirely rather than waiting for a turn nobody has given it.
+  Schedule s;
+  TEST_ASSERT_FALSE(s.claimed());
+  TEST_ASSERT_TRUE(s.inSlotAtPhase(0, 250));
+  TEST_ASSERT_TRUE(s.inSlotAtPhase(200, 250));
 }
 
 // ---- The GPS-disciplined clock ---------------------------------------------
@@ -821,11 +908,11 @@ void test_gps_slots_need_no_reference_car() {
   // to its slot regardless, which is what removes the dependence on one car
   // staying in range.
   Rider riders[MAX_RIDERS] = {};
-  addRider(riders, 0, 100);
-  addRider(riders, 1, 900);
+  addRiderOn(riders, 0, 100, 0);
+  addRiderOn(riders, 1, 900, 2);
 
   Schedule s;
-  s.rebuild(300, false, riders, MAX_RIDERS); // slot 1 of 9
+  s.rebuild(300, false, riders, MAX_RIDERS); // we take the free slot 1
   TEST_ASSERT_FALSE(s.synced());
   TEST_ASSERT_TRUE(s.inSlot(0, 250)); // no epoch, so it free-runs
 
@@ -899,15 +986,17 @@ void test_sync_backs_out_the_reference_slot() {
   // rather than the start of the cycle. Not subtracting that would put every
   // phone-only car a slot or two ahead of everyone else.
   Rider riders[MAX_RIDERS] = {};
-  addRider(riders, 0, 100);       // slot 0, free-running
-  addLockedRider(riders, 1, 700); // slot 2, and the reference
+  addRiderOn(riders, 0, 100, 0);           // free-running, on slot zero
+  addLockedRider(riders, 1, 700);
+  riders[1].pos.slot = 2;                  // locked, so it is the reference
 
   const uint32_t cycle = 250;
   const uint32_t width = Schedule::slotWidthMs(cycle);
 
   Schedule s;
-  s.rebuild(300, false, riders, MAX_RIDERS); // ids 100, 300, 700: we are slot 1
+  s.rebuild(300, false, riders, MAX_RIDERS); // slots 0 and 2 taken, we get 1
   TEST_ASSERT_EQUAL_UINT32(700, s.referenceId());
+  // Read off the reference's own beacon, not derived from its rank.
   TEST_ASSERT_EQUAL_UINT8(2, s.referenceSlot());
   TEST_ASSERT_EQUAL_UINT8(1, s.slot());
 
@@ -932,11 +1021,12 @@ void test_a_mixed_ride_puts_everyone_on_one_cycle() {
   lockClock(clock, pulse);
 
   Rider gpsRoster[MAX_RIDERS] = {};
-  addRider(gpsRoster, 0, 300);
+  addRiderOn(gpsRoster, 0, 300, 0); // the phone-only car already holds slot 0
   Schedule gps;
-  gps.rebuild(700, true, gpsRoster, MAX_RIDERS); // ids 300, 700: we are slot 1
+  gps.rebuild(700, true, gpsRoster, MAX_RIDERS);
+  // Locked, so it keeps time even though 300 is the lower number.
   TEST_ASSERT_TRUE(gps.weAreReference());
-  TEST_ASSERT_EQUAL_UINT8(1, gps.slot());
+  TEST_ASSERT_EQUAL_UINT8(1, gps.slot()); // lowest free
 
   // Find the instant its slot opens, which is when its beacon goes out.
   uint64_t sendAt = 0;
@@ -955,6 +1045,7 @@ void test_a_mixed_ride_puts_everyone_on_one_cycle() {
   const uint32_t heardAtMs = 55555;
   Rider phoneRoster[MAX_RIDERS] = {};
   addLockedRider(phoneRoster, 0, 700);
+  phoneRoster[0].pos.slot = 1; // as advertised in the beacon it just heard
   Schedule phone;
   phone.rebuild(300, false, phoneRoster, MAX_RIDERS);
   TEST_ASSERT_EQUAL_UINT32(700, phone.referenceId());
@@ -1103,14 +1194,18 @@ int main(int, char**) {
   RUN_TEST(test_a_forward_scheduled_across_the_millis_wrap_still_fires);
   RUN_TEST(test_distance_is_close_enough_to_be_a_gate);
   RUN_TEST(test_distance_does_not_overflow_on_a_full_span_of_longitude);
-  RUN_TEST(test_slot_is_our_rank_among_known_cars);
-  RUN_TEST(test_every_car_computes_a_different_slot);
+  RUN_TEST(test_we_take_the_lowest_free_slot);
+  RUN_TEST(test_a_claimed_slot_survives_a_car_joining);
+  RUN_TEST(test_the_lower_node_number_wins_a_contested_slot);
+  RUN_TEST(test_a_higher_node_number_does_not_take_our_slot);
+  RUN_TEST(test_an_unclaimed_car_free_runs_until_it_has_been_heard);
+  RUN_TEST(test_every_car_lands_on_a_slot_of_its_own);
   RUN_TEST(test_the_lowest_node_number_is_the_reference);
   RUN_TEST(test_a_car_alone_does_not_wait_for_a_schedule);
   RUN_TEST(test_slot_window_opens_once_per_cycle);
   RUN_TEST(test_slots_keep_running_across_the_millis_wrap);
   RUN_TEST(test_more_cars_than_slots_doubles_up_rather_than_falling_off);
-  RUN_TEST(test_a_duplicate_node_number_does_not_corrupt_the_rank);
+  RUN_TEST(test_a_duplicate_node_number_does_not_corrupt_the_claim);
   RUN_TEST(test_the_cycle_must_divide_a_second);
   RUN_TEST(test_no_phase_before_the_first_pulse);
   RUN_TEST(test_one_pulse_is_not_enough_to_be_believed);

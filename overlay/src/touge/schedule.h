@@ -33,21 +33,31 @@
 namespace touge {
 
 // Riders plus ourselves. Fixed rather than sized to the roster, because a slot
-// width that changed as cars joined would move everybody's slot at once, and
-// the moment a roster is in flux is exactly when you want the schedule stable.
+// width that changed as cars joined would move everybody else at once, and the
+// moment a roster is in flux is exactly when you want the schedule stable.
 static const uint8_t MAX_SLOTS = MAX_RIDERS + 1;
+
+// No slot held yet. Nine slots leave four bits with values to spare, so this
+// rides in the same nibble as the slot itself and costs nothing.
+static const uint8_t SLOT_NONE = 0x0F;
 
 class Schedule {
  public:
   void reset();
 
-  // Work out our slot from the roster. Every car runs the same sort over the
-  // same ids and lands on the same answer, so no slot has to be handed out.
-  // Cars that have not heard each other yet will disagree for a cycle or two;
-  // that is what the jitter inside the slot is for.
+  // Claim a slot, and keep it.
+  //
+  // Slots used to be derived from rank among the known node numbers, which
+  // needed no protocol at all but meant a car joining pushed everyone above it
+  // onto a new slot at the same moment. Now each car advertises the slot it
+  // holds, keeps it unless a lower node number is already on it, and otherwise
+  // takes the lowest free one. Two cars that pick the same slot before hearing
+  // each other apply the same rule to the same facts, so one of them moves.
   void rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders);
 
+  // SLOT_NONE until the first roster arrives.
   uint8_t slot() const { return slot_; }
+  bool claimed() const { return slot_ < MAX_SLOTS; }
   uint8_t known() const { return known_; }
   uint32_t referenceId() const { return referenceId_; }
   uint8_t referenceSlot() const { return referenceSlot_; }
@@ -82,7 +92,7 @@ class Schedule {
  private:
   uint32_t selfId_ = 0;
   uint32_t referenceId_ = 0;
-  uint8_t slot_ = 0;
+  uint8_t slot_ = SLOT_NONE;
   uint8_t referenceSlot_ = 0;
   uint8_t known_ = 0;
   uint32_t epochMs_ = 0;
