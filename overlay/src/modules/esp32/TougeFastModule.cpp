@@ -44,6 +44,11 @@ const uint32_t GATE_METRES = 20;
 // to prove it is alive and nothing more.
 const uint32_t GATE_IDLE_MS = 3000;
 
+// How long a car stays "on 2.4 GHz" for the purpose of outranking its own LoRa
+// positions. Short on purpose: when the fast link drops, LoRa has to take over
+// without a gap, and a two-second-old position beats none at all.
+const uint32_t FAST_PRECEDENCE_MS = 2000;
+
 // The name rides along every half minute rather than on every ping. Everyone
 // who can hear you has it after one, and after that it is just bytes.
 const uint32_t NAME_EVERY_MS = 30000;
@@ -450,8 +455,38 @@ void TougeFastModule::sendDeferred(uint32_t nowMs)
     }
 }
 
+bool TougeFastModule::wantPacket(const meshtastic_MeshPacket *p)
+{
+    if (!p) return false;
+    if (p->which_payload_variant != meshtastic_MeshPacket_decoded_tag) return false;
+    // Our own port for voice, and positions so that a LoRa one cannot overwrite
+    // a fresher 2.4 GHz one. See handleReceived.
+    return p->decoded.portnum == ourPortNum || p->decoded.portnum == meshtastic_PortNum_POSITION_APP;
+}
+
 ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
+    // 2.4 GHz beats LoRa, and this is where that is enforced.
+    //
+    // Both radios feed the same NodeDB row and it keeps whatever arrived last,
+    // so a LoRa position sampled two seconds ago can land after a 2.4 GHz one
+    // sampled a quarter of a second ago and replace it with the older truth.
+    // Meshtastic's own timestamps are in whole seconds, which is far too
+    // coarse to sort a 250 ms beacon out from a slow one, so the comparison is
+    // made here instead: if we have heard this car on 2.4 GHz recently, its
+    // LoRa position is dropped before PositionModule can write it.
+    //
+    // Recently is deliberately short. The moment 2.4 GHz stops carrying a car,
+    // LoRa has to take over without a gap, and a stale position beats none.
+    if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+        mp.decoded.portnum == meshtastic_PortNum_POSITION_APP) {
+        const Rider *r = mesh_.find(mp.from);
+        if (r && r->via == HEARD_FAST && (uint32_t)(millis() - r->atMs) < FAST_PRECEDENCE_MS) {
+            return ProcessMessage::STOP;
+        }
+        return ProcessMessage::CONTINUE;
+    }
+
     // Only packets the phone aimed at this radio in particular. Router::sendLocal
     // delivers those to modules without transmitting, which is what keeps
     // push-to-talk audio off the LoRa side entirely.

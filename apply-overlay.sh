@@ -58,16 +58,25 @@ fi
 if grep -q 'new TougeFastModule' "$MODULES"; then
   echo "==> Modules.cpp already constructs the module"
 else
-  if ! grep -q '// Only run on an esp32 based device.' "$MODULES"; then
+  # Ahead of PositionModule, and that ordering is load-bearing.
+  #
+  # Modules see a packet in the order they were constructed, and it is
+  # PositionModule that writes a heard position into NodeDB. Ours has to get
+  # there first to be able to say "this car is already on 2.4 GHz, its LoRa
+  # position is two seconds old, do not let it overwrite what we have".
+  # Constructed after PositionModule, the stale write has already happened.
+  if ! grep -q 'positionModule = new PositionModule();' "$MODULES"; then
     echo "error: could not find the setup anchor in Modules.cpp" >&2
+    echo "       upstream moved; the module must be constructed BEFORE" >&2
+    echo "       PositionModule or 2.4 GHz will not take precedence" >&2
     exit 1
   fi
-  sed -i.bak '/\/\/ Only run on an esp32 based device\./a\
-#if !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST)\
+  sed -i.bak '/positionModule = new PositionModule();/i\
+#if defined(ARCH_ESP32) \&\& !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST)\
     tougeFastModule = new TougeFastModule();\
 #endif
 ' "$MODULES"
-  echo "==> added the constructor"
+  echo "==> added the constructor, ahead of PositionModule"
 fi
 
 rm -f "$MODULES.bak"

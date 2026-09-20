@@ -47,6 +47,7 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
 
   protected:
     virtual int32_t runOnce() override;
+    virtual bool wantPacket(const meshtastic_MeshPacket *p) override;
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
 
   private:
