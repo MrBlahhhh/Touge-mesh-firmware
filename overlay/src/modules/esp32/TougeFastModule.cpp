@@ -10,6 +10,7 @@
 #include "main.h"
 #include "touge/cipher.h"
 #include <Preferences.h>
+#include <esp_random.h>
 #include <string.h>
 
 using namespace touge;
@@ -18,10 +19,20 @@ TougeFastModule *tougeFastModule = nullptr;
 
 namespace {
 
-// 1 Hz. On LoRa this would be indefensible; here a position costs 26 bytes on
+// 4 Hz. On LoRa this would be indefensible; here a position costs 26 bytes on
 // a radio nothing else is using, and the difference between a car icon that
 // moves and one that teleports is entirely in this number.
-const uint32_t BEACON_MS = 1000;
+//
+// This, not the transport, is what decides how fresh a position is. A hop over
+// ESP-NOW takes two or three milliseconds; a beacon interval of a second means
+// the newest position anyone has is on average half a second stale before it
+// is even sent. Four cars at 4 Hz over two hops is roughly a fifth of the
+// channel once suppression is doing its job, which leaves plenty of room.
+const uint32_t BEACON_MS = 250;
+
+// Cars that power up together otherwise settle into lockstep and collide on
+// every single beacon. A slice of slop on each interval breaks that up.
+const uint32_t BEACON_JITTER_MS = 40;
 
 // The name rides along every half minute rather than on every ping. Everyone
 // who can hear you has it after one, and after that it is just bytes.
@@ -172,8 +183,10 @@ bool TougeFastModule::transmit(uint8_t type, const uint8_t *body, size_t len, ui
 void TougeFastModule::beacon(uint32_t nowMs)
 {
     if (!started_) return;
-    if ((uint32_t)(nowMs - lastBeaconMs_) < BEACON_MS) return;
+    if (beaconGapMs_ == 0) beaconGapMs_ = BEACON_MS;
+    if ((uint32_t)(nowMs - lastBeaconMs_) < beaconGapMs_) return;
     lastBeaconMs_ = nowMs;
+    beaconGapMs_ = BEACON_MS - BEACON_JITTER_MS + (esp_random() % (BEACON_JITTER_MS * 2));
 
     // No fix means nothing worth sending. The other cars keep the last one they
     // heard and show it as ageing, which is more useful than a zero.
@@ -298,13 +311,19 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         // keeps the original sender and id so every copy in flight is the same
         // packet; giving it a new id here would defeat dedupe at the next node
         // and turn a convoy into an echo chamber.
+        //
+        // Held, not sent. Every car that heard this frame is about to reach
+        // this line at the same instant, and if they all transmit together the
+        // forward is lost to a collision and helps nobody. Waiting a random
+        // slice also gives the others time to go first, and whoever loses the
+        // race drops their copy instead of adding to the noise.
         if (f.hops > 0) {
             Frame fwd = f;
             fwd.hops = f.hops - 1;
             fwd.payload = sealed;
             uint8_t wire[FRAME_MAX];
             size_t n = encodeFrame(fwd, wire, sizeof(wire));
-            if (n > 0) fastRadio.send(wire, n);
+            if (n > 0) mesh_.defer(wire, n, f.src, f.id, nowMs + (esp_random() % FORWARD_JITTER_MS));
         }
     }
 }
@@ -324,12 +343,25 @@ int32_t TougeFastModule::runOnce()
     if (!started_) return 5000; // nothing to do until there is a channel
 
     drainRadio(now);
+    sendDeferred(now);
     beacon(now);
     mesh_.age(now);
 
     // Fast enough that a 20 ms audio frame is never sitting in the queue long,
-    // and slow enough that an idle board is not spinning.
-    return 20;
+    // and slow enough that an idle board is not spinning. It also has to be
+    // well under FORWARD_JITTER_MS: at a 20 ms pass every held frame would
+    // come due in the same sweep and the jitter would buy nothing.
+    return 5;
+}
+
+void TougeFastModule::sendDeferred(uint32_t nowMs)
+{
+    Forward f;
+    // Bounded for the same reason drainRadio is. Everything left behind comes
+    // due again five milliseconds from now.
+    for (int budget = 0; budget < 4 && mesh_.nextDue(nowMs, f); budget++) {
+        fastRadio.send(f.wire, f.len);
+    }
 }
 
 ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)

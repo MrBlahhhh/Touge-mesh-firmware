@@ -53,6 +53,7 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     void syncChannel();
 
     void drainRadio(uint32_t nowMs);
+    void sendDeferred(uint32_t nowMs);
     void beacon(uint32_t nowMs);
 
     // Hands a frame heard on 2.4 GHz to the rest of Meshtastic as though it
@@ -80,6 +81,7 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     uint32_t lastBeaconMs_ = 0;
     uint32_t lastNameMs_ = 0;
     uint32_t lastSyncMs_ = 0;
+    uint32_t beaconGapMs_ = 0;
 };
 
 extern TougeFastModule *tougeFastModule;

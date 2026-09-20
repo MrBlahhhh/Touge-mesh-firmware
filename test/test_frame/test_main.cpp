@@ -375,6 +375,105 @@ void test_roster_drops_only_after_a_very_long_silence() {
   TEST_ASSERT_NULL(m.find(7));
 }
 
+// ---- Forward jitter and suppression ----------------------------------------
+
+static void deferOne(Mesh &m, uint32_t src, uint32_t id, uint32_t dueMs) {
+  uint8_t wire[FRAME_HEADER];
+  Frame f;
+  f.type = FRAME_POSITION;
+  f.src = src;
+  f.id = id;
+  size_t n = encodeFrame(f, wire, sizeof(wire));
+  TEST_ASSERT_TRUE(m.defer(wire, n, src, id, dueMs));
+}
+
+void test_copies_counts_every_arrival() {
+  Mesh m;
+  m.reset();
+  TEST_ASSERT_EQUAL_UINT8(0, m.copies(1, 100, 0));
+  m.firstSight(1, 100, 0);
+  TEST_ASSERT_EQUAL_UINT8(1, m.copies(1, 100, 0));
+  m.firstSight(1, 100, 1);
+  m.firstSight(1, 100, 2);
+  TEST_ASSERT_EQUAL_UINT8(3, m.copies(1, 100, 2));
+  // Gone once the window passes, along with the rest of the entry.
+  TEST_ASSERT_EQUAL_UINT8(0, m.copies(1, 100, SEEN_TTL_MS + 3));
+}
+
+void test_a_forward_waits_for_its_jitter() {
+  Mesh m;
+  m.reset();
+  m.firstSight(1, 100, 0);
+  deferOne(m, 1, 100, 10);
+
+  Forward out;
+  TEST_ASSERT_FALSE(m.nextDue(0, out));
+  TEST_ASSERT_FALSE(m.nextDue(9, out));
+  TEST_ASSERT_TRUE(m.nextDue(10, out));
+  TEST_ASSERT_EQUAL_UINT32(1, out.src);
+  TEST_ASSERT_EQUAL_UINT32(100, out.id);
+  // Handed out once. A slot that stayed armed would rebroadcast on every pass.
+  TEST_ASSERT_FALSE(m.nextDue(11, out));
+}
+
+void test_a_forward_overtaken_by_neighbours_is_dropped() {
+  // The whole point of the jitter: while this one waited, other cars
+  // rebroadcast the same packet. Everyone in earshot has it, so transmitting
+  // now would be pure interference.
+  Mesh m;
+  m.reset();
+  m.firstSight(1, 100, 0);
+  deferOne(m, 1, 100, 10);
+
+  for (uint8_t i = 1; i < SUPPRESS_AFTER; i++) m.firstSight(1, 100, 5);
+  TEST_ASSERT_EQUAL_UINT8(SUPPRESS_AFTER, m.copies(1, 100, 5));
+
+  Forward out;
+  TEST_ASSERT_FALSE(m.nextDue(10, out));
+  TEST_ASSERT_EQUAL_UINT32(1, m.suppressed());
+}
+
+void test_a_forward_nobody_else_made_still_goes() {
+  Mesh m;
+  m.reset();
+  m.firstSight(1, 100, 0);
+  deferOne(m, 1, 100, 10);
+  // One short of the threshold: somebody still needs to hear this.
+  for (uint8_t i = 2; i < SUPPRESS_AFTER; i++) m.firstSight(1, 100, 5);
+
+  Forward out;
+  TEST_ASSERT_TRUE(m.nextDue(10, out));
+  TEST_ASSERT_EQUAL_UINT32(0, m.suppressed());
+}
+
+void test_forward_queue_drops_rather_than_delaying_what_is_waiting() {
+  Mesh m;
+  m.reset();
+  uint8_t wire[FRAME_HEADER];
+  Frame f;
+  f.type = FRAME_POSITION;
+  size_t n = encodeFrame(f, wire, sizeof(wire));
+
+  for (size_t i = 0; i < FORWARD_SLOTS; i++)
+    TEST_ASSERT_TRUE(m.defer(wire, n, 1, (uint32_t)i, 10));
+  // Full. A late forward is worth less than the ones already queued, and on a
+  // ride this busy somebody else is forwarding anyway.
+  TEST_ASSERT_FALSE(m.defer(wire, n, 1, 999, 10));
+}
+
+void test_a_forward_scheduled_across_the_millis_wrap_still_fires() {
+  // millis() wraps every 49 days. Comparing the wrong way round here would
+  // park a frame in the queue until the next wrap came round.
+  Mesh m;
+  m.reset();
+  m.firstSight(1, 100, 0xFFFFFFF0);
+  deferOne(m, 1, 100, 0xFFFFFFFA);
+
+  Forward out;
+  TEST_ASSERT_FALSE(m.nextDue(0xFFFFFFF5, out));
+  TEST_ASSERT_TRUE(m.nextDue(0x00000004, out));
+}
+
 void test_packet_ids_never_restart_at_zero() {
   // The id is half the AES-CTR nonce. Counting from zero after a reboot would
   // replay every nonce this node has already used under the same channel key.
@@ -414,5 +513,11 @@ int main(int, char**) {
   RUN_TEST(test_roster_will_not_bump_a_car_you_are_driving_behind);
   RUN_TEST(test_roster_drops_only_after_a_very_long_silence);
   RUN_TEST(test_packet_ids_never_restart_at_zero);
+  RUN_TEST(test_copies_counts_every_arrival);
+  RUN_TEST(test_a_forward_waits_for_its_jitter);
+  RUN_TEST(test_a_forward_overtaken_by_neighbours_is_dropped);
+  RUN_TEST(test_a_forward_nobody_else_made_still_goes);
+  RUN_TEST(test_forward_queue_drops_rather_than_delaying_what_is_waiting);
+  RUN_TEST(test_a_forward_scheduled_across_the_millis_wrap_still_fires);
   return UNITY_END();
 }

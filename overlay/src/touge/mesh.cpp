@@ -6,24 +6,52 @@ namespace touge {
 void Mesh::reset() {
   memset(seen_, 0, sizeof(seen_));
   memset(riders_, 0, sizeof(riders_));
+  memset(forwards_, 0, sizeof(forwards_));
   lastId_ = 0;
+  suppressed_ = 0;
+}
+
+Mesh::Seen* Mesh::lookup(uint32_t src, uint32_t id, uint32_t nowMs) {
+  for (size_t i = 0; i < SEEN_SLOTS; i++) {
+    Seen& s = seen_[i];
+    if (!s.used) continue;
+    // An expired slot is treated as empty rather than as a match, so a rider
+    // who left and came back is not silenced by a stale entry.
+    if ((uint32_t)(nowMs - s.atMs) > SEEN_TTL_MS) {
+      s.used = false;
+      continue;
+    }
+    if (s.src == src && s.id == id) return &s;
+  }
+  return nullptr;
+}
+
+const Mesh::Seen* Mesh::lookup(uint32_t src, uint32_t id, uint32_t nowMs) const {
+  for (size_t i = 0; i < SEEN_SLOTS; i++) {
+    const Seen& s = seen_[i];
+    if (!s.used) continue;
+    if ((uint32_t)(nowMs - s.atMs) > SEEN_TTL_MS) continue;
+    if (s.src == src && s.id == id) return &s;
+  }
+  return nullptr;
 }
 
 bool Mesh::firstSight(uint32_t src, uint32_t id, uint32_t nowMs) {
+  Seen* hit = lookup(src, id, nowMs);
+  if (hit != nullptr) {
+    if (hit->count < 255) hit->count++;
+    return false;
+  }
+
   int free = -1;
   int oldest = 0;
   uint32_t oldestAt = 0xFFFFFFFF;
-
   for (size_t i = 0; i < SEEN_SLOTS; i++) {
     Seen& s = seen_[i];
-    // An expired slot is treated as empty rather than as a match, so a rider
-    // who left and came back is not silenced by a stale entry.
-    if (s.used && (uint32_t)(nowMs - s.atMs) > SEEN_TTL_MS) s.used = false;
     if (!s.used) {
       if (free < 0) free = (int)i;
       continue;
     }
-    if (s.src == src && s.id == id) return false;
     if (s.atMs < oldestAt) {
       oldestAt = s.atMs;
       oldest = (int)i;
@@ -37,8 +65,55 @@ bool Mesh::firstSight(uint32_t src, uint32_t id, uint32_t nowMs) {
   seen_[slot].src = src;
   seen_[slot].id = id;
   seen_[slot].atMs = nowMs;
+  seen_[slot].count = 1;
   seen_[slot].used = true;
   return true;
+}
+
+uint8_t Mesh::copies(uint32_t src, uint32_t id, uint32_t nowMs) const {
+  const Seen* hit = lookup(src, id, nowMs);
+  return hit ? hit->count : 0;
+}
+
+bool Mesh::defer(const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uint32_t dueMs) {
+  if (wire == nullptr || len == 0 || len > FRAME_MAX) return false;
+
+  for (size_t i = 0; i < FORWARD_SLOTS; i++) {
+    if (forwards_[i].used) continue;
+    memcpy(forwards_[i].wire, wire, len);
+    forwards_[i].len = (uint16_t)len;
+    forwards_[i].src = src;
+    forwards_[i].id = id;
+    forwards_[i].dueMs = dueMs;
+    forwards_[i].used = true;
+    return true;
+  }
+  // No room. The frame is dropped rather than pushing an already-waiting one
+  // out: a forward that arrives late is worth less than one that arrives, and
+  // in a convoy this busy somebody else is almost certainly forwarding anyway.
+  return false;
+}
+
+bool Mesh::nextDue(uint32_t nowMs, Forward& out) {
+  for (size_t i = 0; i < FORWARD_SLOTS; i++) {
+    Forward& f = forwards_[i];
+    if (!f.used) continue;
+    // Unsigned, so a frame scheduled before a millis() wrap still comes due
+    // rather than waiting out the next forty-nine days.
+    if ((int32_t)(nowMs - f.dueMs) < 0) continue;
+
+    f.used = false;
+    // Neighbours may have rebroadcast it while this one waited. If enough of
+    // them did, everyone in earshot has it and this transmission would be
+    // pure interference.
+    if (copies(f.src, f.id, nowMs) >= SUPPRESS_AFTER) {
+      suppressed_++;
+      continue;
+    }
+    out = f;
+    return true;
+  }
+  return false;
 }
 
 Rider* Mesh::note(uint32_t src, const Position& p, uint8_t via, int16_t rssi, uint8_t hopsAway,

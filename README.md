@@ -132,6 +132,37 @@ id is half the nonce, which is why it is 32 bits and why the counter is kept in
 NVS: counting up from zero after a reboot would replay nonces and hand anyone
 listening the XOR of two positions.
 
+## Latency
+
+The target is under a second from one car's GPS to another car's screen, and
+the transport is not the part that costs anything: a hop over ESP-NOW is two or
+three milliseconds, and two hops with jitter is under fifty.
+
+What decides freshness is `BEACON_MS`, at 250 ms. At one second a position is
+already half a second stale on average before it is even sent, which alone eats
+the budget. Four cars at 4 Hz over two hops runs at roughly a fifth of the
+channel once suppression is working.
+
+There are no dedicated repeaters and there is no need for any. Every node
+forwards, which is what `FAST_HOPS = 2` means: it covers a convoy strung out
+far enough that the front and back cannot hear each other but the middle can
+hear both.
+
+Flooding does need two things that are easy to leave out:
+
+- **Random delay per forward.** Every car that heard a frame reaches the
+  forwarding decision in the same microsecond. Sent immediately, they collide
+  and the forward reaches nobody, and it gets worse with more cars, not better.
+  Each one waits a random slice of `FORWARD_JITTER_MS` instead.
+- **Counting the copies.** Having heard `SUPPRESS_AFTER` copies of a packet,
+  everyone within earshot has it and one more transmission is interference. A
+  held frame that gets overtaken while it waits is dropped. In a four-car
+  convoy in line of sight nearly every forward is redundant, and this is what
+  keeps them from costing anything. `Mesh::suppressed()` counts them.
+
+Beacons carry their own jitter too, because cars powered up together otherwise
+fall into lockstep and collide on every single one.
+
 ## Known limits
 
 - **ESP-NOW is line of sight.** A 2.4 GHz receiver bottoms out near -95 dBm
