@@ -19,20 +19,29 @@ TougeFastModule *tougeFastModule = nullptr;
 
 namespace {
 
-// 4 Hz. On LoRa this would be indefensible; here a position costs 26 bytes on
-// a radio nothing else is using, and the difference between a car icon that
-// moves and one that teleports is entirely in this number.
+// One TDMA cycle. Our slot comes round this often, which is both the fastest
+// we can beacon and the longest a ready beacon ever waits for its turn.
 //
-// This, not the transport, is what decides how fresh a position is. A hop over
-// ESP-NOW takes two or three milliseconds; a beacon interval of a second means
-// the newest position anyone has is on average half a second stale before it
-// is even sent. Four cars at 4 Hz over two hops is roughly a fifth of the
-// channel once suppression is doing its job, which leaves plenty of room.
-const uint32_t BEACON_MS = 250;
+// A hop over ESP-NOW is two or three milliseconds, so the transport was never
+// what made a position stale: the interval was. Nine slots across 250 ms puts
+// each one at 27 ms, which is ten times the length of a frame and leaves room
+// for the clock to be a couple of milliseconds out.
+const uint32_t CYCLE_MS = 250;
 
-// Cars that power up together otherwise settle into lockstep and collide on
-// every single beacon. A slice of slop on each interval breaks that up.
-const uint32_t BEACON_JITTER_MS = 40;
+// The gate, borrowed from the Army's Blue Force Tracker, which reports every
+// 30 seconds or every 50 metres of travel and lets whichever comes first win.
+//
+// The point of a distance trigger is that it bounds the thing that actually
+// matters, which is not how old a position is but how wrong it is. Twenty
+// metres is about four car lengths: nobody's icon is ever further than that
+// from where the car really is, whether it is doing 70 or sitting at a
+// junction. A pure time trigger gives you the opposite, spending the most
+// airtime on the car that has not moved.
+const uint32_t GATE_METRES = 20;
+
+// The heartbeat for a car that is parked. Long, because a stationary car needs
+// to prove it is alive and nothing more.
+const uint32_t GATE_IDLE_MS = 3000;
 
 // The name rides along every half minute rather than on every ping. Everyone
 // who can hear you has it after one, and after that it is just bytes.
@@ -69,6 +78,7 @@ TougeFastModule::TougeFastModule()
     : SinglePortModule("tougefast", meshtastic_PortNum_PRIVATE_APP), OSThread("tougefast")
 {
     mesh_.reset();
+    schedule_.reset();
     loadIdCounter();
 }
 
@@ -140,6 +150,10 @@ void TougeFastModule::syncChannel()
     // The roster and the dedupe table are keyed to the old ride. Keeping them
     // across a channel change would leave cars from the last ride on the map.
     mesh_.reset();
+    schedule_.reset();
+    schedule_.rebuild(nodeDB->getNodeNum(), mesh_.riders(), MAX_RIDERS);
+    wantBeacon_ = false;
+    sentOnce_ = false;
     mesh_.seedIds(idCeiling_ ? idCeiling_ - ID_BLOCK : nodeDB->getNodeNum());
 
     if (!fastRadio.begin(net_)) {
@@ -183,15 +197,33 @@ bool TougeFastModule::transmit(uint8_t type, const uint8_t *body, size_t len, ui
 void TougeFastModule::beacon(uint32_t nowMs)
 {
     if (!started_) return;
-    if (beaconGapMs_ == 0) beaconGapMs_ = BEACON_MS;
-    if ((uint32_t)(nowMs - lastBeaconMs_) < beaconGapMs_) return;
-    lastBeaconMs_ = nowMs;
-    beaconGapMs_ = BEACON_MS - BEACON_JITTER_MS + (esp_random() % (BEACON_JITTER_MS * 2));
 
     // No fix means nothing worth sending. The other cars keep the last one they
     // heard and show it as ageing, which is more useful than a zero.
     if (!localPosition.has_latitude_i || !localPosition.has_longitude_i) return;
     if (localPosition.latitude_i == 0 && localPosition.longitude_i == 0) return;
+
+    // Two separate questions, deliberately. First: is there anything worth
+    // saying? Then: is it our turn to say it? Collapsing them would either
+    // give up the slot discipline or let a parked car hold one open.
+    if (!wantBeacon_) {
+        uint32_t since = (uint32_t)(nowMs - lastBeaconMs_);
+        uint32_t moved = sentOnce_ ? distanceM(sentLat_, sentLon_, localPosition.latitude_i,
+                                               localPosition.longitude_i)
+                                   : GATE_METRES;
+        if (!sentOnce_ || moved >= GATE_METRES || since >= GATE_IDLE_MS) wantBeacon_ = true;
+    }
+    if (!wantBeacon_) return;
+
+    // Our turn comes round once a cycle, so the wait is bounded by that and
+    // the gate above decides everything else.
+    if (!schedule_.inSlot(nowMs, CYCLE_MS)) return;
+
+    wantBeacon_ = false;
+    lastBeaconMs_ = nowMs;
+    sentLat_ = localPosition.latitude_i;
+    sentLon_ = localPosition.longitude_i;
+    sentOnce_ = true;
 
     Position p;
     p.lat = localPosition.latitude_i;
@@ -301,9 +333,20 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
 
         if (f.type == FRAME_POSITION) {
             Position p;
-            if (decodePosition(body, f.len, p))
+            if (decodePosition(body, f.len, p)) {
+                size_t before = mesh_.count();
                 mesh_.note(f.src, p, HEARD_FAST, rx.rssi, FAST_HOPS - f.hops, nowMs);
+                // A new car changes everyone's rank, so the schedule is rebuilt
+                // rather than drifting until the next car happens to arrive.
+                if (mesh_.count() != before) schedule_.rebuild(nodeId_, mesh_.riders(), MAX_RIDERS);
+            }
         }
+
+        // The lowest node number on the ride holds slot zero, so its frame
+        // landing is the start of a cycle. Only a frame heard directly is any
+        // use for this: one that came via a neighbour carries that neighbour's
+        // forwarding jitter and would drag the whole schedule sideways.
+        if (f.src == schedule_.referenceId() && f.hops == FAST_HOPS) schedule_.syncTo(rx.rxMs);
 
         inject(f, body, f.len, rx.rssi);
 

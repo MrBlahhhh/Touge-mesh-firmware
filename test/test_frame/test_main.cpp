@@ -14,6 +14,7 @@
 #include "ride.h"
 #include "sha256.h"
 #include "mesh.h"
+#include "schedule.h"
 
 using namespace touge;
 
@@ -485,6 +486,169 @@ void test_packet_ids_never_restart_at_zero() {
   TEST_ASSERT_EQUAL_UINT32(50002, m.lastId());
 }
 
+// ---- Distance -------------------------------------------------------------
+
+void test_distance_is_close_enough_to_be_a_gate() {
+  // One ten-thousandth of a degree of latitude is 11.13 m anywhere on earth.
+  TEST_ASSERT_UINT32_WITHIN(1, 11, distanceM(374419983, -1221419420, 374420983, -1221419420));
+  TEST_ASSERT_EQUAL_UINT32(0, distanceM(374419983, -1221419420, 374419983, -1221419420));
+
+  // A degree of longitude shortens towards the poles. At 60 degrees north it
+  // is worth half what it is at the equator, and a gate that missed this
+  // would fire at twice the distance up there.
+  uint32_t atEquator = distanceM(0, 0, 0, 10000);
+  uint32_t atSixty = distanceM(600000000, 0, 600000000, 10000);
+  TEST_ASSERT_UINT32_WITHIN(atEquator / 40, atEquator / 2, atSixty);
+}
+
+void test_distance_does_not_overflow_on_a_full_span_of_longitude() {
+  // Longitude runs to +/-1.8e9 at this scale, so a difference across the whole
+  // range is 3.6e9 and overflows the signed 32-bit type the operands are
+  // stored in. Wrapped, it comes out around 7,700 km instead of 40,000, so a
+  // loose assertion here would pass with the bug still in place.
+  //
+  // Flat projection, so this is the long way round the equator rather than the
+  // 200 m step across the date line. That limit is fine for a gate measuring
+  // how far one car moved between beacons, and wrong enough to be obvious if
+  // anyone ever tries to use it for something else.
+  uint32_t d = distanceM(0, -1799999000, 0, 1799999000);
+  TEST_ASSERT_UINT32_WITHIN(400000, 40074000, d);
+}
+
+// ---- Slots ----------------------------------------------------------------
+
+static void addRider(Rider *r, size_t i, uint32_t id) {
+  r[i].id = id;
+  r[i].used = true;
+  r[i].atMs = 0;
+}
+
+void test_slot_is_our_rank_among_known_cars() {
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 500);
+  addRider(riders, 1, 100);
+  addRider(riders, 2, 900);
+
+  // Ids 100, 300, 500, 900. Ours is 300, so one car sorts below us.
+  Schedule s;
+  s.rebuild(300, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+  TEST_ASSERT_EQUAL_UINT8(4, s.known());
+  TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
+  TEST_ASSERT_FALSE(s.weAreReference());
+}
+
+void test_every_car_computes_a_different_slot() {
+  // The whole scheme rests on this: four cars with the same roster must each
+  // land on a slot of their own, with nobody handing them out.
+  const uint32_t ids[4] = {900, 100, 500, 300};
+  Rider full[4][MAX_RIDERS] = {};
+  uint8_t slots[4];
+
+  for (int me = 0; me < 4; me++) {
+    size_t n = 0;
+    for (int other = 0; other < 4; other++)
+      if (other != me) addRider(full[me], n++, ids[other]);
+    Schedule s;
+    s.rebuild(ids[me], full[me], MAX_RIDERS);
+    slots[me] = s.slot();
+    // Everyone agrees who the reference is, whoever is asking.
+    TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
+  }
+
+  for (int a = 0; a < 4; a++)
+    for (int b = a + 1; b < 4; b++) TEST_ASSERT_NOT_EQUAL(slots[a], slots[b]);
+}
+
+void test_the_lowest_node_number_is_the_reference() {
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 500);
+  addRider(riders, 1, 900);
+
+  Schedule s;
+  s.rebuild(100, riders, MAX_RIDERS);
+  TEST_ASSERT_TRUE(s.weAreReference());
+  TEST_ASSERT_EQUAL_UINT8(0, s.slot());
+}
+
+void test_a_car_alone_does_not_wait_for_a_schedule() {
+  // Nothing to collide with, and no reference beacon will ever arrive. Waiting
+  // for a sync here would mean never transmitting at all.
+  Schedule s;
+  Rider none[MAX_RIDERS] = {};
+  s.rebuild(300, none, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT8(1, s.known());
+  TEST_ASSERT_TRUE(s.inSlot(0, 250));
+  TEST_ASSERT_TRUE(s.inSlot(123, 250));
+}
+
+void test_slot_window_opens_once_per_cycle() {
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 100); // the reference
+  addRider(riders, 1, 900);
+
+  Schedule s;
+  s.rebuild(300, riders, MAX_RIDERS); // ids 100, 300, 900: we are slot 1
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+
+  s.syncTo(1000); // the reference's beacon landed here, so a cycle began
+  TEST_ASSERT_TRUE(s.synced());
+
+  const uint32_t cycle = 250;
+  const uint32_t width = Schedule::slotWidthMs(cycle); // 250 / 9 = 27
+  TEST_ASSERT_EQUAL_UINT32(27, width);
+
+  // Slot 1 runs from 27 ms to 54 ms after the cycle starts.
+  TEST_ASSERT_FALSE(s.inSlot(1000, cycle));
+  TEST_ASSERT_FALSE(s.inSlot(1000 + width - 1, cycle));
+  TEST_ASSERT_TRUE(s.inSlot(1000 + width, cycle));
+  TEST_ASSERT_TRUE(s.inSlot(1000 + width * 2 - 1, cycle));
+  TEST_ASSERT_FALSE(s.inSlot(1000 + width * 2, cycle));
+
+  // And again a cycle later, without another sync.
+  TEST_ASSERT_TRUE(s.inSlot(1000 + cycle + width, cycle));
+  TEST_ASSERT_FALSE(s.inSlot(1000 + cycle, cycle));
+}
+
+void test_slots_keep_running_across_the_millis_wrap() {
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 100);
+  addRider(riders, 1, 900);
+
+  Schedule s;
+  s.rebuild(300, riders, MAX_RIDERS);
+  s.syncTo(0xFFFFFF00);
+
+  const uint32_t cycle = 250;
+  const uint32_t width = Schedule::slotWidthMs(cycle);
+  // 0xFFFFFF00 + 250 wraps past zero. Unsigned subtraction carries the phase
+  // through; signed would put the slot 49 days away.
+  TEST_ASSERT_TRUE(s.inSlot((uint32_t)(0xFFFFFF00 + cycle + width), cycle));
+}
+
+void test_more_cars_than_slots_doubles_up_rather_than_falling_off() {
+  Rider riders[MAX_RIDERS] = {};
+  for (size_t i = 0; i < MAX_RIDERS; i++) addRider(riders, i, (uint32_t)(i + 1));
+
+  // Our id sorts above all eight, so our rank is 8 and there are 9 slots.
+  Schedule s;
+  s.rebuild(1000, riders, MAX_RIDERS);
+  TEST_ASSERT_TRUE(s.slot() < MAX_SLOTS);
+}
+
+void test_a_duplicate_node_number_does_not_corrupt_the_rank() {
+  // Two boards with the same node number is a real failure, but it must not
+  // also push everybody else's slot along by one.
+  Rider riders[MAX_RIDERS] = {};
+  addRider(riders, 0, 100);
+  addRider(riders, 1, 300); // same as ours
+
+  Schedule s;
+  s.rebuild(300, riders, MAX_RIDERS);
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+  TEST_ASSERT_EQUAL_UINT8(2, s.known());
+}
+
 void setUp() {}
 void tearDown() {}
 
@@ -519,5 +683,15 @@ int main(int, char**) {
   RUN_TEST(test_a_forward_nobody_else_made_still_goes);
   RUN_TEST(test_forward_queue_drops_rather_than_delaying_what_is_waiting);
   RUN_TEST(test_a_forward_scheduled_across_the_millis_wrap_still_fires);
+  RUN_TEST(test_distance_is_close_enough_to_be_a_gate);
+  RUN_TEST(test_distance_does_not_overflow_on_a_full_span_of_longitude);
+  RUN_TEST(test_slot_is_our_rank_among_known_cars);
+  RUN_TEST(test_every_car_computes_a_different_slot);
+  RUN_TEST(test_the_lowest_node_number_is_the_reference);
+  RUN_TEST(test_a_car_alone_does_not_wait_for_a_schedule);
+  RUN_TEST(test_slot_window_opens_once_per_cycle);
+  RUN_TEST(test_slots_keep_running_across_the_millis_wrap);
+  RUN_TEST(test_more_cars_than_slots_doubles_up_rather_than_falling_off);
+  RUN_TEST(test_a_duplicate_node_number_does_not_corrupt_the_rank);
   return UNITY_END();
 }

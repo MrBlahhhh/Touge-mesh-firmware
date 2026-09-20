@@ -138,30 +138,77 @@ The target is under a second from one car's GPS to another car's screen, and
 the transport is not the part that costs anything: a hop over ESP-NOW is two or
 three milliseconds, and two hops with jitter is under fifty.
 
-What decides freshness is `BEACON_MS`, at 250 ms. At one second a position is
-already half a second stale on average before it is even sent, which alone eats
-the budget. Four cars at 4 Hz over two hops runs at roughly a fifth of the
-channel once suppression is working.
+What decides freshness is the beacon, and the beacon answers two separate
+questions: is there anything worth saying, and is it our turn to say it.
 
-There are no dedicated repeaters and there is no need for any. Every node
-forwards, which is what `FAST_HOPS = 2` means: it covers a convoy strung out
-far enough that the front and back cannot hear each other but the middle can
-hear both.
+### The gate: 20 metres or 3 seconds
 
-Flooding does need two things that are easy to leave out:
+Taken from Blue Force Tracker, which reports every 30 seconds or every 50
+metres of travel, whichever comes first.
+
+A distance trigger bounds the thing that actually matters. Not how old a
+position is, but how wrong it is. At `GATE_METRES = 20` nobody's icon on your
+map is ever more than about four car lengths from where that car really is,
+whether it is doing 70 or sitting at a junction. A pure time trigger gives you
+the opposite: it spends the most airtime on the car that has not moved.
+
+At 60 mph that works out to a beacon every 750 ms or so. Parked, it drops to
+the `GATE_IDLE_MS` heartbeat at 3 s and costs almost nothing.
+
+### The slots
+
+Beacons are the only traffic that is both periodic and constant, which makes
+them the traffic that reliably collides, and it gets worse with every car
+added. So they get slots instead of a politeness scheme.
+
+`CYCLE_MS` is 250 ms, cut into `MAX_SLOTS` (9) of 27 ms each. Every car works
+out the same ordering from the same roster and transmits only in its own:
+
+- **Slot is rank.** How many node numbers on the ride sort below yours. No
+  sorting, no allocation, no handing slots out, and every car computing it over
+  the same roster gets the same answer.
+- **The lowest node number is the reference** and holds slot zero, so its
+  beacon landing is the start of a cycle. There is nothing to elect. Only a
+  frame heard directly is used for sync; one that came via a neighbour carries
+  that neighbour's forwarding jitter.
+- **A car alone free-runs.** No schedule worth keeping and nothing to collide
+  with, and waiting for a sync that will never arrive would mean never
+  transmitting at all.
+
+Cardo's DMC does this (US10277748) with a leader election and a designated
+synchronizer. This is the same idea with the negotiation removed.
+
+**It is not real TDMA.** ESP-NOW sits on 802.11, whose MAC does its own carrier
+sense and backoff underneath and cannot be turned off, and the clock comes from
+received beacons rather than GPS, so it is good to a couple of milliseconds and
+no better. Against a 27 ms slot that is plenty. What this removes is
+self-collision, the loss that grows with the size of the group. It does not
+make the channel exclusive.
+
+Reception is timestamped in the ESP-NOW driver callback rather than in the
+polling loop, because the 5 ms a poll can sit waiting would be a fifth of a
+slot.
+
+### Voice and forwards stay contended
+
+Deliberately. Voice is bursty and latency-critical, and push-to-talk means
+there is normally one talker, so slotting it would add up to a full cycle of
+delay to buy nothing. Forwards are aperiodic. Both keep the jitter scheme:
 
 - **Random delay per forward.** Every car that heard a frame reaches the
-  forwarding decision in the same microsecond. Sent immediately, they collide
-  and the forward reaches nobody, and it gets worse with more cars, not better.
-  Each one waits a random slice of `FORWARD_JITTER_MS` instead.
-- **Counting the copies.** Having heard `SUPPRESS_AFTER` copies of a packet,
-  everyone within earshot has it and one more transmission is interference. A
-  held frame that gets overtaken while it waits is dropped. In a four-car
-  convoy in line of sight nearly every forward is redundant, and this is what
-  keeps them from costing anything. `Mesh::suppressed()` counts them.
+  forwarding decision in the same microsecond. Sent immediately they collide
+  and the forward reaches nobody. Each waits a random slice of
+  `FORWARD_JITTER_MS`.
+- **Counting the copies.** Having heard `SUPPRESS_AFTER` copies, everyone
+  within earshot has it and one more transmission is interference, so a held
+  frame overtaken while it waits is dropped. In a four-car convoy in line of
+  sight nearly every forward is redundant. `Mesh::suppressed()` counts them.
 
-Beacons carry their own jitter too, because cars powered up together otherwise
-fall into lockstep and collide on every single one.
+### No repeaters
+
+There are none and none are needed. Every node forwards, which is what
+`FAST_HOPS = 2` means: it covers a convoy strung out far enough that the front
+and back cannot hear each other but the middle can hear both.
 
 ## Known limits
 

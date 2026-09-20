@@ -1,5 +1,10 @@
 #include "frame.h"
 #include <string.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace touge {
 namespace {
@@ -100,6 +105,28 @@ bool decodePosition(const uint8_t* in, size_t len, Position& out) {
   memset(out.name, 0, sizeof(out.name));
   if (nameLen > 0) memcpy(out.name, in + POSITION_MIN, nameLen);
   return true;
+}
+
+uint32_t distanceM(int32_t lat1, int32_t lon1, int32_t lat2, int32_t lon2) {
+  // Sixty-four bit, and not for precision. Longitude spans -1.8e9 to +1.8e9 at
+  // this scale, so a car either side of the date line produces a difference of
+  // 3.6e9, which does not fit in the int32 the operands are stored in.
+  const double SCALE = 1e-7;
+  double dLat = (double)((int64_t)lat2 - (int64_t)lat1) * SCALE;
+  double dLon = (double)((int64_t)lon2 - (int64_t)lon1) * SCALE;
+
+  const double M_PER_DEG = 111320.0;
+  double meanLat = ((double)lat1 + (double)lat2) * 0.5 * SCALE * (M_PI / 180.0);
+  // Longitude lines converge towards the poles, so a degree of longitude is
+  // worth less the further north you are. Without this a car at 60 degrees
+  // would read twice as far east as it is.
+  double x = dLon * M_PER_DEG * cos(meanLat);
+  double y = dLat * M_PER_DEG;
+
+  double d = sqrt(x * x + y * y);
+  if (d <= 0) return 0;
+  if (d > (double)0xFFFFFFFFu) return 0xFFFFFFFFu;
+  return (uint32_t)(d + 0.5);
 }
 
 } // namespace touge

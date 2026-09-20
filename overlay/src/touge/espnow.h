@@ -36,6 +36,10 @@ struct FastRx {
   uint8_t data[FRAME_MAX];
   uint16_t len = 0;
   int8_t rssi = 0;
+  // Stamped in the driver callback, not in the polling loop. The schedule
+  // recovers its clock from this, and the five milliseconds a poll can sit
+  // waiting would be a fifth of a slot.
+  uint32_t rxMs = 0;
 };
 
 class FastRadio {

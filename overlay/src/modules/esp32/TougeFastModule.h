@@ -35,6 +35,7 @@
 #include "touge/frame.h"
 #include "touge/mesh.h"
 #include "touge/ride.h"
+#include "touge/schedule.h"
 
 class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
   public:
@@ -71,6 +72,7 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
 
     touge::Mesh mesh_;
     touge::FastNet net_;
+    touge::Schedule schedule_;
 
     uint8_t keySeen_[touge::PSK_LEN] = {0};
     uint8_t keySeenLen_ = 0;
@@ -81,7 +83,12 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     uint32_t lastBeaconMs_ = 0;
     uint32_t lastNameMs_ = 0;
     uint32_t lastSyncMs_ = 0;
-    uint32_t beaconGapMs_ = 0;
+    // The gate has opened and we are waiting for our slot.
+    bool wantBeacon_ = false;
+    // Where we were when we last transmitted, for the distance gate.
+    int32_t sentLat_ = 0;
+    int32_t sentLon_ = 0;
+    bool sentOnce_ = false;
 };
 
 extern TougeFastModule *tougeFastModule;

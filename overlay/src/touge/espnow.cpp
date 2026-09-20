@@ -3,6 +3,7 @@
 #include <string.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <Arduino.h>
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -40,6 +41,7 @@ void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
   FastRx rx;
   rx.len = (uint16_t)len;
   rx.rssi = rssi;
+  rx.rxMs = millis();
   memcpy(rx.data, data, (size_t)len);
 
   // This runs on the Wi-Fi task. Blocking here stalls the driver, so a full

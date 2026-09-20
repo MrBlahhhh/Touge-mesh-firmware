@@ -81,4 +81,11 @@ static const size_t POSITION_MIN = 12;
 size_t encodePosition(const Position& p, uint8_t* out, size_t cap);
 bool decodePosition(const uint8_t* in, size_t len, Position& out);
 
+// Metres between two fixed-point coordinates.
+//
+// Equirectangular, not haversine. Over the few hundred metres that separate
+// cars on one road the error is under a tenth of a percent, and this runs in a
+// beacon gate that fires several times a second.
+uint32_t distanceM(int32_t lat1, int32_t lon1, int32_t lat2, int32_t lon2);
+
 } // namespace touge
