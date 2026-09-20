@@ -541,6 +541,22 @@ void TougeFastModule::status(uint32_t nowMs)
              (unsigned)schedule_.known(), (unsigned)schedule_.referenceId(),
              schedule_.weAreReference() ? " (us)" : "", clock, (unsigned)fastNeighbours(),
              (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped());
+
+    // Signal strength per car, which is the number that settles an argument
+    // about antennas.
+    //
+    // The board offers three ways to wire 2.4 GHz - the on-board trace, an
+    // IPEX after lifting an inductor, or both bridged together - and the only
+    // honest way to choose is to build two boards differently and read what
+    // they hear. Every position is already stamped with the RSSI it arrived
+    // at; it simply had nowhere to go.
+    const Rider *rs = mesh_.riders();
+    for (size_t i = 0; i < MAX_RIDERS; i++) {
+        if (!rs[i].used || rs[i].via != HEARD_FAST) continue;
+        LOG_INFO("touge:   %08x rssi=%d hops=%u age=%ums %s", (unsigned)rs[i].id, (int)rs[i].rssi,
+                 (unsigned)rs[i].hopsAway, (unsigned)(nowMs - rs[i].atMs),
+                 rs[i].pos.name[0] ? rs[i].pos.name : "");
+    }
 }
 
 void TougeFastModule::hopKeeping(uint32_t nowMs)
