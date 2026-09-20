@@ -361,7 +361,12 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
             // LoRa. A NodeInfo that arrived the normal way is signed and
             // carries a long name; overwriting it from an unauthenticated
             // 2.4 GHz frame would be a downgrade.
-            if (n && !n->has_user) {
+            //
+            // An empty long_name is the test, because NodeInfoLite has no
+            // nested User to ask about: this firmware flattens long_name and
+            // short_name onto the node itself, so there is no has_user to
+            // read. No name stored means there is nothing to downgrade.
+            if (n && n->long_name[0] == 0) {
                 meshtastic_User u = meshtastic_User_init_default;
                 strncpy(u.short_name, p.name, sizeof(u.short_name) - 1);
                 strncpy(u.long_name, p.name, sizeof(u.long_name) - 1);
