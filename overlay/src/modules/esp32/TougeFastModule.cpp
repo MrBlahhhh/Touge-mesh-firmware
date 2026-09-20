@@ -132,12 +132,23 @@ TougeFastModule::TougeFastModule()
     loadIdCounter();
 }
 
-size_t TougeFastModule::fastNeighbours() const
+size_t TougeFastModule::fastNeighbours(uint32_t nowMs) const
 {
     size_t n = 0;
     const Rider *r = mesh_.riders();
-    for (size_t i = 0; i < MAX_RIDERS; i++)
-        if (r[i].used && r[i].via == HEARD_FAST) n++;
+    for (size_t i = 0; i < MAX_RIDERS; i++) {
+        if (!r[i].used || r[i].via != HEARD_FAST) continue;
+        // Heard on the fast lane recently, not ever.
+        //
+        // via is only ever set to HEARD_FAST, because that is the only way a
+        // position reaches this module, and a rider keeps its seat for ten
+        // minutes. So without a window this counted every car heard on
+        // 2.4 GHz since the ride started, long after they had dropped back to
+        // LoRa, and reported it as the live fast count. That number is what
+        // an antenna change gets judged on, so it has to mean what it says.
+        if ((uint32_t)(nowMs - r[i].atMs) >= FAST_PRECEDENCE_MS) continue;
+        n++;
+    }
     return n;
 }
 
@@ -220,7 +231,12 @@ void TougeFastModule::syncChannel()
         started_ = false;
         return;
     }
-    fastRadio.retuneTo(hop_.channel());
+    if (!fastRadio.retuneTo(hop_.channel())) {
+        // Up, but not where we meant to be. Worth one line at boot rather than
+        // a silent mismatch that only shows up as a ride nobody can hear.
+        LOG_WARN("touge: wanted channel %u, radio stayed on %u (WiFi or MQTT associated?)",
+                 (unsigned)hop_.channel(), (unsigned)fastRadio.channel());
+    }
     started_ = true;
     LOG_INFO("touge: fast lane up on wifi channel %u", (unsigned)fastRadio.channel());
 }
@@ -355,6 +371,51 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
 
         nodeDB->updatePosition(f.src, mp, RX_SRC_RADIO);
 
+        // Stamp when we heard them.
+        //
+        // updatePosition deliberately does not touch last_heard; updateFrom
+        // does, off a LoRa packet's rx_time, and a car carried only by the
+        // fast lane never goes through it. Without this a car whose position
+        // is a quarter of a second old reads as never heard from at all.
+        meshtastic_NodeInfoLite *heard = nodeDB->getMeshNode(f.src);
+        if (heard) heard->last_heard = mp.time;
+
+        // And hand the phone a packet, which is the entire point of the
+        // exercise.
+        //
+        // NodeDB is not a route to the app. updatePosition ends in
+        // notifyObservers, and the things observing that are the screen and
+        // other modules, never PhoneAPI: the phone learns positions from
+        // packets and only sees the node database on a config dump. Worse,
+        // handleReceived below returns STOP for the LoRa copy of any car on
+        // the fast lane, and that STOP breaks the module loop before
+        // RoutingModule, which owns the only live handleFromRadio call. So
+        // the app went blind to precisely the cars the fast lane was working
+        // for, while the OLED two feet away looked perfect.
+        meshtastic_MeshPacket *pp = router->allocForSending();
+        if (pp) {
+            pp->from = f.src;
+            pp->to = NODENUM_BROADCAST;
+            pp->id = f.id;
+            pp->channel = channels.getPrimaryIndex();
+            pp->hop_limit = 0;
+            pp->hop_start = 0;
+            pp->rx_rssi = rssi;
+            pp->rx_time = mp.time;
+            pp->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+            pp->decoded.portnum = meshtastic_PortNum_POSITION_APP;
+            size_t n = pb_encode_to_bytes(pp->decoded.payload.bytes, sizeof(pp->decoded.payload.bytes),
+                                          &meshtastic_Position_msg, &mp);
+            if (n > 0) {
+                pp->decoded.payload.size = (uint16_t)n;
+                service->sendToPhone(pp);
+            } else {
+                // An oversized encode is silent and returns 0. Shipping the
+                // empty packet would look like a position of nowhere.
+                packetPool.release(pp);
+            }
+        }
+
         if (p.name[0] != 0) {
             meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(f.src);
             // Only fill in a name for a node we have never heard from over
@@ -430,9 +491,35 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         // Authenticated, so it is genuinely one of ours. That makes it evidence
         // the channel works, which is what the hop decision is measuring.
         lastHeardMs_ = nowMs;
-        heardInWindow_++;
+
+        // Keep time before the dedupe, not after it.
+        //
+        // This used to sit below, and a beacon whose direct copy was lost
+        // while a neighbour's forward of it got through would be dropped by
+        // dedupe with the clock never touched. The forward cannot arrive
+        // first at a car in direct range, since forwarding means receiving
+        // and then waiting out jitter, so that only bit when the direct copy
+        // was actually lost. Cheap to get right regardless, and the next
+        // beacon no longer has to cover for it.
+        //
+        // Still direct-only: a forwarded copy carries the forwarder's jitter
+        // and would drag the whole schedule sideways. Once per frame, because
+        // a genuine retransmission of the same id arrives later than the
+        // first and syncing to it would step the epoch backwards.
+        if (f.src == schedule_.referenceId() && f.hops == FAST_HOPS &&
+            !(f.src == lastSyncSrc_ && f.id == lastSyncId_)) {
+            lastSyncSrc_ = f.src;
+            lastSyncId_ = f.id;
+            schedule_.syncTo(rx.rxMs, CYCLE_MS);
+        }
 
         if (!mesh_.firstSight(f.src, f.id, nowMs)) continue;
+
+        // Distinct frames only. Counting every copy meant a channel busy
+        // enough to be flooding itself with duplicates and forwards read as
+        // a healthy one, which is exactly backwards for a number whose whole
+        // job is deciding whether to stay on this channel.
+        heardInWindow_++;
 
         if (f.type == FRAME_POSITION) {
             Position p;
@@ -441,9 +528,24 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
                 // A newer belief about the channel wins, wherever it comes
                 // from. Only acted on after the tag has already passed, so a
                 // stranger cannot walk the ride off its channel.
+                // Snapshot before observe(), which is what moves the belief.
+                const uint8_t wasIndex = hop_.index();
+                const uint8_t wasGen = hop_.generation();
                 if (hop_.observe(p.hop)) {
-                    LOG_INFO("touge: following a hop to channel %u", (unsigned)hop_.channel());
-                    fastRadio.retuneTo(hop_.channel());
+                    // Only claim the move if the radio actually made it.
+                    //
+                    // esp_wifi_set_channel fails outright while the station is
+                    // associated, which it is whenever Meshtastic's own WiFi or
+                    // MQTT is up. Taking the new belief anyway left this node
+                    // certain it was on a channel it could not hear, and the log
+                    // cheerfully agreed with it.
+                    if (fastRadio.retuneTo(hop_.channel())) {
+                        LOG_INFO("touge: following a hop to channel %u", (unsigned)hop_.channel());
+                    } else {
+                        LOG_WARN("touge: could not retune to channel %u, staying on %u",
+                                 (unsigned)hop_.channel(), (unsigned)fastRadio.channel());
+                        hop_.restore(wasIndex, wasGen);
+                    }
                 }
                 // Every position, not only the ones that change the head count.
                 // A car can keep its seat on the roster and still move slot, or
@@ -455,12 +557,6 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
                                   mesh_.riders(), MAX_RIDERS);
             }
         }
-
-        // The lowest node number on the ride holds slot zero, so its frame
-        // landing is the start of a cycle. Only a frame heard directly is any
-        // use for this: one that came via a neighbour carries that neighbour's
-        // forwarding jitter and would drag the whole schedule sideways.
-        if (f.src == schedule_.referenceId() && f.hops == FAST_HOPS) schedule_.syncTo(rx.rxMs, CYCLE_MS);
 
         inject(f, body, bodyLen, rx.rssi);
 
@@ -544,7 +640,7 @@ void TougeFastModule::status(uint32_t nowMs)
     LOG_INFO("touge: ch=%u slot=%s/%u known=%u ref=%08x%s clock=%s fast=%u suppressed=%u dropped=%u",
              (unsigned)fastRadio.channel(), slotText, (unsigned)MAX_SLOTS,
              (unsigned)schedule_.known(), (unsigned)schedule_.referenceId(),
-             schedule_.weAreReference() ? " (us)" : "", clock, (unsigned)fastNeighbours(),
+             schedule_.weAreReference() ? " (us)" : "", clock, (unsigned)fastNeighbours(nowMs),
              (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped());
 
     // Signal strength per car, which is the number that settles an argument
@@ -585,8 +681,15 @@ void TougeFastModule::hopKeeping(uint32_t nowMs)
         if ((uint32_t)(nowMs - lastScanMs_) >= SCAN_DWELL_MS) {
             lastScanMs_ = nowMs;
             uint8_t ch = hop_.scanNext();
-            LOG_DEBUG("touge: quiet for %ums, listening on channel %u", (unsigned)quiet, (unsigned)ch);
-            fastRadio.retuneTo(ch);
+            if (fastRadio.retuneTo(ch)) {
+                LOG_DEBUG("touge: quiet for %ums, listening on channel %u", (unsigned)quiet, (unsigned)ch);
+            } else {
+                // Stuck on one channel, so the scan cannot do its job. Saying so
+                // beats printing a sweep that never happened while the ride is
+                // somewhere else.
+                LOG_WARN("touge: quiet for %ums but cannot leave channel %u to look",
+                         (unsigned)quiet, (unsigned)fastRadio.channel());
+            }
         }
         return;
     }
@@ -607,10 +710,20 @@ void TougeFastModule::hopKeeping(uint32_t nowMs)
     if (cars == 0 || expect == 0) return;
 
     if (got * 100 / expect < HOP_KEEP_PCT) {
+        const uint8_t wasIndex = hop_.index();
+        const uint8_t wasGen = hop_.generation();
         hop_.advance();
+        // A hop nobody can perform is worse than staying put: the rest of the
+        // ride follows the beacon that announced it, and this node sits on the
+        // old channel believing it led them there.
+        if (!fastRadio.retuneTo(hop_.channel())) {
+            LOG_WARN("touge: %u of %u beacons but the radio will not leave channel %u",
+                     (unsigned)got, (unsigned)expect, (unsigned)fastRadio.channel());
+            hop_.restore(wasIndex, wasGen);
+            return;
+        }
         LOG_INFO("touge: %u of %u expected beacons, hopping to channel %u", (unsigned)got,
                  (unsigned)expect, (unsigned)hop_.channel());
-        fastRadio.retuneTo(hop_.channel());
         // Everyone else is still on the old channel and will not hear the next
         // beacon. They go quiet, they scan, they find us. That is the design
         // rather than a shortcoming of it.

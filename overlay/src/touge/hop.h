@@ -72,6 +72,18 @@ class Hop {
   // rather than imposing the one it happened to stop on.
   uint8_t scanNext();
 
+  // Put the belief back where it was.
+  //
+  // For when the radio refused to move. Deciding to hop and then failing to
+  // retune leaves this class pointing at a channel the hardware is not on,
+  // and every later decision is made against that fiction. Restoring keeps
+  // what we believe and what we are listening to as the same thing.
+  void restore(uint8_t index, uint8_t generation)
+  {
+    index_ = index;
+    generation_ = generation;
+  }
+
  private:
   uint8_t index_ = 0;
   uint8_t generation_ = 0;

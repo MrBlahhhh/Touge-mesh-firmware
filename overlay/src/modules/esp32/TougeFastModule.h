@@ -44,7 +44,7 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     TougeFastModule();
 
     // For the screen: how many cars are close enough to be on 2.4 GHz.
-    size_t fastNeighbours() const;
+    size_t fastNeighbours(uint32_t nowMs) const;
 
   protected:
     virtual int32_t runOnce() override;
@@ -100,6 +100,10 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     uint32_t lastHopCheckMs_ = 0;
     uint32_t lastStatusMs_ = 0;
     uint32_t heardInWindow_ = 0;
+    // The last reference beacon the clock was stepped to, so a repeat of
+    // the same frame cannot step it a second time.
+    uint32_t lastSyncSrc_ = 0;
+    uint32_t lastSyncId_ = 0;
     // The gate has opened and we are waiting for our slot.
     bool wantBeacon_ = false;
     // Where we were when we last transmitted, for the distance gate.

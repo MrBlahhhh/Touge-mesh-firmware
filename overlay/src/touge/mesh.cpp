@@ -95,25 +95,39 @@ bool Mesh::defer(const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uin
 }
 
 bool Mesh::nextDue(uint32_t nowMs, Forward& out) {
-  for (size_t i = 0; i < FORWARD_SLOTS; i++) {
-    Forward& f = forwards_[i];
-    if (!f.used) continue;
-    // Unsigned, so a frame scheduled before a millis() wrap still comes due
-    // rather than waiting out the next forty-nine days.
-    if ((int32_t)(nowMs - f.dueMs) < 0) continue;
+  // Oldest debt first, rather than whichever slot happens to be lowest.
+  //
+  // Taking these in array order meant a frame that came due twenty
+  // milliseconds ago could go out behind one that came due just now, purely
+  // because it landed in a higher slot. The jitter that spaces forwards apart
+  // is chosen per frame, so under load the order the table happens to be in
+  // has nothing to do with the order the air wanted them in.
+  for (;;) {
+    Forward* best = nullptr;
+    for (size_t i = 0; i < FORWARD_SLOTS; i++) {
+      Forward& f = forwards_[i];
+      if (!f.used) continue;
+      // Unsigned, so a frame scheduled before a millis() wrap still comes due
+      // rather than waiting out the next forty-nine days. The same signed
+      // difference orders two due frames against each other.
+      if ((int32_t)(nowMs - f.dueMs) < 0) continue;
+      if (best == nullptr || (int32_t)(f.dueMs - best->dueMs) < 0) best = &f;
+    }
+    if (best == nullptr) return false;
 
-    f.used = false;
+    best->used = false;
     // Neighbours may have rebroadcast it while this one waited. If enough of
     // them did, everyone in earshot has it and this transmission would be
-    // pure interference.
-    if (copies(f.src, f.id, nowMs) >= SUPPRESS_AFTER) {
+    // pure interference. Suppressing one does not excuse the rest, so this
+    // goes round again rather than giving up for this tick; the slot has been
+    // released either way, so the loop always shrinks.
+    if (copies(best->src, best->id, nowMs) >= SUPPRESS_AFTER) {
       suppressed_++;
       continue;
     }
-    out = f;
+    out = *best;
     return true;
   }
-  return false;
 }
 
 Rider* Mesh::note(uint32_t src, const Position& p, uint8_t via, int16_t rssi, uint8_t hopsAway,
