@@ -129,6 +129,13 @@ const uint32_t HOP_KEEP_PCT = 25;
 // bench of boards find each other, rare enough not to drown the log.
 const uint32_t STATUS_EVERY_MS = 5000;
 
+// How old the local fix may be before this board stops beaconing it.
+//
+// The phone feeds a position every few seconds, so ten is several missed
+// updates - long enough to ride out a hiccup, short enough that a radio whose
+// phone has gone stops claiming to know where its car is.
+const uint32_t POSITION_STALE_S = 10;
+
 // The shortest PSK worth deriving a 2.4 GHz key from.
 //
 // Meshtastic uses one byte to mean "the default channel, key number N", which
@@ -351,6 +358,26 @@ void TougeFastModule::beacon(uint32_t nowMs)
     // Two separate questions, deliberately. First: is there anything worth
     // saying? Then: is it our turn to say it? Collapsing them would either
     // give up the slot discipline or let a parked car hold one open.
+    // Nothing to say if nobody has told us anything lately.
+    //
+    // A board keeps beaconing whatever localPosition last held, so a radio
+    // left switched on after its phone walked away broadcast a frozen fix at
+    // 1 Hz indefinitely - and because a fast position outranks the LoRa one,
+    // everyone else pinned that car to a place it had left. Seen tonight: a
+    // rider who had closed the app, left the ride and turned her LoRa off was
+    // still on the map, because her board was still talking.
+    //
+    // The position carries the time it was measured. If that has stopped
+    // advancing, we have nothing new to say and should say nothing, which also
+    // lets the far end fall back to LoRa after FAST_PRECEDENCE_MS rather than
+    // preferring our stale copy forever.
+    uint32_t nowSec = getValidTime(RTCQualityFromNet);
+    if (nowSec > 0 && localPosition.time > 0 &&
+        nowSec - localPosition.time > POSITION_STALE_S) {
+        wantBeacon_ = false;
+        return;
+    }
+
     if (!wantBeacon_) {
         uint32_t since = (uint32_t)(nowMs - lastBeaconMs_);
         uint32_t moved = sentOnce_ ? distanceM(sentLat_, sentLon_, localPosition.latitude_i,
