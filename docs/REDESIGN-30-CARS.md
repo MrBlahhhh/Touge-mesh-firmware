@@ -1,7 +1,7 @@
-# 2.4 GHz lane: redesign for 30 cars over half a mile
+# 2.4 GHz lane: redesign for 28 cars over half a mile
 
 
-Stated 2026-09-20 late: rides are **up to 30 cars spread over half a mile in
+Stated 2026-09-20 late: rides are **up to 28 cars spread over half a mile in
 the mountains**. Everything built and tested that day assumed a bench group of
 three and a design ceiling of eight.
 
@@ -38,7 +38,7 @@ slot may be reused, so front and tail transmit simultaneously.
 **`FRAME_ROSTER` (type 5, defined in frame.h, currently unused) becomes
 neighbour gossip:** direct neighbours, RSSI, link age, claimed slot, selected
 relay status. Each node colours its own two-hop graph from that without
-knowing all thirty riders.
+knowing all twenty-eight riders.
 
 **Selected multipoint relays instead of flooding** (OLSR-style): pick a small
 relay set covering every two-hop neighbour, forward each packet once through
@@ -77,7 +77,7 @@ audio and LoRa cannot carry 12.2 kbit/s speech.
    no host C++ compiler on this machine. Nothing below can be simulated
    without it. First thing.
 2. **`FRAME_ROSTER` neighbour gossip**, then **long-chain simulation tests**
-   (30 nodes in a line, partial visibility, hidden relays). This supplies the
+   (28 nodes in a line, partial visibility, hidden relays). This supplies the
    two-hop conflict graph; without it neighbourhood TDMA still collides at
    hidden relay nodes.
 3. **Measure real ESP-NOW LR airtime and send-completion latency** on the bench
@@ -91,7 +91,7 @@ audio and LoRa cannot carry 12.2 kbit/s speech.
 
 This is weeks of protocol work, not an evening. The nine-slot scheduler was a
 useful prototype and proved the lane carries traffic between boards; it is
-not the thing that ships for thirty riders.
+not the thing that ships for twenty-eight riders.
 
 Related: [[gnss-only-buys-pps-timing]] (PPS makes the sync tree unnecessary
 where present), [[hub-election-ignores-position]] (superseded by the sync tree
