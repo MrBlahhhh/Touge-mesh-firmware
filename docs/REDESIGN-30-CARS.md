@@ -1,91 +1,90 @@
-# 2.4 GHz lane: redesign for 28 cars over half a mile
 
+## Review findings not yet fixed (2026-09-21)
 
-Stated 2026-09-20 late: rides are **up to 28 cars spread over half a mile in
-the mountains**. Everything built and tested that day assumed a bench group of
-three and a design ceiling of eight.
+Ranked. Everything above this line in the "order of work" still stands; these
+are the specific faults a second review found, with the evidence.
 
-## Why the current design cannot get there
+**Positions are up to 20 s old and stamped as fresh.** A phone-fed board's
+`localPosition` is only written by the phone's broadcast position packet, sent
+at `Convoy.pingIntervalMs`, which at 28 cars is pinned to the 20 s
+`MAX_MESH_FLOOR_MS` cap. `beacon()` sees no movement and re-sends the same fix
+every second, so the 250 ms cycle is optimising delivery of a 20 s old
+position. Worse, the wire format carries no fix time: `inject()` stamps
+`mp.time` with the *receive* time, so the app's age column reads "now" and the
+LoRa-precedence STOP then blocks the fresher LoRa copy as "older". Fix: have
+the app write a local-only position (to = own node, hop_limit 0, via
+`sendLocal`) at 1 Hz independent of the LoRa pacing, put a fix time in the
+frame, and publish `heard` to the UI from `drain()` rather than only from the
+exchange loop.
 
-- `MAX_RIDERS` was 8 and `MAX_SLOTS` was `MAX_RIDERS + 1`. Raised to 28 and
-  decoupled in 116560f: the roster holds a real ride now, and slots are an
-  airtime budget rather than a headcount.
-- That does **not** give 28 cars 28 slots. `rebuild` deals them into 9 by
-  `selfId % MAX_SLOTS`, about three deep, and those three transmit together
-  every idle beacon. They do not free-run - an earlier note here said they did
-  and it was wrong. The roster fix makes cars 9-28 exist; the collision is
-  exactly what two-hop colouring is for.
-- The collisions feed the hop decision. Lost frames read as a bad channel, the
-  reference moves the whole ride, everyone spends seconds scanning, more frames
-  are lost. Countermeasures so far: the hop denominator now counts cars heard
-  on this channel rather than every seat in the roster, and the reference keeps
-  to its own slot instead of transmitting whenever it likes.
-- Clock sync comes only from beacons heard **directly** from one reference car.
-  Over half a mile of mountain most cars cannot hear it. The machinery is
-  unavailable precisely where hidden nodes make it necessary.
-- Blind two-hop flooding. Thirty cars at 1 Hz plus rebroadcast is a large
-  share of an ESP-NOW LR channel (250 kbps, ~8 ms per 250 byte frame) before a
-  single voice talker.
+**The radio-to-phone BLE path cannot carry 28 cars.** `inject()` allocates one
+MeshPacket per position, plus one per voice frame, plus the 5 s status. That is
+28-38 packets/s idle before voice. `MeshService::sendToPhone` drops non-text
+packets when `toPhoneQueue` is full (32 max), and the app drains one GATT read
+at a time, sequentially, never requesting a faster connection interval. Once
+behind, the newest positions, the fast-lane status and every voice frame are
+dropped at the radio - and the app reports a dead lane on a saturated healthy
+one.
 
-## Agreed target architecture
+**The LoRa-precedence STOP also kills LoRa rebroadcast.** `handleReceived`
+returns STOP for a LoRa position from any car heard on 2.4 GHz within 3 s, and
+`callModules` breaks before RoutingModule, which is where
+`perhapsRebroadcast` lives. So a middle car that hears the head over 2.4 GHz
+refuses to relay the head's LoRa position, and a tail car beyond both the
+head's LoRa range and FAST_HOPS gets nothing on either radio. The existing
+comment notices the STOP breaks phone delivery and works around that; it does
+not mention the rebroadcast.
 
-Verified against the code where it makes claims about it.
+**Unslotted forwards saturate the channel.** Every hearer defers a forward with
+0-15 ms jitter, but copies only count once drained at the 5 ms cadence, so the
+first wave - about a third of hearers - transmits having seen only the
+original and SUPPRESS_AFTER cannot stop it. A 28-car car park is ~9 forwards
+per frame, roughly 0.85 s of air per second from positions alone. One talker at
+16.7 frames/s adds ~1.5 s/s after forwarding. Slots are meaningless while
+anyone talks.
 
-**One epoch across the connected ride, not per-neighbourhood clocks.** GPS PPS
-where available. Without PPS, propagate a root clock through a sync tree:
-root id, generation, hop distance from root, timing quality. Every node in the
-component shares the frame epoch. (Per-neighbourhood clocks were considered
-and rejected: adjacent clusters on different time bases cannot reuse slots
-against each other, and a relay in both would carry two schedules.)
+**The reference is per observer.** Each car elects the lowest node number *it
+can hear*, so over half a mile several cars are simultaneously "the reference"
+and each may hop independently. A tail group that loses the head goes lost
+together, sweeps in lockstep, meets on the first candidate and stops there -
+neither group is ever lost again, so nothing reconverges them.
 
-**Two-hop slot colouring for spatial reuse.** A slot must be unique within a
-node's two-hop interference neighbourhood: if A and C both reach B but not
-each other, they must not share a slot or they collide at B. Beyond two hops a
-slot may be reused, so front and tail transmit simultaneously.
+**Slot ownership outlives the car by ten minutes.** `rebuild` counts a roster
+entry's claimed slot regardless of age, and the roster holds a car for
+`RIDER_DROP_MS`. Five cars that leave hold five of nine slots for ten minutes.
+And `syncChannel` rebuilds against an empty roster, so every board claims slot
+0 at boot: 28 cars powering up together take about nine beacon rounds to
+resolve, colliding on the low slots throughout.
 
-**`FRAME_ROSTER` (type 5, defined in frame.h, currently unused) becomes
-neighbour gossip:** direct neighbours, RSSI, link age, claimed slot, selected
-relay status. Each node colours its own two-hop graph from that without
-knowing all twenty-eight riders.
+**Transmit failures are invisible.** `transmit()`'s return is discarded,
+`sendDeferred` ignores `send()`, and there is no `esp_now_register_send_cb`, so
+`ESP_ERR_ESPNOW_NO_MEM` under saturation is silent. The status line counts
+receive drops and nothing else: a board that has stopped getting frames out
+looks healthy to itself.
 
-**Selected multipoint relays instead of flooding** (OLSR-style): pick a small
-relay set covering every two-hop neighbour, forward each packet once through
-it, keep two candidate relays where possible, recompute on link loss, use
-sequence numbers and route age rather than a fixed hop ceiling.
+**`rider.chan` is stamped at drain time, not receive time.** `onRecv` records
+`rxMs` but not the channel, so a retune inside `drainRadio` leaves frames
+received on the old channel stamped with the new one - which then makes
+`countOn(new)` count phantom cars.
 
-**The timing root is never the data hub.** It supplies the clock only; traffic
-follows the relay graph, so losing the root does not disconnect front from
-tail. On root loss, hold the current epoch and keep transmitting while
-electing a replacement; finish after ~3 missed 1 Hz control packets.
+**Dedupe TTL is fiction at 28 cars.** 64 entries against 40-55 distinct
+frames/s evicts the oldest every 1.2-1.6 s, so nothing reaches `SEEN_TTL_MS`.
+No harm today, since forwards settle inside ~20 ms, but
+`test_dedupe_forgets_after_the_window` documents a window that does not exist
+under load.
 
-  Correction to the brief as received: the current code already holds the
-  epoch and keeps transmitting on root loss (`haveEpoch_` stays true; only the
-  vote changes after `REFERENCE_LAPSE_MS` = 8 s). Nobody stops for eight
-  seconds. Tightening 8 s to ~3 s is a constant, not a redesign.
+**Voice has no app-side transport.** `LoopbackVoiceTransport` is what is wired;
+nothing implements `VoiceTransport` over the mesh. The firmware voice path is
+unexercised, and the two findings above land the moment it is wired.
 
-**Hybrid voice MAC:** reserved TDMA slots for active voice sources and their
-selected relays; a small contention window for joining, topology repair,
-emergency control and the 1 Hz positions. Superframe matched to the existing
-60 ms packetisation. Capacity assigned only to active talkers, not all 30.
-One PTT talker first; two to four overlapping later is realistic. Keep the
-previous-packet repeat initially - it doubles voice airtime but recovers loss.
+**Asserts worth adding:** `HOP_WINDOW_MS % GATE_IDLE_MS == 0`, a burst bound on
+`FORWARD_SLOTS`, and a measured `FRAME_AIRTIME_MS` (the current 8 ms is
+arithmetic and excludes the LR preamble).
 
-**Per-rider failover** (this was item 3 of the earlier review, deferred):
-prefer a fresh 2.4 GHz position; after three missed 1 Hz updates accept LoRa;
-if LoRa ages out accept cell; switch back the moment fresher 2.4 GHz traffic
-returns. Independently per rider, not the group-wide `usingCellBackup` switch
-that exists today.
-
-**Voice stays 2.4 GHz only.** The polling server cannot carry conversation
-audio and LoRa cannot carry 12.2 kbit/s speech.
-
-## Order of work
-
-1. **A host build that runs.** 74 firmware tests exist and have never executed:
-   no host C++ compiler on this machine. Nothing below can be simulated
-   without it. First thing.
-2. **`FRAME_ROSTER` neighbour gossip**, then **long-chain simulation tests**
-   (28 nodes in a line, partial visibility, hidden relays). This supplies the
+**App:** `Convoy.staleAfterMs` at 28 cars is 100 s, so a car that left the fast
+lane reads fresh for over a minute and a half. `carsWithinBudget` is logged and
+displayed but nothing acts on it.
+ supplies the
    two-hop conflict graph; without it neighbourhood TDMA still collides at
    hidden relay nodes.
 3. **Measure real ESP-NOW LR airtime and send-completion latency** on the bench
