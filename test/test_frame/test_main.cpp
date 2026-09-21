@@ -365,8 +365,8 @@ void test_roster_will_not_bump_a_car_you_are_driving_behind() {
 
   // Once a seat has gone quiet, the newcomer takes it.
   uint32_t later = 1000 + RIDER_STALE_MS + 1;
-  m.note(2, posNamed("x"), HEARD_FAST, -40, 0, later); // keep this one fresh
-  TEST_ASSERT_NOT_NULL(m.note(99, posNamed("late"), HEARD_FAST, -40, 0, later));
+  m.note(2, posNamed("x"), HEARD_FAST, -40, 0, later, 11); // keep this one fresh
+  TEST_ASSERT_NOT_NULL(m.note(99, posNamed("late"), HEARD_FAST, -40, 0, later, 11));
   TEST_ASSERT_NOT_NULL(m.find(99));
   TEST_ASSERT_NOT_NULL(m.find(2));
 }
