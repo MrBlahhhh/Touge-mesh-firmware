@@ -88,6 +88,13 @@ const uint32_t HOP_KEEP_PCT = 40;
 // bench of boards find each other, rare enough not to drown the log.
 const uint32_t STATUS_EVERY_MS = 5000;
 
+// The shortest PSK worth deriving a 2.4 GHz key from.
+//
+// Meshtastic uses one byte to mean "the default channel, key number N", which
+// is public knowledge rather than a secret. A Touge ride always writes a full
+// 32 byte PSK, so anything this short is a channel nobody has secured.
+const int MIN_PSK_BYTES = 16;
+
 const char *NVS_NAMESPACE = "tougefast";
 const char *NVS_ID_KEY = "idceil";
 
@@ -189,19 +196,22 @@ void TougeFastModule::saveIdCounter()
 void TougeFastModule::syncChannel()
 {
     CryptoKey key = channels.getKey(channels.getPrimaryIndex());
-    // No key, no fast lane. -1 is "no usable key" and 0 is "encryption off",
-    // and neither gives us anything to derive from.
+    // No secret, no fast lane.
     //
-    // Zero used to fall through, which was worse than running unencrypted: a
-    // key derived from no bytes is the same key on every board on earth, so
-    // every open ride shared one 2.4 GHz secret. Anyone running this firmware
-    // could have read and injected positions and speech on any other open
-    // ride within earshot, while the tag checks all passed and made it look
-    // authenticated. Refusing matches what the LoRa side already does with a
-    // channel it cannot encrypt.
-    if (key.length <= 0) {
+    // -1 is "no usable key", 0 is "encryption off", and 1 is Meshtastic's
+    // default channel: a single byte naming one of the well known keys that
+    // ships with the firmware and is on the public internet. None of the three
+    // is a secret, and a key derived from a value everybody has is the same key
+    // on every board on earth - so every radio on a default channel would share
+    // one 2.4 GHz secret, and the tag checks would all pass and make it look
+    // authenticated.
+    //
+    // The first version of this guard tested `<= 0` and let the one byte case
+    // straight through, which is the same hole with a longer name. A ride key
+    // derives a 32 byte PSK, so anything shorter than a real key is not one.
+    if (key.length < MIN_PSK_BYTES) {
         if (started_) {
-            LOG_INFO("touge: primary channel lost its key, fast lane down");
+            LOG_INFO("touge: primary channel has no real key, fast lane down");
             fastRadio.end();
             started_ = false;
         }
