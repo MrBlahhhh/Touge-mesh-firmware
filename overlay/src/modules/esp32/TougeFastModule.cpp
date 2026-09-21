@@ -142,7 +142,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 15;
+const uint32_t TOUGE_BUILD = 16;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -160,6 +160,37 @@ const uint32_t HOME_AFTER_MS = 25000;
 // measuring real airtime and send-completion latency before any slot width is
 // fixed. Used only to keep the slot arithmetic honest at compile time.
 const uint32_t FRAME_AIRTIME_MS = 8;
+
+// How often runOnce is asked to look at the world.
+//
+// Was a bare `return 5` at the bottom of runOnce. It is named here because two
+// other things depend on it: a beacon cannot leave its slot any more promptly
+// than this, and that is what bounds how far a clock drifts as it is handed
+// down the convoy.
+const uint32_t TICK_MS = 5;
+
+// What a listener assumes about how late a beacon was.
+//
+// A beacon leaves on the first tick at or after its slot opens, so it is
+// between zero and TICK_MS late, averaging half that. Subtracting the average
+// is what stops the error compounding: a lag that is always positive adds up
+// hop after hop, while one that is as often early as late cancels out. Rounded
+// up, because being a shade early inside your own slot costs nothing and being
+// late costs a collision.
+const uint32_t SYNC_BIAS_MS = TICK_MS / 2 + 1;
+
+static_assert(SYNC_BIAS_MS * 2 >= TICK_MS, "the correction has to cover the tick it is for");
+
+// The deepest car in the convoy still has to fit inside its slot.
+//
+// Its epoch carries a correction error from every hop between it and the
+// reference, plus one for its own wait, and then its frame has to finish
+// before the next car's slot opens. With a 250 ms cycle over nine slots that
+// is 27 ms a slot, 8 ms of frame, and 19 ms of room - which buys five hops at
+// 3 ms each. Deeper than that and a car transmits into its neighbour.
+static_assert(SYNC_BIAS_MS * (MAX_REF_HOPS + 1) + FRAME_AIRTIME_MS <= CYCLE_MS / MAX_SLOTS,
+              "a car at MAX_REF_HOPS would transmit outside its slot: shorten the chain, "
+              "widen the slots, or make the tick faster");
 
 // The shortest PSK worth deriving a 2.4 GHz key from.
 //
@@ -757,7 +788,7 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
             !(f.src == lastSyncSrc_ && f.id == lastSyncId_)) {
             lastSyncSrc_ = f.src;
             lastSyncId_ = f.id;
-            schedule_.syncTo(rx.rxMs, CYCLE_MS);
+            schedule_.syncTo(rx.rxMs, CYCLE_MS, SYNC_BIAS_MS);
         }
 
         if (!mesh_.firstSight(f.src, f.id, nowMs)) continue;
@@ -897,8 +928,10 @@ int32_t TougeFastModule::runOnce()
     // Fast enough that a 20 ms audio frame is never sitting in the queue long,
     // and slow enough that an idle board is not spinning. It also has to be
     // well under FORWARD_JITTER_MS: at a 20 ms pass every held frame would
-    // come due in the same sweep and the jitter would buy nothing.
-    return 5;
+    // come due in the same sweep and the jitter would buy nothing. And it is
+    // what bounds how promptly a beacon can leave its slot, which is what
+    // limits how long the sync chain can be - see SYNC_BIAS_MS.
+    return (int32_t)TICK_MS;
 }
 
 void TougeFastModule::status(uint32_t nowMs)

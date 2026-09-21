@@ -74,10 +74,18 @@ bool decodeFrame(const uint8_t* in, size_t len, Frame& out);
 // falls back to the best reference it can hear directly, and the ride
 // re-converges from the anchor outward.
 //
-// Eight is far more than half a mile of road needs at these ranges, and the
-// count rides in a nibble alongside the flag, so it costs nothing to be
-// generous.
-static const uint8_t MAX_REF_HOPS = 8;
+// Five, and not a number picked for feeling generous.
+//
+// Every hop inherits its parent's epoch from the arrival of a beacon, and a
+// beacon leaves up to half a module tick either side of its slot boundary. The
+// error is passed down the chain along with the clock, so the deepest car is
+// the one closest to transmitting outside its slot. The assert in
+// TougeFastModule derives this from the slot width, the frame airtime and the
+// tick, and fails the build if any of them move; see the working there.
+//
+// Eight was the first figure here and it was wrong: at eight hops a car would
+// have been transmitting a full slot width late, into whoever was next.
+static const uint8_t MAX_REF_HOPS = 5;
 
 // A route to the reference that does not exist, or does not exist yet.
 static const uint8_t REF_UNREACHABLE = 0x0F;

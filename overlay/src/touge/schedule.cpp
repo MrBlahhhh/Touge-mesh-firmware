@@ -193,9 +193,10 @@ void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, si
   }
 }
 
-void Schedule::syncTo(uint32_t heardAtMs, uint32_t cycleMs) {
-  // Back out the reference's own slot to get the start of the cycle.
-  epochMs_ = heardAtMs - (uint32_t)syncSlot_ * slotWidthMs(cycleMs);
+void Schedule::syncTo(uint32_t heardAtMs, uint32_t cycleMs, uint32_t senderLateMs) {
+  // Back out the sender's own slot to get the start of the cycle, and the time
+  // it is expected to have spent waiting for a tick inside that slot.
+  epochMs_ = heardAtMs - senderLateMs - (uint32_t)syncSlot_ * slotWidthMs(cycleMs);
   haveEpoch_ = true;
 }
 

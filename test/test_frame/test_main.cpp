@@ -783,6 +783,53 @@ void test_every_car_lands_on_a_slot_of_its_own() {
   }
 }
 
+void test_syncing_allows_for_the_sender_waiting_for_a_tick() {
+  // A beacon does not leave on its slot boundary. It leaves on the first
+  // module tick at or after it, so it is always a little late and never early.
+  // A listener that subtracts nothing inherits that lag - and then hands it on
+  // to the cars behind it along with the clock, so it grows with every hop
+  // instead of staying where it started.
+  Rider riders[MAX_RIDERS] = {};
+  addRiderOn(riders, 0, 100, 0); // the reference, on slot zero
+
+  Schedule a;
+  a.rebuild(300, false, riders, MAX_RIDERS, 0);
+  Schedule b;
+  b.rebuild(300, false, riders, MAX_RIDERS, 0);
+
+  const uint32_t cycle = 250;
+  // The same beacon, heard at the same instant, read two ways.
+  a.syncTo(1000, cycle);            // assume it left exactly on the boundary
+  b.syncTo(1000, cycle, 3);         // allow for it having waited for a tick
+
+  TEST_ASSERT_TRUE(a.synced());
+  TEST_ASSERT_TRUE(b.synced());
+  // The corrected epoch sits earlier, by exactly the allowance.
+  const uint32_t width = Schedule::slotWidthMs(cycle);
+  const uint32_t mine = (uint32_t)a.slot() * width;
+  // a thinks its slot opens three milliseconds after b does.
+  TEST_ASSERT_TRUE(b.inSlot(1000 + mine - 3, cycle));
+  TEST_ASSERT_FALSE(a.inSlot(1000 + mine - 3, cycle));
+}
+
+void test_the_chain_is_short_enough_to_stay_inside_a_slot() {
+  // The deepest car inherits a correction error from every hop between it and
+  // the reference, adds its own wait, and still has to finish transmitting
+  // before its neighbour's slot opens. This is that sum, in the same terms the
+  // firmware asserts it in - kept here so the arithmetic is visible to
+  // somebody reading the tests rather than only to the compiler.
+  const uint32_t cycle = 250;
+  const uint32_t width = Schedule::slotWidthMs(cycle);
+  const uint32_t frameAirtime = 8;
+  const uint32_t syncBias = 3;
+
+  const uint32_t worst = syncBias * (MAX_REF_HOPS + 1) + frameAirtime;
+  TEST_ASSERT_TRUE(worst <= width);
+  // And one hop deeper would not fit, which is what makes the cap the right
+  // number rather than merely a safe one.
+  TEST_ASSERT_TRUE(syncBias * (MAX_REF_HOPS + 2) + frameAirtime > width);
+}
+
 void test_a_reference_travels_past_the_cars_that_can_hear_it() {
   // We cannot hear 100 at all. The car in front of us can, and says so, which
   // is the whole mechanism: the claim walks the convoy rather than depending
@@ -1779,6 +1826,8 @@ int main(int, char**) {
   RUN_TEST(test_boards_starting_together_do_not_all_take_slot_zero);
   RUN_TEST(test_an_unclaimed_car_free_runs_until_it_has_been_heard);
   RUN_TEST(test_every_car_lands_on_a_slot_of_its_own);
+  RUN_TEST(test_syncing_allows_for_the_sender_waiting_for_a_tick);
+  RUN_TEST(test_the_chain_is_short_enough_to_stay_inside_a_slot);
   RUN_TEST(test_a_reference_travels_past_the_cars_that_can_hear_it);
   RUN_TEST(test_the_reference_is_no_hops_from_itself_and_syncs_to_nobody);
   RUN_TEST(test_the_nearest_route_to_the_reference_wins);

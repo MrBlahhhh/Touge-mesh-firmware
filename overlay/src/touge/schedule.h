@@ -167,7 +167,22 @@ class Schedule {
   // necessarily hold slot zero, because a GPS-locked car outranks a
   // lower-numbered one that is free-running, so its own slot is subtracted to
   // recover the start of the cycle.
-  void syncTo(uint32_t heardAtMs, uint32_t cycleMs);
+  /**
+   * @param senderLateMs how long after its slot opened the sender is expected
+   * to have actually transmitted.
+   *
+   * A beacon does not leave on the slot boundary. It leaves on the first
+   * module tick at or after it, which is up to a whole tick later, and
+   * subtracting nothing means the listener's epoch is that much late. That
+   * would not matter if it stopped there - but the listener passes its epoch
+   * on to the cars behind it, and each adds its own, so the error grows with
+   * every hop rather than staying put. Half a tick is the average, and taking
+   * it off turns a lag that always accumulates into a jitter that cancels.
+   *
+   * Defaults to zero so the slot geometry can be tested without also modelling
+   * the tick.
+   */
+  void syncTo(uint32_t heardAtMs, uint32_t cycleMs, uint32_t senderLateMs = 0);
 
   /**
    * Start the cycle here, because nobody else is going to.
