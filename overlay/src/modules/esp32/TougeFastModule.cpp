@@ -66,6 +66,12 @@ const uint32_t GATE_IDLE_MS = 1000;
 // clear two beacons; at 1 Hz the same safety costs three.
 const uint32_t FAST_PRECEDENCE_MS = 3000;
 
+// How often one car's position is handed to the phone. See inject().
+const uint32_t PHONE_POSITION_MS = 1000;
+
+static_assert(PHONE_POSITION_MS >= CYCLE_MS,
+              "throttling faster than the lane produces would do nothing");
+
 // The name rides along every half minute rather than on every ping. Everyone
 // who can hear you has it after one, and after that it is just bytes.
 const uint32_t NAME_EVERY_MS = 30000;
@@ -569,6 +575,22 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
         // RoutingModule, which owns the only live handleFromRadio call. So
         // the app went blind to precisely the cars the fast lane was working
         // for, while the OLED two feet away looked perfect.
+        // One per car per second, not one per beacon.
+        //
+        // The lane carries four positions a second per car and each was
+        // becoming its own MeshPacket on the phone queue. Twenty-eight cars is
+        // a hundred and twelve packets a second down a BLE link that manages
+        // about thirty even at the fast connection interval, so the queue
+        // filled at its thirty-two packet ceiling and sendToPhone began
+        // dropping the newest non-text packets - positions, the fast-lane
+        // status, and voice. The app then reported a dead lane on a saturated
+        // healthy one, which is the worst of both: the traffic was lost and
+        // the diagnosis pointed away from the cause.
+        //
+        // The roster above is still kept at full rate; this is only about what
+        // crosses the wire, and a screen cannot use more than a few a second.
+        if (!mesh_.phoneDue(f.src, PHONE_POSITION_MS, millis())) return;
+
         meshtastic_MeshPacket *pp = router->allocForSending();
         if (pp) {
             pp->from = f.src;

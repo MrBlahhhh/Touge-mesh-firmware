@@ -486,6 +486,57 @@ void test_an_empty_neighbourhood_still_waits() {
   TEST_ASSERT_EQUAL_UINT32(FORWARD_JITTER_MS, forwardSpreadMs(0));
 }
 
+void test_a_position_reaches_the_phone_once_per_interval() {
+  // The lane carries four positions a second per car, and each one became its
+  // own packet on a BLE link that manages about thirty a second in total. At
+  // twenty-eight cars that is a hundred and twelve, so the radio's queue filled
+  // and it dropped the newest of everything - positions, status and voice.
+  Mesh m;
+  Position p{};
+  m.note(7, p, HEARD_FAST, -60, 0, 1000, 1);
+
+  // First sight of a car always goes: there is nothing to throttle against.
+  TEST_ASSERT_TRUE(m.phoneDue(7, 1000, 1000));
+  // The next three beacons of that second do not.
+  TEST_ASSERT_FALSE(m.phoneDue(7, 1000, 1250));
+  TEST_ASSERT_FALSE(m.phoneDue(7, 1000, 1500));
+  TEST_ASSERT_FALSE(m.phoneDue(7, 1000, 1999));
+  // And the next second does.
+  TEST_ASSERT_TRUE(m.phoneDue(7, 1000, 2000));
+  TEST_ASSERT_FALSE(m.phoneDue(7, 1000, 2250));
+}
+
+void test_each_car_is_throttled_on_its_own_clock() {
+  // Twenty-eight cars at one a second is twenty-eight packets a second, not
+  // one: the budget is per car, so the roster does not starve behind whichever
+  // car happened to be heard first.
+  Mesh m;
+  Position p{};
+  m.note(7, p, HEARD_FAST, -60, 0, 1000, 1);
+  m.note(9, p, HEARD_FAST, -60, 0, 1000, 1);
+
+  TEST_ASSERT_TRUE(m.phoneDue(7, 1000, 1000));
+  TEST_ASSERT_TRUE(m.phoneDue(9, 1000, 1000));
+  TEST_ASSERT_FALSE(m.phoneDue(7, 1000, 1500));
+  TEST_ASSERT_FALSE(m.phoneDue(9, 1000, 1500));
+}
+
+void test_a_car_not_on_the_roster_is_not_withheld() {
+  // Nothing to throttle against, and withholding a position because we have
+  // nowhere to record having sent it would be the wrong way round.
+  Mesh m;
+  TEST_ASSERT_TRUE(m.phoneDue(12345, 1000, 5000));
+}
+
+void test_the_phone_throttle_survives_the_millis_wrap() {
+  Mesh m;
+  Position p{};
+  m.note(7, p, HEARD_FAST, -60, 0, 0xFFFFFF00, 1);
+  TEST_ASSERT_TRUE(m.phoneDue(7, 1000, 0xFFFFFF00));
+  TEST_ASSERT_FALSE(m.phoneDue(7, 1000, (uint32_t)(0xFFFFFF00 + 500)));
+  TEST_ASSERT_TRUE(m.phoneDue(7, 1000, (uint32_t)(0xFFFFFF00 + 1000)));
+}
+
 void test_a_forward_waits_for_its_jitter() {
   Mesh m;
   m.reset();
@@ -1543,6 +1594,10 @@ int main(int, char**) {
   RUN_TEST(test_the_forwarding_window_widens_with_the_neighbourhood);
   RUN_TEST(test_the_forwarding_window_is_bounded);
   RUN_TEST(test_an_empty_neighbourhood_still_waits);
+  RUN_TEST(test_a_position_reaches_the_phone_once_per_interval);
+  RUN_TEST(test_each_car_is_throttled_on_its_own_clock);
+  RUN_TEST(test_a_car_not_on_the_roster_is_not_withheld);
+  RUN_TEST(test_the_phone_throttle_survives_the_millis_wrap);
   RUN_TEST(test_a_forward_waits_for_its_jitter);
   RUN_TEST(test_a_forward_overtaken_by_neighbours_is_dropped);
   RUN_TEST(test_a_forward_nobody_else_made_still_goes);

@@ -234,6 +234,21 @@ size_t Mesh::countOn(uint8_t chan, uint32_t windowMs, uint32_t nowMs) const {
   return n;
 }
 
+bool Mesh::phoneDue(uint32_t id, uint32_t everyMs, uint32_t nowMs) {
+  for (size_t i = 0; i < MAX_RIDERS; i++) {
+    if (!riders_[i].used || riders_[i].id != id) continue;
+    // Never sent: send. Otherwise only once the interval has passed. Unsigned,
+    // so a car first heard before a millis() wrap is not silenced for
+    // forty-nine days afterwards.
+    if (riders_[i].phoneMs != 0 && (uint32_t)(nowMs - riders_[i].phoneMs) < everyMs) return false;
+    riders_[i].phoneMs = nowMs;
+    return true;
+  }
+  // Not on the roster at all, so there is nothing to throttle against and no
+  // reason to withhold it.
+  return true;
+}
+
 const Rider* Mesh::find(uint32_t id) const {
   for (size_t i = 0; i < MAX_RIDERS; i++)
     if (riders_[i].used && riders_[i].id == id) return &riders_[i];
