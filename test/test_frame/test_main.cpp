@@ -330,9 +330,9 @@ static Position posNamed(const char* name) {
 void test_roster_updates_in_place() {
   Mesh m;
   m.reset();
-  TEST_ASSERT_NOT_NULL(m.note(7, posNamed("jackie"), HEARD_FAST, -40, 0, 1000));
+  TEST_ASSERT_NOT_NULL(m.note(7, posNamed("jackie"), HEARD_FAST, -40, 0, 1000, 11));
   TEST_ASSERT_EQUAL_UINT32(1, m.count());
-  TEST_ASSERT_NOT_NULL(m.note(7, posNamed("jackie"), HEARD_LORA, -110, 2, 2000));
+  TEST_ASSERT_NOT_NULL(m.note(7, posNamed("jackie"), HEARD_LORA, -110, 2, 2000, 11));
   TEST_ASSERT_EQUAL_UINT32(1, m.count());
 
   const Rider* r = m.find(7);
@@ -347,8 +347,8 @@ void test_roster_keeps_a_name_between_name_pings() {
   // ping is pure airtime. An unnamed ping must not blank the roster entry.
   Mesh m;
   m.reset();
-  m.note(7, posNamed("jackie"), HEARD_FAST, -40, 0, 1000);
-  m.note(7, posNamed(nullptr), HEARD_FAST, -41, 0, 2000);
+  m.note(7, posNamed("jackie"), HEARD_FAST, -40, 0, 1000, 11);
+  m.note(7, posNamed(nullptr), HEARD_FAST, -41, 0, 2000, 11);
   TEST_ASSERT_EQUAL_STRING("jackie", m.find(7)->pos.name);
 }
 
@@ -356,12 +356,12 @@ void test_roster_will_not_bump_a_car_you_are_driving_behind() {
   Mesh m;
   m.reset();
   for (uint32_t i = 0; i < MAX_RIDERS; i++)
-    TEST_ASSERT_NOT_NULL(m.note(i + 1, posNamed("x"), HEARD_FAST, -40, 0, 1000));
+    TEST_ASSERT_NOT_NULL(m.note(i + 1, posNamed("x"), HEARD_FAST, -40, 0, 1000, 11));
   TEST_ASSERT_EQUAL_UINT32(MAX_RIDERS, m.count());
 
   // Everyone is current, so a newcomer is turned away rather than evicting
   // someone whose position is still live on the screen.
-  TEST_ASSERT_NULL(m.note(99, posNamed("late"), HEARD_FAST, -40, 0, 1000));
+  TEST_ASSERT_NULL(m.note(99, posNamed("late"), HEARD_FAST, -40, 0, 1000, 11));
 
   // Once a seat has gone quiet, the newcomer takes it.
   uint32_t later = 1000 + RIDER_STALE_MS + 1;
@@ -374,7 +374,7 @@ void test_roster_will_not_bump_a_car_you_are_driving_behind() {
 void test_roster_drops_only_after_a_very_long_silence() {
   Mesh m;
   m.reset();
-  m.note(7, posNamed("jackie"), HEARD_LORA, -110, 3, 1000);
+  m.note(7, posNamed("jackie"), HEARD_LORA, -110, 3, 1000, 11);
 
   // Stale is not gone. A car that vanishes off the screen every time it dips
   // behind a ridge is worse than one that says it was last seen 90 seconds ago.
