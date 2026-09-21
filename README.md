@@ -296,17 +296,3 @@ and back cannot hear each other but the middle can hear both.
 ## Licence
 
 GPL-3.0-or-later. See `LICENSE`.
-
-Not really a choice, and worth saying why rather than leaving a file sitting
-there. This is a module that compiles into Meshtastic's firmware, Meshtastic is
-GPL-3.0, and the thing that ends up on a board is the two of them linked into
-one binary. Distributing that binary means distributing a derivative work, so
-the source that went into it is GPL-3.0 whatever this file says. Naming it is
-just being honest about where it already stood.
-
-What that does mean: anyone can take this, change it, and sell it, so long as
-they publish their changes under the same terms.
-
-What it does not reach: the Android app. That is a separate program that talks
-to the board over BLE, the same way any Meshtastic client does. Nothing here
-links into it and nothing here obliges it.
