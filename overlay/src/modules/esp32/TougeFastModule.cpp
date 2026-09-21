@@ -94,10 +94,19 @@ const uint32_t SYNC_EVERY_MS = 2000;
 // held traffic while it hunted.
 const uint32_t LOST_MS = 6000;
 
-// A second on each candidate while searching. Long enough to catch a beacon
-// from a car on its idle heartbeat, short enough that three channels is three
-// seconds rather than a minute.
-const uint32_t SCAN_DWELL_MS = 1000;
+// How long to listen on each candidate while searching.
+//
+// Must outlast two beacons, or the search can sweep straight past the ride.
+// This was one second against a heartbeat of the same length, so hearing the
+// channel you were standing on was a coin toss - and against a board still on
+// the old three second heartbeat, roughly one chance in three. Watched on a
+// bench: a board cycling 6, 11, 6, 1, 11 with heard=0 the whole time, while
+// another sat healthy on channel 6 the entire sweep.
+//
+// The cost of a longer dwell is a slower sweep, which is the cheaper mistake:
+// three channels at two and a half seconds is still under eight seconds to
+// find a ride, and a sweep that misses does not converge at all.
+const uint32_t SCAN_DWELL_MS = 2500;
 
 // How long the reference watches before deciding the channel is unusable, and
 // the share of expected beacons below which it moves the ride.
@@ -165,6 +174,9 @@ TougeFastModule::TougeFastModule()
     // A car must not age off the fast lane between its own beacons.
     static_assert(FAST_PRECEDENCE_MS > 2 * GATE_IDLE_MS,
                   "the fast-lane window must outlast two idle heartbeats");
+    // A search that listens for less than two beacons can miss a live channel.
+    static_assert(SCAN_DWELL_MS > 2 * GATE_IDLE_MS,
+                  "each scan dwell must outlast two idle heartbeats");
 
 #ifdef PIN_GPS_PPS
     pinMode(PIN_GPS_PPS, INPUT);
