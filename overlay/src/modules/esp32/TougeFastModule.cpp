@@ -505,6 +505,35 @@ void TougeFastModule::beacon(uint32_t nowMs)
     if (n > 0) transmit(FRAME_POSITION, body, n, FAST_HOPS);
 }
 
+meshtastic_Position TougeFastModule::asMeshPosition(const Position &p)
+{
+    meshtastic_Position mp = meshtastic_Position_init_default;
+    mp.latitude_i = p.lat;
+    mp.longitude_i = p.lon;
+    mp.has_latitude_i = true;
+    mp.has_longitude_i = true;
+    mp.ground_track = (uint32_t)p.headingDeg * 100000;
+    mp.ground_speed = (uint32_t)(p.speedMph / 2.23694f);
+    // What the sender said it was, not what we wish it were.
+    mp.location_source = p.phoneAttached ? meshtastic_Position_LocSource_LOC_EXTERNAL
+                                         : meshtastic_Position_LocSource_LOC_INTERNAL;
+    mp.time = getValidTime(RTCQualityFromNet);
+    return mp;
+}
+
+void TougeFastModule::reassertFastPositions()
+{
+    for (size_t i = 0; i < restoreCount_; i++) {
+        const Rider *r = mesh_.find(restore_[i]);
+        // Gone from the roster, or no longer a fast-lane car: the LoRa copy
+        // that just landed is the best thing we have and it stays.
+        if (r == nullptr || r->via != HEARD_FAST) continue;
+        meshtastic_Position mp = asMeshPosition(r->pos);
+        nodeDB->updatePosition(restore_[i], mp, RX_SRC_RADIO);
+    }
+    restoreCount_ = 0;
+}
+
 void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, int8_t rssi)
 {
     if (f.type == FRAME_POSITION) {
@@ -515,17 +544,7 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
         // than writing a firmware: the OLED, the phone app and every other
         // module read positions from here, and none of them need to know a
         // second radio exists.
-        meshtastic_Position mp = meshtastic_Position_init_default;
-        mp.latitude_i = p.lat;
-        mp.longitude_i = p.lon;
-        mp.has_latitude_i = true;
-        mp.has_longitude_i = true;
-        mp.ground_track = (uint32_t)p.headingDeg * 100000;
-        mp.ground_speed = (uint32_t)(p.speedMph / 2.23694f);
-        // What the sender said it was, not what we wish it were.
-        mp.location_source = p.phoneAttached ? meshtastic_Position_LocSource_LOC_EXTERNAL
-                                             : meshtastic_Position_LocSource_LOC_INTERNAL;
-        mp.time = getValidTime(RTCQualityFromNet);
+        meshtastic_Position mp = asMeshPosition(p);
 
         nodeDB->updatePosition(f.src, mp, RX_SRC_RADIO);
 
@@ -799,6 +818,11 @@ int32_t TougeFastModule::runOnce()
     if (nodeId_ == 0) nodeId_ = nodeDB->getNodeNum();
 
     uint32_t now = millis();
+
+    // First thing in the tick: PositionModule ran a few milliseconds ago and
+    // may have written a stale LoRa fix over a fresher 2.4 GHz one. See
+    // handleReceived.
+    reassertFastPositions();
     // The channel only changes when somebody reconfigures the ride, so this is
     // checked on a slow clock. Running it every pass would compare and rederive
     // keys fifty times a second for no reason.
@@ -1077,7 +1101,28 @@ ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
         mp.decoded.portnum == meshtastic_PortNum_POSITION_APP) {
         const Rider *r = mesh_.find(mp.from);
         if (r && r->via == HEARD_FAST && (uint32_t)(millis() - r->atMs) < FAST_PRECEDENCE_MS) {
-            return ProcessMessage::STOP;
+            // Not STOP any more, and this is the difference between a car
+            // being a second stale and a car not existing.
+            //
+            // STOP breaks callModules, and callModules is how RoutingModule
+            // runs - which is the only thing that calls sniffReceived, which
+            // is the only thing that rebroadcasts. So refusing a LoRa position
+            // from a car we can hear on 2.4 GHz also refused to *relay* it. A
+            // middle car that could hear the head on 2.4 GHz would not pass
+            // the head's LoRa position back down the line, and a tail car
+            // beyond both the head's LoRa range and FAST_HOPS heard nothing
+            // from the head on either radio. The car that most needed the
+            // relay was the one guaranteed not to get it, and the cost of the
+            // bug rose with the length of the convoy.
+            //
+            // The precedence itself is still worth having: NodeDB is
+            // last-write-wins with no staleness guard, so a two-second-old
+            // LoRa fix does replace a quarter-second-old 2.4 GHz one. So the
+            // packet goes through and the row is put back on the next tick,
+            // five milliseconds later, from the fast position we already hold.
+            // Briefly stale beats permanently absent.
+            if (restoreCount_ < RESTORE_SLOTS) restore_[restoreCount_++] = mp.from;
+            return ProcessMessage::CONTINUE;
         }
         return ProcessMessage::CONTINUE;
     }

@@ -75,6 +75,13 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
 
     bool transmit(uint8_t type, const uint8_t *body, size_t len, uint8_t hops);
 
+    // Our wire position as Meshtastic's, for NodeDB and for the phone.
+    static meshtastic_Position asMeshPosition(const touge::Position &p);
+
+    // Puts a car's 2.4 GHz position back after a LoRa copy has overwritten it.
+    // See handleReceived for why the LoRa copy is now allowed through at all.
+    void reassertFastPositions();
+
     // Packet ids are half the AES-CTR nonce, so they must never repeat under
     // one channel key. NVS holds a value safely ahead of anything already
     // sent, and it is re-armed in blocks rather than written every packet.
@@ -89,6 +96,16 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     uint8_t keySeen_[touge::PSK_LEN] = {0};
     uint8_t keySeenLen_ = 0;
     bool started_ = false;
+
+    // Cars whose NodeDB row a stale LoRa position is about to overwrite.
+    //
+    // Small and fixed: this only fills with cars heard on both radios inside
+    // three seconds, and one entry each is enough because the correction runs
+    // within five milliseconds. A full ring drops the oldest, which costs that
+    // car a single stale row until its next fast frame.
+    static const size_t RESTORE_SLOTS = 8;
+    uint32_t restore_[RESTORE_SLOTS] = {0};
+    size_t restoreCount_ = 0;
 
     uint32_t nodeId_ = 0;
     uint32_t idCeiling_ = 0;
