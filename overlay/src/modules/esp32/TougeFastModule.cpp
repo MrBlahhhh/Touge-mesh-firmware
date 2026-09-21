@@ -142,7 +142,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 17;
+const uint32_t TOUGE_BUILD = 19;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -151,6 +151,16 @@ const uint32_t TOUGE_BUILD = 17;
 // between beacons does not abandon a working channel; short enough that a
 // split ride reconverges in well under a minute.
 const uint32_t HOME_AFTER_MS = 25000;
+
+// Whether the ride hops channels to escape interference.
+//
+// Off. Every car derives the same channel from the ride key and stays on it,
+// which is the only arrangement that reliably lets two cars find each other on
+// 2.4 GHz - the scan meant to reunite a car that fell behind instead kept two
+// lost cars permanently out of phase across 1/6/11. The hop machinery is intact
+// and can be turned back on once the scan is made phase-stable; until then a
+// fixed channel is what carries. This is what every helmet intercom does.
+const bool FAST_LANE_HOP = false;
 
 
 // Roughly how long a full frame takes on the air.
@@ -168,6 +178,11 @@ const uint32_t FRAME_AIRTIME_MS = 8;
 // than this, and that is what bounds how far a clock drifts as it is handed
 // down the convoy.
 const uint32_t TICK_MS = 5;
+
+// How long after boot the fast lane waits before starting WiFi, so Bluetooth
+// initialises first and the two do not fight over heap on a no-PSRAM board.
+// See runOnce.
+const uint32_t FAST_LANE_START_DELAY_MS = 8000;
 
 // What a listener assumes about how late a beacon was.
 //
@@ -906,6 +921,23 @@ int32_t TougeFastModule::runOnce()
 
     uint32_t now = millis();
 
+    // Let Bluetooth win the memory race.
+    //
+    // Bringing up the fast lane starts the WiFi driver, which is tens of
+    // kilobytes of heap. On a board with no PSRAM that is enough that NimBLE's
+    // setup, which runs a little later in Meshtastic's boot, cannot allocate
+    // its advertising object - and NimBLE calls an unguarded `new`, so the
+    // failure is an uncaught bad_alloc that aborts the whole device into a boot
+    // loop. Our own WiFi bring-up, by contrast, checks its return and falls
+    // back to LoRa-only.
+    //
+    // So we wait. By the time this fires, Meshtastic has initialised BLE and
+    // taken its memory; if what is left is not enough for WiFi, the fast lane
+    // degrades to LoRa rather than taking Bluetooth - and the phone link - down
+    // with it. A few seconds of no 2.4 GHz at boot is invisible next to a radio
+    // that never finishes booting.
+    if (now < FAST_LANE_START_DELAY_MS) return (int32_t)(FAST_LANE_START_DELAY_MS - now);
+
     // First thing in the tick: PositionModule ran a few milliseconds ago and
     // may have written a stale LoRa fix over a fresher 2.4 GHz one. See
     // handleReceived.
@@ -1051,69 +1083,46 @@ void TougeFastModule::hopKeeping(uint32_t nowMs)
 
     uint32_t quiet = (uint32_t)(nowMs - lastHeardMs_);
 
-    // The scan, and the reason any of the rest of this is safe to do.
-    //
-    // A car that has heard nothing for a while is either alone, or on a
-    // channel the ride has left. It cannot tell which, and it must not assume
-    // the first: that is the failure where a car sits deaf on an abandoned
-    // channel forever, with the news it needs carried only on the channel it
-    // is no longer listening to.
-    //
-    // So it goes and looks. Three candidates, a second on each, and it is back
-    // with the group within a few seconds however it came to be lost - a
-    // missed hop, switched off during one, or simply joining late.
+    // A car that has heard nothing for a while is either alone or on the wrong
+    // channel, and it cannot tell which. Rather than sit deaf on a channel the
+    // ride may have left, it goes back to the one the key chose - home - where
+    // every car on this ride can be found. See the note below.
     if (quiet >= LOST_MS) {
-        // Sweep for a while, then go and wait where everyone can find you.
+        // Fixed channel: stay home, never sweep.
         //
-        // A sweep only works when exactly one board is lost. Two sweeping at
-        // the same rate can stay permanently out of phase - each arriving on a
-        // channel as the other leaves - and three boards ended the evening
-        // sitting on channels 1, 6 and 11, every one of them reporting that it
-        // could hear nobody, having each passed through the others' channels
-        // repeatedly.
+        // The sweep was meant to reunite a car that fell off the back onto a
+        // channel the ride had hopped to. In practice it did the opposite. Two
+        // lost cars both derive the same home from the ride key, so they should
+        // just meet there - but they went lost within a few seconds of each
+        // other, both started sweeping 1/6/11 at the same rate, and stayed
+        // permanently out of phase, each landing on a channel as the other left.
+        // On the bench two cars on one ride key sat on channels 1 and 11
+        // reporting "nobody on it", having passed through each other's channels
+        // for minutes. And every reconfigure or reconnect reset the lost timer,
+        // so they never survived long enough to reach the wait-at-home phase
+        // that would have saved them.
         //
-        // The ride key picks the same starting channel on every board, so that
-        // is somewhere they can agree to meet without being told. After a few
-        // fruitless sweeps a board stops hunting and waits there. A board that
-        // is not lost carries on as it was, so the lost ones come to it; if
-        // everyone is lost, everyone ends up at home.
-        // Alternate: hunt for a while, wait at home for a while, repeat.
-        //
-        // Parking at home permanently would strand a board whose ride had
-        // legitimately hopped elsewhere - it would sit on a channel nobody is
-        // using while the group talked on another, having stopped looking. And
-        // sweeping forever is what left three boards circling past each other.
-        // Doing both in turn covers both: a ride that moved is found by the
-        // next sweep, and boards that are all lost meet during a home phase.
-        //
-        // The phases are long enough that two boards drifting in and out of
-        // step still overlap at home for most of a phase.
-        const bool waitAtHome = ((quiet / HOME_AFTER_MS) % 2) == 1;
-        if (waitAtHome) {
-            if (fastRadio.channel() != hop_.homeChannel()) {
-                hop_.goHome();
-                if (fastRadio.retuneTo(hop_.channel())) {
-                    LOG_INFO("touge: quiet for %ums, waiting on home channel %u",
-                             (unsigned)quiet, (unsigned)hop_.channel());
-                }
-            }
-            return;
-        }
-        if ((uint32_t)(nowMs - lastScanMs_) >= SCAN_DWELL_MS) {
-            lastScanMs_ = nowMs;
-            uint8_t ch = hop_.scanNext();
-            if (fastRadio.retuneTo(ch)) {
-                LOG_DEBUG("touge: quiet for %ums, listening on channel %u", (unsigned)quiet, (unsigned)ch);
-            } else {
-                // Stuck on one channel, so the scan cannot do its job. Saying so
-                // beats printing a sweep that never happened while the ride is
-                // somewhere else.
-                LOG_WARN("touge: quiet for %ums but cannot leave channel %u to look",
-                         (unsigned)quiet, (unsigned)fastRadio.channel());
+        // So the ride does not hop, and a lost car does one thing: go home and
+        // stay. Every car on the same key lands on the same channel and hears
+        // every other one, with no phase to fall out of. This is what OpenHelmet
+        // and every headset intercom does - one fixed channel - and it trades a
+        // congested-channel escape hatch nobody has needed yet for a fast lane
+        // that actually carries. See FAST_LANE_HOP.
+        if (fastRadio.channel() != hop_.homeChannel()) {
+            hop_.goHome();
+            if (fastRadio.retuneTo(hop_.channel())) {
+                LOG_INFO("touge: quiet for %ums, home on channel %u",
+                         (unsigned)quiet, (unsigned)hop_.channel());
             }
         }
         return;
     }
+
+    // The ride does not hop. See the fixed-channel note above: everyone stays
+    // on the channel the key chose, which is the only way two cars reliably
+    // find each other on 2.4 GHz without a scan to fall out of phase. The
+    // interference-escape hop is kept in the code, and off, behind this flag.
+    if (!FAST_LANE_HOP) return;
 
     // Only the car keeping time decides to move, so the ride does not have
     // several cars hopping it in different directions at once.

@@ -47,8 +47,15 @@ static const size_t PEAK_FRAMES_PER_SEC = 55;
 // it. Three seconds is twelve cycles and a hundred and fifty times longer than
 // a forward takes to settle. The assert below is what keeps the two from
 // drifting apart again.
-static const uint32_t SEEN_TTL_MS = 3000;
-static const size_t SEEN_SLOTS = 192;
+// Shortened from three seconds to keep the table small enough that WiFi and
+// BLE both still fit in internal SRAM on a no-PSRAM V3. Forwards settle in about
+// twenty milliseconds, so 1.5 s is still seventy times the real window.
+static const uint32_t SEEN_TTL_MS = 1500;
+// 96 entries against the 1.5 s window above. Each Seen is ~16 bytes, so this
+// is ~1.5 KB rather than the 3 KB of 192, and the fast lane has to share the
+// heap with the WiFi driver (~45 KB) and NimBLE, which aborts the whole device
+// if its allocation fails. See the boot-loop fix.
+static const size_t SEEN_SLOTS = 96;
 
 static_assert(SEEN_SLOTS >= PEAK_FRAMES_PER_SEC * SEEN_TTL_MS / 1000,
               "the dedupe table must be able to hold the window it claims, or "
@@ -106,7 +113,12 @@ static_assert(FORWARD_JITTER_MAX_MS >= FORWARD_JITTER_MS,
 // be the only board that can reach the tail. The queue holds a frame each, so
 // thirty-two is about eight kilobytes of heap, which is affordable and a great
 // deal cheaper than a silently dropped relay.
-static const size_t FORWARD_SLOTS = 32;
+// Each Forward holds a full frame (~266 bytes), so this is the single biggest
+// heap cost in the module. Twelve is enough that a busy relay does not drop
+// forwards in normal use, and it is 5 KB rather than 8.5 KB. The whole reason
+// this matters is that BLE init calls an unguarded `new` that aborts the chip
+// on failure, so every kilobyte here is a kilobyte BLE might need.
+static const size_t FORWARD_SLOTS = 12;
 
 // Having heard this many copies of a packet, everyone within earshot already
 // has it and adding another transmission helps nobody. In a four-car convoy

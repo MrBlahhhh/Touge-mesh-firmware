@@ -23,7 +23,13 @@ namespace {
 // cycle and dropped climbs while every phone still reports a healthy lane,
 // because a frame refused at the queue was never heard as far as anything
 // above it is concerned.
-const int RX_DEPTH = 32;
+// Eight, not thirty-two. Each FastRx carries a full frame, so the queue is
+// RX_DEPTH * ~260 bytes of heap, allocated up front by xQueueCreate. Thirty-two
+// was 8 KB, and on a no-PSRAM V3 that 8 KB is exactly what NimBLE needed and
+// could not get - an unguarded `new` in BLE advertising setup then aborted the
+// device into a boot loop. Eight is ~2 KB and still a quarter-second of frames
+// at the fast-lane rate, which is all the drain loop can fall behind by.
+const int RX_DEPTH = 8;
 
 QueueHandle_t rxQueue = nullptr;
 volatile uint32_t dropCount = 0;
