@@ -63,6 +63,14 @@ void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, si
       anyLocked = true;
     }
 
+    // A claim lapses well before the roster forgets the car.
+    //
+    // Keeping the seat and keeping the slot are different questions with
+    // different answers, and both were being read off the same ten-minute
+    // roster. Five cars leaving held five of nine slots long after they were
+    // out of earshot, and the cars still on the road crowded into the rest.
+    if ((uint32_t)(nowMs - riders[i].atMs) >= SLOT_LAPSE_MS) continue;
+
     uint8_t s = riders[i].pos.slot;
     if (s >= MAX_SLOTS) continue; // has not claimed one yet
     if (owner[s] == 0 || riders[i].id < owner[s]) owner[s] = riders[i].id;
@@ -80,7 +88,20 @@ void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, si
 
   if (mustMove) {
     slot_ = SLOT_NONE;
-    for (uint8_t s = 0; s < MAX_SLOTS; s++) {
+    // Start the search at our own node number rather than at zero.
+    //
+    // With a populated table this is the same answer as scanning from zero:
+    // the first free slot, just entered from a different point on the ring.
+    // With an empty one it is the whole difference. Every board boots with a
+    // roster it has not filled yet, every board found slot 0 free, and every
+    // board claimed it - so twenty-eight cars switched on together all
+    // transmitted in the same slot and then spent nine beacon rounds
+    // unpicking it by node number, colliding on the low slots the entire
+    // time. Entering the ring at selfId spreads that first guess across all
+    // nine before anyone has heard anybody.
+    const uint8_t start = (uint8_t)(selfId % MAX_SLOTS);
+    for (uint8_t k = 0; k < MAX_SLOTS; k++) {
+      const uint8_t s = (uint8_t)((start + k) % MAX_SLOTS);
       if (owner[s] == 0) {
         slot_ = s;
         break;

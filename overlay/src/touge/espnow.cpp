@@ -27,6 +27,11 @@ const int RX_DEPTH = 32;
 
 QueueHandle_t rxQueue = nullptr;
 volatile uint32_t dropCount = 0;
+volatile uint32_t sendFailCount = 0;
+volatile int lastSendErr = 0;
+
+// Read by the receive callback, which has no handle on the FastRadio.
+volatile uint8_t currentChannel = 0;
 
 const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -48,6 +53,7 @@ void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
   rx.len = (uint16_t)len;
   rx.rssi = rssi;
   rx.rxMs = millis();
+  rx.chan = currentChannel;
   memcpy(rx.data, data, (size_t)len);
 
   // This runs on the Wi-Fi task. Blocking here stalls the driver, so a full
@@ -123,6 +129,7 @@ bool FastRadio::retuneTo(uint8_t channel) {
   if (channel == channel_) return true;
   if (esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) return false;
   channel_ = channel;
+  currentChannel = channel;
   return true;
 }
 
@@ -136,7 +143,16 @@ void FastRadio::end() {
 
 bool FastRadio::send(const uint8_t* buf, size_t len) {
   if (!ready_ || buf == nullptr || len == 0 || len > FRAME_MAX) return false;
-  return esp_now_send(BROADCAST, buf, len) == ESP_OK;
+  esp_err_t err = esp_now_send(BROADCAST, buf, len);
+  if (err != ESP_OK) {
+    // ESP_ERR_ESPNOW_NO_MEM here means the driver's own transmit queue is
+    // full, which is what saturation looks like from this side. Counted
+    // rather than ignored so a board that has gone quiet can say so.
+    sendFailCount++;
+    lastSendErr = (int)err;
+    return false;
+  }
+  return true;
 }
 
 bool FastRadio::poll(FastRx& out) {
@@ -145,5 +161,9 @@ bool FastRadio::poll(FastRx& out) {
 }
 
 uint32_t FastRadio::dropped() const { return dropCount; }
+
+uint32_t FastRadio::sendFailed() const { return sendFailCount; }
+
+int FastRadio::lastSendError() const { return lastSendErr; }
 
 } // namespace touge

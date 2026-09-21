@@ -24,17 +24,81 @@ namespace touge {
 // This is deliberately not the slot count any more. See MAX_SLOTS.
 static const size_t MAX_RIDERS = 28;
 
-// A packet is remembered long enough to outlive every echo of itself. Three
-// hops at SHORT_FAST with back-off is under two seconds, so thirty is a wide
-// margin that still forgets a rider who drops out and comes back.
-static const uint32_t SEEN_TTL_MS = 30000;
-static const size_t SEEN_SLOTS = 64;
+// How busy the air gets with the ride full.
+//
+// Twenty-eight cars beaconing, plus the forwards their neighbours make of
+// those beacons. Measured as distinct frames, since that is what the table
+// below stores one of each.
+static const size_t PEAK_FRAMES_PER_SEC = 55;
+
+// A packet is remembered long enough to outlive every echo of itself.
+//
+// Thirty seconds was the old figure and it was a fiction. Sixty-four entries
+// against fifty-odd distinct frames a second turns the whole table over in
+// about a second and a quarter, so nothing ever survived to be forgotten by
+// the TTL: eviction got there first, every time, and the number described a
+// window that did not exist whenever it mattered. No packet was mishandled
+// because of it - forwards settle inside about twenty milliseconds, which is
+// two orders of magnitude inside even the real window - but a constant that
+// cannot be true under load is one nobody can reason from, and the test that
+// pinned it was pinning the fiction.
+//
+// So: a window short enough to be honest, and a table large enough to hold
+// it. Three seconds is twelve cycles and a hundred and fifty times longer than
+// a forward takes to settle. The assert below is what keeps the two from
+// drifting apart again.
+static const uint32_t SEEN_TTL_MS = 3000;
+static const size_t SEEN_SLOTS = 192;
+
+static_assert(SEEN_SLOTS >= PEAK_FRAMES_PER_SEC * SEEN_TTL_MS / 1000,
+              "the dedupe table must be able to hold the window it claims, or "
+              "eviction silently shortens it and the TTL means nothing");
 
 // Forwarding a packet the instant it arrives is the wrong thing to do, and it
 // gets worse the more cars are on the ride. Three nodes that all hear one
 // frame rebroadcast in the same microsecond and collide, so nobody downstream
-// gets it. Each forward waits a random slice of this instead.
-static const uint32_t FORWARD_JITTER_MS = 15;
+// gets it. Each forward waits before going out.
+//
+// ## Why the wait is not just noise
+//
+// It used to be a flat random slice of fifteen milliseconds, and the copy
+// suppression underneath it could not do its job. Copies are counted as they
+// arrive, and a forward only arrives after its sender has waited: so in the
+// first few milliseconds after a frame lands, nobody has forwarded it yet,
+// every hearer still counts exactly one copy, and every hearer whose slice
+// expires in that window transmits. With the drain running at five
+// milliseconds that was about a third of them - nine forwards of every frame
+// in a full ride, roughly eight hundred and fifty milliseconds of air per
+// second from positions alone. The suppression was not failing; it was never
+// being consulted in time.
+//
+// Two changes, and the wait carries information instead of noise.
+//
+// Ordered by signal: the car that heard the frame most weakly goes first,
+// because it is the one furthest out and the one whose forward reaches
+// somewhere the original did not. Everyone nearer hears that forward while
+// still holding their own, and drops it. The most useful forwarder is also
+// the earliest, so the frame travels outward rather than in a random order.
+//
+// Spread by density: the window widens with the number of cars in earshot,
+// because density is what broke it. Nine neighbours get ninety milliseconds
+// to sort themselves out instead of fifteen, so the first bucket is a twentieth
+// of them rather than a third. Bounded, because a forward that arrives after
+// the next beacon is worth nothing.
+static const uint32_t FORWARD_JITTER_MS = 30;
+static const uint32_t FORWARD_JITTER_MAX_MS = 120;
+
+// The ends of the useful signal range. Below the far end every frame is "as
+// far away as it gets"; above the near end, "right here".
+static const int16_t FORWARD_FAR_DBM = -95;
+static const int16_t FORWARD_NEAR_DBM = -40;
+
+// Two cars at the same distance must not transmit together, and nothing about
+// their signal separates them.
+static const uint32_t FORWARD_TIE_MS = 4;
+
+static_assert(FORWARD_JITTER_MAX_MS >= FORWARD_JITTER_MS,
+              "the ceiling cannot be below the floor");
 // Frames waiting their turn to be forwarded.
 //
 // Eight, chosen when the roster was eight. Twenty-eight cars that all hear one
@@ -55,6 +119,23 @@ static const uint8_t SUPPRESS_AFTER = 3;
 // it dips behind a ridge is worse than one that says "last seen 90s".
 static const uint32_t RIDER_STALE_MS = 120000;
 static const uint32_t RIDER_DROP_MS = 600000;
+
+/**
+ * How wide the forwarding window should be with this many cars in earshot.
+ *
+ * Widens with the neighbourhood, because the whole failure is a density one: a
+ * window that gives three cars time to suppress each other gives nine cars no
+ * time at all. Bounded so that a forward still beats the next beacon.
+ */
+uint32_t forwardSpreadMs(size_t neighbours);
+
+/**
+ * How long this particular hearer holds this particular frame.
+ *
+ * Weakest signal first. [tieBreak] is any random number; only its low few bits
+ * are used, to separate cars the signal cannot.
+ */
+uint32_t forwardDelayMs(int16_t rssi, uint32_t spreadMs, uint32_t tieBreak);
 
 enum Heard : uint8_t {
   HEARD_NONE = 0,

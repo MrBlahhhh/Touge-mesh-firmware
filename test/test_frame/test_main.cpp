@@ -410,6 +410,82 @@ void test_copies_counts_every_arrival() {
   TEST_ASSERT_EQUAL_UINT8(0, m.copies(1, 100, SEEN_TTL_MS + 3));
 }
 
+void test_the_weakest_hearer_forwards_first() {
+  // The car that heard the frame most faintly is the one furthest out, and so
+  // the one whose forward reaches somewhere the original did not. It goes
+  // first; everyone nearer hears that forward while still holding their own
+  // copy and drops it. Before this the order was random, which meant the most
+  // useful relay was as likely to be suppressed as to be the one that ran.
+  const uint32_t spread = 90;
+  const uint32_t far = forwardDelayMs(FORWARD_FAR_DBM, spread, 0);
+  const uint32_t mid = forwardDelayMs(-70, spread, 0);
+  const uint32_t near = forwardDelayMs(FORWARD_NEAR_DBM, spread, 0);
+
+  TEST_ASSERT_EQUAL_UINT32(0, far);
+  TEST_ASSERT_EQUAL_UINT32(spread, near);
+  TEST_ASSERT_TRUE(mid > far);
+  TEST_ASSERT_TRUE(mid < near);
+}
+
+void test_signal_beyond_the_ends_of_the_range_is_clamped() {
+  const uint32_t spread = 90;
+  // Nothing sorts below the far end or above the near one, and in particular
+  // nothing produces a delay past the window it was given.
+  TEST_ASSERT_EQUAL_UINT32(forwardDelayMs(FORWARD_FAR_DBM, spread, 0),
+                           forwardDelayMs(-120, spread, 0));
+  TEST_ASSERT_EQUAL_UINT32(forwardDelayMs(FORWARD_NEAR_DBM, spread, 0),
+                           forwardDelayMs(-10, spread, 0));
+}
+
+void test_a_board_that_cannot_measure_signal_waits_longest() {
+  // Some cores hand the callback no RSSI at all and it arrives as zero, which
+  // as a signal reading means "extremely close". That is the right way round
+  // to be wrong: a board that cannot measure how far away a sender is should
+  // not be the one elected to relay for it.
+  const uint32_t spread = 90;
+  TEST_ASSERT_EQUAL_UINT32(forwardDelayMs(FORWARD_NEAR_DBM, spread, 0),
+                           forwardDelayMs(0, spread, 0));
+}
+
+void test_two_cars_at_the_same_distance_do_not_transmit_together() {
+  // Identical signal, so nothing about the ordering separates them. A few
+  // milliseconds of noise does.
+  const uint32_t spread = 90;
+  bool differed = false;
+  for (uint32_t t = 0; t < FORWARD_TIE_MS; t++)
+    if (forwardDelayMs(-70, spread, t) != forwardDelayMs(-70, spread, 0)) differed = true;
+  TEST_ASSERT_TRUE(differed);
+  // And the noise never grows into the next car's place in the order.
+  TEST_ASSERT_TRUE(forwardDelayMs(-70, spread, FORWARD_TIE_MS - 1) <
+                   forwardDelayMs(FORWARD_NEAR_DBM, spread, 0));
+}
+
+void test_the_forwarding_window_widens_with_the_neighbourhood() {
+  // The failure was a density one: a window that gives three cars time to
+  // suppress each other gives nine cars no time at all.
+  TEST_ASSERT_EQUAL_UINT32(FORWARD_JITTER_MS, forwardSpreadMs(1));
+  TEST_ASSERT_EQUAL_UINT32(FORWARD_JITTER_MS, forwardSpreadMs(SUPPRESS_AFTER));
+  TEST_ASSERT_TRUE(forwardSpreadMs(9) > forwardSpreadMs(3));
+  TEST_ASSERT_TRUE(forwardSpreadMs(MAX_RIDERS) >= forwardSpreadMs(9));
+}
+
+void test_the_forwarding_window_is_bounded() {
+  // A forward that arrives after the next beacon is worth nothing, so the
+  // window stops widening well before a cycle.
+  TEST_ASSERT_EQUAL_UINT32(FORWARD_JITTER_MAX_MS, forwardSpreadMs(MAX_RIDERS));
+  TEST_ASSERT_TRUE(forwardSpreadMs(MAX_RIDERS) <= FORWARD_JITTER_MAX_MS);
+  // Including the tie-break noise on top of the widest window.
+  TEST_ASSERT_TRUE(forwardDelayMs(FORWARD_NEAR_DBM, forwardSpreadMs(MAX_RIDERS),
+                                  FORWARD_TIE_MS - 1) < 250);
+}
+
+void test_an_empty_neighbourhood_still_waits() {
+  // Nobody heard yet is not the same as nobody there. A board that has just
+  // come up has an empty roster and must not treat that as permission to
+  // transmit the instant a frame lands.
+  TEST_ASSERT_EQUAL_UINT32(FORWARD_JITTER_MS, forwardSpreadMs(0));
+}
+
 void test_a_forward_waits_for_its_jitter() {
   Mesh m;
   m.reset();
@@ -539,15 +615,21 @@ static void addRiderOn(Rider *r, size_t i, uint32_t id, uint8_t slot) {
   r[i].pos.slot = slot;
 }
 
-void test_we_take_the_lowest_free_slot() {
+void test_we_take_a_slot_nobody_else_holds() {
+  // Not the lowest free one. The search enters the ring at our own node
+  // number, so that boards booting together with nothing on the roster do not
+  // all find slot zero free and all take it. Which free slot it is does not
+  // matter; that it is free does.
   Rider riders[MAX_RIDERS] = {};
   addRiderOn(riders, 0, 500, 0);
   addRiderOn(riders, 1, 100, 2);
 
   Schedule s;
   s.rebuild(300, false, riders, MAX_RIDERS, 0);
-  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
   TEST_ASSERT_TRUE(s.claimed());
+  TEST_ASSERT_TRUE(s.slot() < MAX_SLOTS);
+  TEST_ASSERT_NOT_EQUAL(0, s.slot());
+  TEST_ASSERT_NOT_EQUAL(2, s.slot());
   TEST_ASSERT_EQUAL_UINT8(3, s.known());
   TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
   TEST_ASSERT_FALSE(s.weAreReference());
@@ -564,10 +646,10 @@ void test_a_claimed_slot_survives_a_car_joining() {
   Schedule s;
   s.rebuild(300, false, riders, MAX_RIDERS, 0);
   uint8_t mine = s.slot();
-  TEST_ASSERT_EQUAL_UINT8(1, mine);
+  TEST_ASSERT_TRUE(s.claimed());
 
   // A car with a lower number than ours turns up, on a slot of its own.
-  addRiderOn(riders, 1, 100, 2);
+  addRiderOn(riders, 1, 100, (uint8_t)((mine + 1) % MAX_SLOTS));
   s.rebuild(300, false, riders, MAX_RIDERS, 0);
   TEST_ASSERT_EQUAL_UINT8(mine, s.slot());
 
@@ -585,18 +667,20 @@ void test_the_lower_node_number_wins_a_contested_slot() {
 
   Schedule s;
   s.rebuild(300, false, riders, MAX_RIDERS, 0);
-  TEST_ASSERT_EQUAL_UINT8(0, s.slot()); // we took the lowest free one
+  TEST_ASSERT_TRUE(s.claimed());
+  TEST_ASSERT_NOT_EQUAL(3, s.slot()); // 100 holds it and outranks us
 
-  // Now we are on 3 and the lower number arrives on it.
+  // And the other way round: we hold one, and a lower number arrives on it.
   Schedule t;
   Rider alone[MAX_RIDERS] = {};
   addRiderOn(alone, 0, 900, 0);
   t.rebuild(300, false, alone, MAX_RIDERS, 0);
-  TEST_ASSERT_EQUAL_UINT8(1, t.slot());
+  const uint8_t ours = t.slot();
+  TEST_ASSERT_TRUE(t.claimed());
 
-  addRiderOn(alone, 1, 100, 1); // lower number, takes our slot from under us
+  addRiderOn(alone, 1, 100, ours); // lower number, takes our slot from under us
   t.rebuild(300, false, alone, MAX_RIDERS, 0);
-  TEST_ASSERT_NOT_EQUAL(1, t.slot());
+  TEST_ASSERT_NOT_EQUAL(ours, t.slot());
   TEST_ASSERT_TRUE(t.claimed());
 }
 
@@ -606,12 +690,14 @@ void test_a_higher_node_number_does_not_take_our_slot() {
 
   Schedule s;
   s.rebuild(300, false, riders, MAX_RIDERS, 0);
-  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+  const uint8_t mine = s.slot();
+  TEST_ASSERT_TRUE(s.claimed());
 
-  // 900 sorts above us, so it is the one that has to move, not us.
-  addRiderOn(riders, 1, 900, 1);
+  // 900 sorts above us and lands on our slot, so it is the one that has to
+  // move, not us.
+  addRiderOn(riders, 1, 900, mine);
   s.rebuild(300, false, riders, MAX_RIDERS, 0);
-  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+  TEST_ASSERT_EQUAL_UINT8(mine, s.slot());
 }
 
 void test_every_car_lands_on_a_slot_of_its_own() {
@@ -628,8 +714,11 @@ void test_every_car_lands_on_a_slot_of_its_own() {
 
     Schedule s;
     s.rebuild(ids[me], false, roster, MAX_RIDERS, 0);
-    // The free slot left over is exactly the one this car already holds.
-    TEST_ASSERT_EQUAL_UINT8(held[me], s.slot());
+    // Not which slot it lands on - that depends where the search enters the
+    // ring - but that it is nobody else's.
+    TEST_ASSERT_TRUE(s.claimed());
+    for (int other = 0; other < 4; other++)
+      if (other != me) TEST_ASSERT_NOT_EQUAL(held[other], s.slot());
     TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
   }
 }
@@ -642,7 +731,9 @@ void test_the_lowest_node_number_is_the_reference() {
   Schedule s;
   s.rebuild(100, false, riders, MAX_RIDERS, 0);
   TEST_ASSERT_TRUE(s.weAreReference());
-  TEST_ASSERT_EQUAL_UINT8(0, s.slot());
+  TEST_ASSERT_TRUE(s.claimed());
+  TEST_ASSERT_NOT_EQUAL(1, s.slot());
+  TEST_ASSERT_NOT_EQUAL(2, s.slot());
 }
 
 void test_a_car_alone_does_not_wait_for_a_schedule() {
@@ -667,7 +758,10 @@ void test_slot_window_opens_once_per_cycle() {
 
   Schedule s;
   s.rebuild(300, false, riders, MAX_RIDERS, 0);
-  TEST_ASSERT_EQUAL_UINT8(1, s.slot()); // lowest free, 100 holds 0 and 900 holds 2
+  TEST_ASSERT_TRUE(s.claimed());
+  const uint8_t mine = s.slot();
+  TEST_ASSERT_NOT_EQUAL(0, mine); // 100 holds that, and it is the reference
+  const uint32_t opens = (uint32_t)mine * width;
   // The reference advertises slot zero, so its beacon lands on the cycle start
   // with nothing to subtract.
   TEST_ASSERT_EQUAL_UINT8(0, s.referenceSlot());
@@ -675,15 +769,15 @@ void test_slot_window_opens_once_per_cycle() {
   s.syncTo(1000, cycle); // the reference's beacon landed here, so a cycle began
   TEST_ASSERT_TRUE(s.synced());
 
-  // Slot 1 runs from 27 ms to 54 ms after the cycle starts.
+  // Our slot runs for one width, once, starting where our slot number puts it.
   TEST_ASSERT_FALSE(s.inSlot(1000, cycle));
-  TEST_ASSERT_FALSE(s.inSlot(1000 + width - 1, cycle));
-  TEST_ASSERT_TRUE(s.inSlot(1000 + width, cycle));
-  TEST_ASSERT_TRUE(s.inSlot(1000 + width * 2 - 1, cycle));
-  TEST_ASSERT_FALSE(s.inSlot(1000 + width * 2, cycle));
+  TEST_ASSERT_FALSE(s.inSlot(1000 + opens - 1, cycle));
+  TEST_ASSERT_TRUE(s.inSlot(1000 + opens, cycle));
+  TEST_ASSERT_TRUE(s.inSlot(1000 + opens + width - 1, cycle));
+  TEST_ASSERT_FALSE(s.inSlot(1000 + opens + width, cycle));
 
   // And again a cycle later, without another sync.
-  TEST_ASSERT_TRUE(s.inSlot(1000 + cycle + width, cycle));
+  TEST_ASSERT_TRUE(s.inSlot(1000 + cycle + opens, cycle));
   TEST_ASSERT_FALSE(s.inSlot(1000 + cycle, cycle));
 }
 
@@ -697,10 +791,12 @@ void test_slots_keep_running_across_the_millis_wrap() {
 
   Schedule s;
   s.rebuild(300, false, riders, MAX_RIDERS, 0);
+  TEST_ASSERT_TRUE(s.claimed());
+  const uint32_t opens = (uint32_t)s.slot() * width;
   s.syncTo(0xFFFFFF00, cycle);
   // 0xFFFFFF00 + 250 wraps past zero. Unsigned subtraction carries the phase
   // through; signed would put the slot 49 days away.
-  TEST_ASSERT_TRUE(s.inSlot((uint32_t)(0xFFFFFF00 + cycle + width), cycle));
+  TEST_ASSERT_TRUE(s.inSlot((uint32_t)(0xFFFFFF00 + cycle + opens), cycle));
 }
 
 void test_more_cars_than_slots_doubles_up_rather_than_falling_off() {
@@ -780,16 +876,71 @@ void test_a_duplicate_node_number_does_not_corrupt_the_claim() {
   // Two boards with the same node number is a real failure and nothing here
   // can fix it, but it must not also corrupt the head count or hand our own
   // slot away to what is really us.
+  // The duplicate is put on the very slot we would otherwise pick, so that a
+  // claim from our own id blocking us would show up as us moving off it.
+  const uint8_t would = (uint8_t)(300 % MAX_SLOTS);
   Rider riders[MAX_RIDERS] = {};
   addRiderOn(riders, 0, 100, 0);
-  addRiderOn(riders, 1, 300, 1); // our own number, claiming a slot
+  addRiderOn(riders, 1, 300, would); // our own number, claiming a slot
 
   Schedule s;
   s.rebuild(300, false, riders, MAX_RIDERS, 0);
   TEST_ASSERT_EQUAL_UINT8(2, s.known());
   TEST_ASSERT_TRUE(s.claimed());
-  // Slot 1 reads as free, because the only claim on it is from our own id.
-  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+  // It reads as free, because the only claim on it is from our own id.
+  TEST_ASSERT_EQUAL_UINT8(would, s.slot());
+}
+
+void test_a_departed_car_does_not_hold_its_slot_forever() {
+  // The roster deliberately keeps a car for ten minutes so that one over a
+  // ridge does not vanish off the map. Its slot is a different question with a
+  // different answer, and both were being read off the same roster: five cars
+  // leaving a ride held five of nine slots for ten minutes while the cars
+  // still on the road crowded into what was left.
+  Rider riders[MAX_RIDERS] = {};
+  addRiderOn(riders, 0, 100, 0);
+  riders[0].atMs = 0;
+
+  // Heard a moment ago. The claim stands and we go somewhere else.
+  Schedule s;
+  s.rebuild(900, false, riders, MAX_RIDERS, 1000);
+  TEST_ASSERT_TRUE(s.claimed());
+  TEST_ASSERT_NOT_EQUAL(0, s.slot());
+
+  // Quiet for longer than a dropout, still on the roster. 900 % 9 is 0, so it
+  // enters the ring exactly where the departed car was sitting: if the claim
+  // still counted, this would have to move.
+  Schedule t;
+  t.rebuild(900, false, riders, MAX_RIDERS, SLOT_LAPSE_MS + 1);
+  TEST_ASSERT_TRUE(t.claimed());
+  TEST_ASSERT_EQUAL_UINT8(0, t.slot());
+}
+
+void test_boards_starting_together_do_not_all_take_slot_zero() {
+  // Every board boots with a roster it has not filled in yet. Scanning from
+  // zero meant every one of them found slot zero free and took it, so a car
+  // park of cars switched on together transmitted in a single slot and then
+  // spent nine beacon rounds unpicking it by node number, colliding on the low
+  // slots throughout. Entering the ring at the node number spreads that first
+  // guess before anybody has heard anybody.
+  //
+  // These nine ids land on nine different slots, which is the mechanism doing
+  // exactly what it is for. Real node numbers are hash-like and will collide
+  // sometimes; the lowest-number rule is what settles those.
+  const uint32_t ids[9] = {11, 22, 33, 44, 55, 66, 77, 88, 99};
+  bool taken[MAX_SLOTS] = {};
+  int distinct = 0;
+  for (int i = 0; i < 9; i++) {
+    Rider nobody[MAX_RIDERS] = {};
+    Schedule s;
+    s.rebuild(ids[i], false, nobody, MAX_RIDERS, 0);
+    TEST_ASSERT_TRUE(s.claimed());
+    if (!taken[s.slot()]) {
+      taken[s.slot()] = true;
+      distinct++;
+    }
+  }
+  TEST_ASSERT_EQUAL_INT(9, distinct);
 }
 
 void test_an_unclaimed_car_free_runs_until_it_has_been_heard() {
@@ -973,14 +1124,17 @@ void test_gps_slots_need_no_reference_car() {
   addRiderOn(riders, 1, 900, 2);
 
   Schedule s;
-  s.rebuild(300, false, riders, MAX_RIDERS, 0); // we take the free slot 1
+  s.rebuild(300, false, riders, MAX_RIDERS, 0);
+  TEST_ASSERT_TRUE(s.claimed());
   TEST_ASSERT_FALSE(s.synced());
   TEST_ASSERT_TRUE(s.inSlot(0, 250)); // no epoch, so it free-runs
 
   const uint32_t width = Schedule::slotWidthMs(250);
+  const uint32_t opens = (uint32_t)s.slot() * width;
+  TEST_ASSERT_NOT_EQUAL(0, s.slot());
   TEST_ASSERT_FALSE(s.inSlotAtPhase(0, 250));
-  TEST_ASSERT_TRUE(s.inSlotAtPhase(width, 250));
-  TEST_ASSERT_FALSE(s.inSlotAtPhase(width * 2, 250));
+  TEST_ASSERT_TRUE(s.inSlotAtPhase(opens, 250));
+  TEST_ASSERT_FALSE(s.inSlotAtPhase(opens + width, 250));
 }
 
 // ---- The mixed ride --------------------------------------------------------
@@ -1055,18 +1209,22 @@ void test_sync_backs_out_the_reference_slot() {
   const uint32_t width = Schedule::slotWidthMs(cycle);
 
   Schedule s;
-  s.rebuild(300, false, riders, MAX_RIDERS, 0); // slots 0 and 2 taken, we get 1
+  s.rebuild(300, false, riders, MAX_RIDERS, 0); // slots 0 and 2 taken
   TEST_ASSERT_EQUAL_UINT32(700, s.referenceId());
   // Read off the reference's own beacon, not derived from its rank.
   TEST_ASSERT_EQUAL_UINT8(2, s.referenceSlot());
-  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+  TEST_ASSERT_TRUE(s.claimed());
+  const uint8_t mine = s.slot();
+  TEST_ASSERT_NOT_EQUAL(0, mine);
+  TEST_ASSERT_NOT_EQUAL(2, mine);
 
   // Its beacon lands at t=1000, two slots into the cycle, so the cycle began
-  // two slot widths earlier and our own slot is one width after that.
+  // two slot widths earlier and our own slot is `mine` widths after that.
   s.syncTo(1000, cycle);
-  TEST_ASSERT_TRUE(s.inSlot(1000 - width, cycle));
+  const uint32_t began = 1000 - width * 2;
+  TEST_ASSERT_TRUE(s.inSlot(began + (uint32_t)mine * width, cycle));
   TEST_ASSERT_FALSE(s.inSlot(1000, cycle));
-  TEST_ASSERT_FALSE(s.inSlot(1000 - width * 2, cycle));
+  TEST_ASSERT_FALSE(s.inSlot(began, cycle));
 }
 
 void test_a_mixed_ride_puts_everyone_on_one_cycle() {
@@ -1087,7 +1245,9 @@ void test_a_mixed_ride_puts_everyone_on_one_cycle() {
   gps.rebuild(700, true, gpsRoster, MAX_RIDERS, 0);
   // Locked, so it keeps time even though 300 is the lower number.
   TEST_ASSERT_TRUE(gps.weAreReference());
-  TEST_ASSERT_EQUAL_UINT8(1, gps.slot()); // lowest free
+  TEST_ASSERT_TRUE(gps.claimed());
+  const uint8_t gpsSlot = gps.slot();
+  TEST_ASSERT_NOT_EQUAL(0, gpsSlot); // 300 holds that
 
   // Find the instant its slot opens, which is when its beacon goes out.
   uint64_t sendAt = 0;
@@ -1099,24 +1259,27 @@ void test_a_mixed_ride_puts_everyone_on_one_cycle() {
       break;
     }
   }
-  TEST_ASSERT_EQUAL_UINT64(pulse + (uint64_t)width * 1000, sendAt);
+  TEST_ASSERT_EQUAL_UINT64(pulse + (uint64_t)gpsSlot * width * 1000, sendAt);
 
   // The phone-only car, id 300, hears that beacon and syncs to it. Its own
   // millis() has nothing to do with the other car's microsecond counter.
   const uint32_t heardAtMs = 55555;
   Rider phoneRoster[MAX_RIDERS] = {};
   addLockedRider(phoneRoster, 0, 700);
-  phoneRoster[0].pos.slot = 1; // as advertised in the beacon it just heard
+  phoneRoster[0].pos.slot = gpsSlot; // as advertised in the beacon it just heard
   Schedule phone;
   phone.rebuild(300, false, phoneRoster, MAX_RIDERS, 0);
   TEST_ASSERT_EQUAL_UINT32(700, phone.referenceId());
-  TEST_ASSERT_EQUAL_UINT8(1, phone.referenceSlot());
-  TEST_ASSERT_EQUAL_UINT8(0, phone.slot());
+  TEST_ASSERT_EQUAL_UINT8(gpsSlot, phone.referenceSlot());
+  TEST_ASSERT_TRUE(phone.claimed());
+  const uint8_t phoneSlot = phone.slot();
+  TEST_ASSERT_NOT_EQUAL(gpsSlot, phoneSlot); // the two never share one
   phone.syncTo(heardAtMs, cycle);
 
-  // Slot 0 belongs to the phone car, and it runs from one slot width before
-  // the beacon it just heard. The two cars never share a slot.
-  TEST_ASSERT_TRUE(phone.inSlot(heardAtMs - width, cycle));
+  // Backing the reference's own slot out of the beacon gives the cycle start
+  // on the phone car's millis(), and its slot follows from there.
+  const uint32_t began = heardAtMs - (uint32_t)gpsSlot * width;
+  TEST_ASSERT_TRUE(phone.inSlot(began + (uint32_t)phoneSlot * width, cycle));
   TEST_ASSERT_FALSE(phone.inSlot(heardAtMs, cycle));
 }
 
@@ -1373,6 +1536,13 @@ int main(int, char**) {
   RUN_TEST(test_roster_drops_only_after_a_very_long_silence);
   RUN_TEST(test_packet_ids_never_restart_at_zero);
   RUN_TEST(test_copies_counts_every_arrival);
+  RUN_TEST(test_the_weakest_hearer_forwards_first);
+  RUN_TEST(test_signal_beyond_the_ends_of_the_range_is_clamped);
+  RUN_TEST(test_a_board_that_cannot_measure_signal_waits_longest);
+  RUN_TEST(test_two_cars_at_the_same_distance_do_not_transmit_together);
+  RUN_TEST(test_the_forwarding_window_widens_with_the_neighbourhood);
+  RUN_TEST(test_the_forwarding_window_is_bounded);
+  RUN_TEST(test_an_empty_neighbourhood_still_waits);
   RUN_TEST(test_a_forward_waits_for_its_jitter);
   RUN_TEST(test_a_forward_overtaken_by_neighbours_is_dropped);
   RUN_TEST(test_a_forward_nobody_else_made_still_goes);
@@ -1380,10 +1550,12 @@ int main(int, char**) {
   RUN_TEST(test_a_forward_scheduled_across_the_millis_wrap_still_fires);
   RUN_TEST(test_distance_is_close_enough_to_be_a_gate);
   RUN_TEST(test_distance_does_not_overflow_on_a_full_span_of_longitude);
-  RUN_TEST(test_we_take_the_lowest_free_slot);
+  RUN_TEST(test_we_take_a_slot_nobody_else_holds);
   RUN_TEST(test_a_claimed_slot_survives_a_car_joining);
   RUN_TEST(test_the_lower_node_number_wins_a_contested_slot);
   RUN_TEST(test_a_higher_node_number_does_not_take_our_slot);
+  RUN_TEST(test_a_departed_car_does_not_hold_its_slot_forever);
+  RUN_TEST(test_boards_starting_together_do_not_all_take_slot_zero);
   RUN_TEST(test_an_unclaimed_car_free_runs_until_it_has_been_heard);
   RUN_TEST(test_every_car_lands_on_a_slot_of_its_own);
   RUN_TEST(test_the_lowest_node_number_is_the_reference);

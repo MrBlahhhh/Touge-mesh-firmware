@@ -40,6 +40,14 @@ struct FastRx {
   // recovers its clock from this, and the five milliseconds a poll can sit
   // waiting would be a fifth of a slot.
   uint32_t rxMs = 0;
+  // The channel this frame actually arrived on.
+  //
+  // For the same reason as rxMs: a hop can happen between the driver taking
+  // the frame and the module getting round to it, and asking the radio which
+  // channel it is on at that point answers about the new one. Frames received
+  // just before a hop were being filed under the channel the ride had moved
+  // to, which is then counted as evidence that cars are already there.
+  uint8_t chan = 0;
 };
 
 class FastRadio {
@@ -73,6 +81,22 @@ class FastRadio {
   // Frames the driver handed us that we had nowhere to put. Worth watching:
   // a number that climbs means the module is not draining fast enough.
   uint32_t dropped() const;
+
+  /**
+   * Frames the driver refused to accept for transmission.
+   *
+   * A broadcast has no acknowledgement, so the send callback reports success
+   * whatever happens in the air and is worth nothing here. The return of
+   * esp_now_send is worth something: under saturation it is
+   * ESP_ERR_ESPNOW_NO_MEM, and that was being discarded at every level - the
+   * driver's return, send()'s return, and the module's. A board that had
+   * stopped getting anything out looked perfectly healthy to itself, and the
+   * only number on the status line counted receive drops.
+   */
+  uint32_t sendFailed() const;
+
+  /** The last error the driver gave, for the status line. */
+  int lastSendError() const;
 
  private:
   bool ready_ = false;

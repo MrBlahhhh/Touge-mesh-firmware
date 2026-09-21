@@ -3,6 +3,33 @@
 
 namespace touge {
 
+uint32_t forwardSpreadMs(size_t neighbours) {
+  // One neighbour needs no room at all to avoid anybody, but the floor is the
+  // old flat window: two cars still have to miss each other.
+  uint32_t want = (uint32_t)(FORWARD_JITTER_MS * (neighbours > 0 ? neighbours : 1)) /
+                  (SUPPRESS_AFTER > 0 ? SUPPRESS_AFTER : 1);
+  if (want < FORWARD_JITTER_MS) want = FORWARD_JITTER_MS;
+  if (want > FORWARD_JITTER_MAX_MS) want = FORWARD_JITTER_MAX_MS;
+  return want;
+}
+
+uint32_t forwardDelayMs(int16_t rssi, uint32_t spreadMs, uint32_t tieBreak) {
+  const uint32_t tie = FORWARD_TIE_MS > 0 ? (tieBreak % FORWARD_TIE_MS) : 0;
+  if (spreadMs == 0) return tie;
+
+  int32_t r = rssi;
+  if (r < FORWARD_FAR_DBM) r = FORWARD_FAR_DBM;
+  if (r > FORWARD_NEAR_DBM) r = FORWARD_NEAR_DBM;
+
+  // Zero at the far end, the full spread at the near end. A board reporting no
+  // RSSI at all reads as 0 dBm, which clamps to the near end and holds
+  // longest - the right way to be wrong, since a car that cannot measure
+  // signal should not be the one elected to relay.
+  const int32_t span = (int32_t)FORWARD_NEAR_DBM - (int32_t)FORWARD_FAR_DBM;
+  const uint32_t d = (uint32_t)(((int64_t)(r - FORWARD_FAR_DBM) * (int64_t)spreadMs) / span);
+  return d + tie;
+}
+
 void Mesh::reset() {
   memset(seen_, 0, sizeof(seen_));
   memset(riders_, 0, sizeof(riders_));

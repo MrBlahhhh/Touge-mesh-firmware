@@ -79,6 +79,28 @@ static_assert(MAX_SLOTS <= 15, "the slot travels in a nibble; see frame.cpp");
 // too long for the clock.
 static const uint32_t REFERENCE_LAPSE_MS = 8000;
 
+/**
+ * How long a car's claim on a slot outlives the last time it was heard.
+ *
+ * The roster deliberately holds a car for ten minutes so a car over a ridge
+ * does not vanish off the map. Slot ownership was reading off that same
+ * roster, so five cars leaving a ride held five of nine slots for ten minutes
+ * and the cars still driving crowded into what was left.
+ *
+ * Longer than a handful of missed beacons, because handing a slot to somebody
+ * else on the strength of a short dropout is how two cars end up transmitting
+ * together. Far shorter than the roster, because a car nobody has heard in
+ * half a minute is not using the air. A car that comes back rebuilds and
+ * reclaims on its next beacon, and the lowest-node-number rule settles it if
+ * somebody took the seat meanwhile.
+ */
+static const uint32_t SLOT_LAPSE_MS = 30000;
+
+static_assert(SLOT_LAPSE_MS > REFERENCE_LAPSE_MS,
+              "a car should lose the clock before it loses its slot");
+static_assert(SLOT_LAPSE_MS < RIDER_DROP_MS,
+              "a slot held until the roster forgets the car is the bug this is for");
+
 // No slot held yet. Nine slots leave four bits with values to spare, so this
 // rides in the same nibble as the slot itself and costs nothing.
 static const uint8_t SLOT_NONE = 0x0F;

@@ -706,8 +706,14 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         if (f.type == FRAME_POSITION) {
             Position p;
             if (decodePosition(body, bodyLen, p)) {
-                mesh_.note(f.src, p, HEARD_FAST, rx.rssi, FAST_HOPS - f.hops, nowMs,
-                           fastRadio.channel());
+                // rx.chan, not fastRadio.channel(): the frame is filed under
+                // the channel it arrived on, not the one the radio happens to
+                // be sitting on by the time this loop reaches it. A hop
+                // between the two stamped everything still in the queue with
+                // the new channel, and countOn then read those as cars that
+                // had already moved - the hop counting its own backlog as
+                // proof it had succeeded.
+                mesh_.note(f.src, p, HEARD_FAST, rx.rssi, FAST_HOPS - f.hops, nowMs, rx.chan);
                 // A newer belief about the channel wins, wherever it comes
                 // from. Only acted on after the tag has already passed, so a
                 // stranger cannot walk the ride off its channel.
@@ -775,7 +781,15 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
             fwd.payload = sealed;
             uint8_t wire[FRAME_MAX];
             size_t n = encodeFrame(fwd, wire, sizeof(wire));
-            if (n > 0) mesh_.defer(wire, n, f.src, f.id, nowMs + (esp_random() % FORWARD_JITTER_MS));
+            // Weakest hearer first, over a window that widens with the
+            // number of cars in earshot. A flat slice meant the earliest
+            // third of hearers transmitted before a single copy had been
+            // counted, so the suppression below never got a chance to run.
+            if (n > 0) {
+                const uint32_t spread = forwardSpreadMs(fastNeighbours(nowMs));
+                mesh_.defer(wire, n, f.src, f.id,
+                            nowMs + forwardDelayMs(rx.rssi, spread, esp_random()));
+            }
         }
     }
 }
@@ -846,11 +860,13 @@ void TougeFastModule::status(uint32_t nowMs)
         slotText[sizeof(slotText) - 1] = 0;
     }
 
-    LOG_INFO("touge: ch=%u slot=%s/%u known=%u ref=%08x%s clock=%s fast=%u suppressed=%u dropped=%u",
+    LOG_INFO("touge: ch=%u slot=%s/%u known=%u ref=%08x%s clock=%s fast=%u suppressed=%u dropped=%u "
+             "txfail=%u(%d)",
              (unsigned)fastRadio.channel(), slotText, (unsigned)MAX_SLOTS,
              (unsigned)schedule_.known(), (unsigned)schedule_.referenceId(),
              schedule_.weAreReference() ? " (us)" : "", clock, (unsigned)fastNeighbours(nowMs),
-             (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped());
+             (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
+             (unsigned)fastRadio.sendFailed(), fastRadio.lastSendError());
 
     // The same line, to the phone.
     //
@@ -867,10 +883,10 @@ void TougeFastModule::status(uint32_t nowMs)
     // rather than breaking. sendToPhone only queues for BLE; none of this
     // touches the air.
     {
-        char js[192];
+        char js[224];
         int n = snprintf(
             js, sizeof(js),
-            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u,\"gi\":%u,\"gg\":%u}}",
+            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u,\"gi\":%u,\"gg\":%u,\"tf\":%u}}",
             (unsigned)fastRadio.channel(), schedule_.claimed() ? (int)schedule_.slot() : -1,
             (unsigned)schedule_.known(), (unsigned)fastNeighbours(nowMs), clock,
             (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
@@ -878,7 +894,8 @@ void TougeFastModule::status(uint32_t nowMs)
             (unsigned)((nowSec > 0 && localPosition.time > 0 && nowSec > localPosition.time)
                            ? nowSec - localPosition.time
                            : 0),
-            (unsigned)hop_.index(), (unsigned)hop_.generation());
+            (unsigned)hop_.index(), (unsigned)hop_.generation(),
+            (unsigned)fastRadio.sendFailed());
         if (n > 0 && (size_t)n < sizeof(js)) {
             meshtastic_MeshPacket *sp = router->allocForSending();
             if (sp) {
