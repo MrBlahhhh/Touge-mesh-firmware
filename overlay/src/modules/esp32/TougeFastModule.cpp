@@ -147,6 +147,14 @@ const uint32_t TOUGE_BUILD = 12;
 const uint32_t HOME_AFTER_MS = 25000;
 
 
+// Roughly how long a full frame takes on the air.
+//
+// 250 bytes at ESP-NOW's LR rate of 250 kbps, which is the rate this uses for
+// range. Unmeasured: see firmware/docs/REDESIGN-30-CARS.md, which lists
+// measuring real airtime and send-completion latency before any slot width is
+// fixed. Used only to keep the slot arithmetic honest at compile time.
+const uint32_t FRAME_AIRTIME_MS = 8;
+
 // The shortest PSK worth deriving a 2.4 GHz key from.
 //
 // Meshtastic uses one byte to mean "the default channel, key number N", which
@@ -195,6 +203,15 @@ TougeFastModule::TougeFastModule()
     // A search that listens for less than two beacons can miss a live channel.
     static_assert(SCAN_DWELL_MS > 2 * GATE_IDLE_MS,
                   "each scan dwell must outlast two idle heartbeats");
+    // A slot has to be wider than the frame that goes in it.
+    //
+    // ESP-NOW in LR mode runs at 250 kbps, so a full 250 byte frame is about
+    // eight milliseconds on the air. Slots narrower than that would overlap by
+    // construction, which is the trap that catches anyone deriving the slot
+    // count from the number of riders: twenty-nine slots in this cycle is
+    // 8.6 ms each and there is no frame that fits.
+    static_assert(CYCLE_MS / MAX_SLOTS >= 3 * FRAME_AIRTIME_MS,
+                  "slots must be several frame times wide; raise CYCLE_MS or drop MAX_SLOTS");
 
 #ifdef PIN_GPS_PPS
     pinMode(PIN_GPS_PPS, INPUT);

@@ -14,7 +14,15 @@
 namespace touge {
 
 // Eight cars is more than any group ride that still works as a group ride.
-static const size_t MAX_RIDERS = 8;
+// How many cars the roster can hold.
+//
+// Rides run to twenty-eight cars. Eight was the bench group this was built
+// against, and a fixed array of eight silently drops the twenty-ninth car -
+// and the twelfth, and the ninth. A Rider is about fifty-six bytes, so
+// twenty-eight is under two kilobytes on an ESP32-S3, which is nothing.
+//
+// This is deliberately not the slot count any more. See MAX_SLOTS.
+static const size_t MAX_RIDERS = 28;
 
 // A packet is remembered long enough to outlive every echo of itself. Three
 // hops at SHORT_FAST with back-off is under two seconds, so thirty is a wide

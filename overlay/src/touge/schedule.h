@@ -35,7 +35,35 @@ namespace touge {
 // Riders plus ourselves. Fixed rather than sized to the roster, because a slot
 // width that changed as cars joined would move everybody else at once, and the
 // moment a roster is in flux is exactly when you want the schedule stable.
-static const uint8_t MAX_SLOTS = MAX_RIDERS + 1;
+// Transmit slots in one cycle. An airtime budget, not a headcount.
+//
+// This was MAX_RIDERS + 1, on the assumption that every car gets its own slot.
+// That assumption breaks the moment a ride is bigger than a bench group:
+// twenty-nine slots in a 250 ms cycle is 8.6 ms each, and an ESP-NOW LR frame
+// at 250 kbps is already about 8 ms. There would be no room for the frame,
+// never mind guard time.
+//
+// So the two are now separate. The slot count comes from what the air can
+// carry; the roster comes from how many cars are on the ride. With more cars
+// than slots, the cars without one free-run - which is what `inSlotAtPhase`
+// already does for an unclaimed car, and degrades to carrier sense rather
+// than to silence.
+//
+// The real answer is spatial reuse: a slot only has to be unique within a
+// car's two-hop interference neighbourhood, so the front and the tail of a
+// half-mile train can share one. That needs the neighbour gossip and two-hop
+// colouring described in firmware/docs/REDESIGN-30-CARS.md. Until then this
+// is an honest nine.
+//
+// Fifteen is the wire's ceiling regardless: the slot travels in a nibble
+// alongside the flags (frame.cpp packs `(slot & 0x0F) << 4`), so anything
+// above fifteen needs a frame format change as well.
+static const uint8_t MAX_SLOTS = 9;
+
+// The wire carries the slot in a nibble beside the flags, so fifteen is the
+// ceiling until the frame format changes. Worth failing the build over rather
+// than discovering it as slots silently wrapping into the flag bits.
+static_assert(MAX_SLOTS <= 15, "the slot travels in a nibble; see frame.cpp");
 
 // How long a car may be quiet and still keep the job of keeping time.
 //
