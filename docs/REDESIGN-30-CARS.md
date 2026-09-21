@@ -1,5 +1,36 @@
 
-## Review findings not yet fixed (2026-09-21)
+## Review findings: nine of ten fixed (2026-09-21)
+
+Everything below was found by a second review and has since been fixed, except
+the last one. Kept rather than deleted because the reasoning is the useful part
+and each fix is only legible against the fault it was for. The commits are
+`bccc0bf`, `0065faf`, `475c190`, `2c8f05b` and `f3489ff`.
+
+**Still open: voice has no app-side transport.** `LoopbackVoiceTransport` is
+what is wired. The rest of the stack is built - `Intercom`, `JitterBuffer`,
+`VoicePacket`, the `VoiceTransport` interface - and the firmware carries voice
+in both directions: out through `handleReceived`, back in through `inject`'s
+generic branch on the private port. What is missing is a `MeshVoiceTransport`
+implementing `send` as a private-port packet addressed to the radio itself, and
+`onReceive` hooked into `MeshtasticLink.drain`. That drain already parses the
+private port as JSON, so voice needs a discriminator; JSON always opens with a
+brace, so a payload that does not is audio.
+
+One prerequisite for it turned out to be broken and is now fixed:
+`MeshService::handleToRadio` zeroes `from` on everything the phone sends, and
+only `Router::send` fills it in - which a locally-delivered packet never
+reaches. The module compared `mp.from` against its own node number, so the test
+failed and push-to-talk audio would never have been transmitted at all. It uses
+`isFromUs` now, which is what that helper is for.
+
+Also deliberately not done: a real fix time on the wire. With the phone now
+telling the radio where it is once a second, stamping `mp.time` with the receive
+time is approximately true rather than twenty seconds of fiction. Still the
+honest answer, no longer urgent.
+
+## The findings as they were written
+
+
 
 Ranked. Everything above this line in the "order of work" still stands; these
 are the specific faults a second review found, with the evidence.

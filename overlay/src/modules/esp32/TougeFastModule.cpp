@@ -1178,8 +1178,18 @@ ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
     // delivers those to modules without transmitting, which is what keeps
     // push-to-talk audio off the LoRa side entirely.
     if (mp.which_payload_variant != meshtastic_MeshPacket_decoded_tag) return ProcessMessage::CONTINUE;
-    if (mp.from != nodeDB->getNodeNum()) return ProcessMessage::CONTINUE;
-    if (mp.to != nodeDB->getNodeNum()) return ProcessMessage::CONTINUE;
+    // isFromUs, not a comparison against our node number.
+    //
+    // MeshService::handleToRadio sets from to zero on everything the phone
+    // sends - clients are not allowed to assign node numbers - and it is only
+    // filled in by Router::send, on the way to the LoRa chip. A packet
+    // addressed to this radio never goes that way: sendLocal sees isToUs and
+    // hands it straight to deliverLocal. So from was still zero by the time it
+    // reached here, the test below failed, and push-to-talk audio from the
+    // phone was never transmitted at all. isFromUs is the idiomatic check and
+    // treats zero as ourselves, which is exactly what it is for.
+    if (!isFromUs(&mp)) return ProcessMessage::CONTINUE;
+    if (!isToUs(&mp)) return ProcessMessage::CONTINUE;
 
     if (!started_) {
         // Swallowed rather than passed on. Letting it fall through would put
