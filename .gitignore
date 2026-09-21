@@ -1,0 +1,6 @@
+# PlatformIO build output and vendored libraries. Never source.
+#
+# The parent repository ignores this as `firmware/.pio/`, which stops applying
+# the moment these files are the root of a repository of their own. Kept here
+# so both are covered: 82 build artefacts were committed once already.
+.pio/
