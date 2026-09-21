@@ -136,7 +136,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 10;
+const uint32_t TOUGE_BUILD = 11;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -693,7 +693,9 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
                     // certain it was on a channel it could not hear, and the log
                     // cheerfully agreed with it.
                     if (fastRadio.retuneTo(hop_.channel())) {
-                        LOG_INFO("touge: following a hop to channel %u", (unsigned)hop_.channel());
+                        LOG_INFO("touge: following %08x to channel %u (gen %u, was %u/%u)",
+                                 (unsigned)f.src, (unsigned)hop_.channel(),
+                                 (unsigned)hop_.generation(), (unsigned)wasIndex, (unsigned)wasGen);
                     } else {
                         LOG_WARN("touge: could not retune to channel %u, staying on %u",
                                  (unsigned)hop_.channel(), (unsigned)fastRadio.channel());
@@ -824,14 +826,15 @@ void TougeFastModule::status(uint32_t nowMs)
         char js[192];
         int n = snprintf(
             js, sizeof(js),
-            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u}}",
+            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u,\"gi\":%u,\"gg\":%u}}",
             (unsigned)fastRadio.channel(), schedule_.claimed() ? (int)schedule_.slot() : -1,
             (unsigned)schedule_.known(), (unsigned)fastNeighbours(nowMs), clock,
             (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
             (unsigned)TOUGE_BUILD,
             (unsigned)((nowSec > 0 && localPosition.time > 0 && nowSec > localPosition.time)
                            ? nowSec - localPosition.time
-                           : 0));
+                           : 0),
+            (unsigned)hop_.index(), (unsigned)hop_.generation());
         if (n > 0 && (size_t)n < sizeof(js)) {
             meshtastic_MeshPacket *sp = router->allocForSending();
             if (sp) {
