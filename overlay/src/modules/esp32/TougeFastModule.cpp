@@ -136,7 +136,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 7;
+const uint32_t TOUGE_BUILD = 8;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -890,7 +890,19 @@ void TougeFastModule::hopKeeping(uint32_t nowMs)
         // fruitless sweeps a board stops hunting and waits there. A board that
         // is not lost carries on as it was, so the lost ones come to it; if
         // everyone is lost, everyone ends up at home.
-        if (quiet >= HOME_AFTER_MS) {
+        // Alternate: hunt for a while, wait at home for a while, repeat.
+        //
+        // Parking at home permanently would strand a board whose ride had
+        // legitimately hopped elsewhere - it would sit on a channel nobody is
+        // using while the group talked on another, having stopped looking. And
+        // sweeping forever is what left three boards circling past each other.
+        // Doing both in turn covers both: a ride that moved is found by the
+        // next sweep, and boards that are all lost meet during a home phase.
+        //
+        // The phases are long enough that two boards drifting in and out of
+        // step still overlap at home for most of a phase.
+        const bool waitAtHome = ((quiet / HOME_AFTER_MS) % 2) == 1;
+        if (waitAtHome) {
             if (fastRadio.channel() != hop_.homeChannel()) {
                 hop_.goHome();
                 if (fastRadio.retuneTo(hop_.channel())) {
