@@ -478,16 +478,28 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
 
         if (p.name[0] != 0) {
             meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(f.src);
-            // Only fill in a name for a node we have never heard from over
-            // LoRa. A NodeInfo that arrived the normal way is signed and
-            // carries a long name; overwriting it from an unauthenticated
-            // 2.4 GHz frame would be a downgrade.
+            // Fill in a name we do not have, and finish one we cut short.
             //
-            // An empty long_name is the test, because NodeInfoLite has no
-            // nested User to ask about: this firmware flattens long_name and
-            // short_name onto the node itself, so there is no has_user to
-            // read. No name stored means there is nothing to downgrade.
-            if (n && n->long_name[0] == 0) {
+            // This accepted a name only when long_name was empty, so that a
+            // frame could not overwrite a name that arrived the ordinary way.
+            // The caution was misplaced twice over. These frames carry an HMAC
+            // over the ride key, so they are not unauthenticated; and an
+            // earlier build sent short_name over the air, which the receiver
+            // wrote into long_name. That left "Jack" where "Jackie" belonged
+            // and nothing could ever replace it, because "Jack" is not empty.
+            // A wrong name was frozen permanently by a rule meant to protect
+            // a right one.
+            //
+            // So: take a name when there is none, and take one that merely
+            // extends what is already stored. "Jack" gives way to "Jackie";
+            // "Jackie" does not give way to "Bob". Un-truncating is the only
+            // rewrite allowed, which fixes the boards already carrying a
+            // clipped name without opening the door the old rule was guarding.
+            const bool haveNone = n && n->long_name[0] == 0;
+            const bool extends = n && !haveNone &&
+                                 strncmp(n->long_name, p.name, strlen(n->long_name)) == 0 &&
+                                 strlen(p.name) > strlen(n->long_name);
+            if (n && (haveNone || extends)) {
                 meshtastic_User u = meshtastic_User_init_default;
                 // The frame carries the long name, so the short one is the
                 // first few characters of it rather than a copy. Copying the
