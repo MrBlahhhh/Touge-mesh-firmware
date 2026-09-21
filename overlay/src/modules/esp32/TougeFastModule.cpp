@@ -262,7 +262,7 @@ void TougeFastModule::syncChannel()
     mesh_.reset();
     schedule_.reset();
     schedule_.rebuild(nodeDB->getNodeNum(), rideClock.locked((uint64_t)esp_timer_get_time()),
-                      mesh_.riders(), MAX_RIDERS);
+                      mesh_.riders(), MAX_RIDERS, millis());
     wantBeacon_ = false;
     sentOnce_ = false;
     mesh_.seedIds(idCeiling_ ? idCeiling_ - ID_BLOCK : nodeDB->getNodeNum());
@@ -620,7 +620,7 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
                 // rather than when somebody else next turns up. Nine slots
                 // across eight riders is not work worth conserving.
                 schedule_.rebuild(nodeId_, rideClock.locked((uint64_t)esp_timer_get_time()),
-                                  mesh_.riders(), MAX_RIDERS);
+                                  mesh_.riders(), MAX_RIDERS, millis());
             }
         }
 

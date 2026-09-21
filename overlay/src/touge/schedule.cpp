@@ -12,7 +12,8 @@ void Schedule::reset() {
   haveEpoch_ = false;
 }
 
-void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders) {
+void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders,
+                       uint32_t nowMs) {
   selfId_ = selfId;
 
   // Who keeps time. A car whose own clock is locked to GPS always wins the
@@ -37,8 +38,27 @@ void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, si
     // can fix that, but it must not also corrupt the count or the slot table.
     if (riders[i].id == selfId) continue;
     count++;
-    if (riders[i].id < lowestAny) lowestAny = riders[i].id;
-    if (riders[i].pos.clockLocked && (!anyLocked || riders[i].id < lowestLocked)) {
+
+    // A car that has gone quiet keeps its seat but loses the job of keeping
+    // time.
+    //
+    // The roster holds a car for ten minutes, which is right for the map: a
+    // car over a ridge should not vanish off it. It was also, until now, how
+    // long a departed car went on winning the election for reference, because
+    // the vote only ever looked at who was on the roster. So switching off the
+    // lowest-numbered car left everyone timing off a radio that was in
+    // somebody's pocket, with nothing re-disciplining the epoch - and an ESP32
+    // crystal drifts far enough in ten minutes to slide one slot into the next.
+    //
+    // Two different questions, one constant. This is the other one: quiet for
+    // a few beacons and you are still on the map, just not the clock.
+    // Only the vote. A quiet car keeps its slot, because a slot it may still
+    // be using must not be handed to somebody else on the strength of a few
+    // missed beacons - that is how two cars end up transmitting together.
+    const bool audible = (uint32_t)(nowMs - riders[i].atMs) < REFERENCE_LAPSE_MS;
+
+    if (audible && riders[i].id < lowestAny) lowestAny = riders[i].id;
+    if (audible && riders[i].pos.clockLocked && (!anyLocked || riders[i].id < lowestLocked)) {
       lowestLocked = riders[i].id;
       anyLocked = true;
     }

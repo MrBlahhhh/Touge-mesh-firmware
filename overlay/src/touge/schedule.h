@@ -37,6 +37,14 @@ namespace touge {
 // moment a roster is in flux is exactly when you want the schedule stable.
 static const uint8_t MAX_SLOTS = MAX_RIDERS + 1;
 
+// How long a car may be quiet and still keep the job of keeping time.
+//
+// Long enough that a couple of lost beacons change nothing, short enough that
+// switching off the reference does not leave everyone timing off a radio in
+// somebody's pocket. The roster's own ten minutes is right for the map and far
+// too long for the clock.
+static const uint32_t REFERENCE_LAPSE_MS = 15000;
+
 // No slot held yet. Nine slots leave four bits with values to spare, so this
 // rides in the same nibble as the slot itself and costs nothing.
 static const uint8_t SLOT_NONE = 0x0F;
@@ -53,7 +61,11 @@ class Schedule {
   // holds, keeps it unless a lower node number is already on it, and otherwise
   // takes the lowest free one. Two cars that pick the same slot before hearing
   // each other apply the same rule to the same facts, so one of them moves.
-  void rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders);
+  /**
+   * @param nowMs so a car that has gone quiet can stop being the reference.
+   */
+  void rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders,
+               uint32_t nowMs);
 
   // SLOT_NONE until the first roster arrives.
   uint8_t slot() const { return slot_; }
