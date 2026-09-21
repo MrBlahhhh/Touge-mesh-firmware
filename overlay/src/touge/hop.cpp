@@ -27,6 +27,9 @@ void Hop::begin(uint8_t seed) {
   index_ = (uint8_t)(seed % FAST_CHANNELS);
   generation_ = 0;
   scan_ = index_;
+  // Remembered separately, because the ride may hop away from it and a lost
+  // board still needs somewhere every other board would agree to meet.
+  home_ = index_;
 }
 
 bool Hop::observe(uint8_t packed) {

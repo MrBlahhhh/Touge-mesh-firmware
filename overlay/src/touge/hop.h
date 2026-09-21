@@ -72,6 +72,25 @@ class Hop {
   // rather than imposing the one it happened to stop on.
   uint8_t scanNext();
 
+  /**
+   * Back to the channel the ride key chose.
+   *
+   * Every board derives the same starting channel from the same key, so it is
+   * the one place all of them can agree to look without being told. A sweep
+   * only finds the ride when exactly one board is lost: two boards sweeping at
+   * the same rate can stay permanently out of phase, each arriving on a
+   * channel as the other leaves, which is precisely what three boards sitting
+   * on channels 1, 6 and 11 looked like.
+   */
+  void goHome()
+  {
+    index_ = home_;
+    scan_ = home_;
+  }
+
+  /** The channel the key chose, whatever the ride has since hopped to. */
+  uint8_t homeChannel() const { return HOP_CHANNELS[home_ % FAST_CHANNELS]; }
+
   // Put the belief back where it was.
   //
   // For when the radio refused to move. Deciding to hop and then failing to
@@ -92,6 +111,7 @@ class Hop {
   uint8_t index_ = 0;
   uint8_t generation_ = 0;
   uint8_t scan_ = 0;
+  uint8_t home_ = 0;
 };
 
 } // namespace touge

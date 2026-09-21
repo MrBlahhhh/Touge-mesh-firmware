@@ -129,6 +129,23 @@ const uint32_t HOP_KEEP_PCT = 25;
 // bench of boards find each other, rare enough not to drown the log.
 const uint32_t STATUS_EVERY_MS = 5000;
 
+// What build of the Touge module this is.
+//
+// Meshtastic's own version string comes from its git hash and does not move
+// when this overlay changes, so "is this board running the current firmware?"
+// was unanswerable from the phone - which is how an evening went by with three
+// boards on three different sets of timing constants and no way to tell. Bump
+// it whenever the on-air behaviour changes.
+const uint32_t TOUGE_BUILD = 7;
+
+// How long a board hunts before giving up and waiting at home.
+//
+// Three channels at two and a half seconds is one sweep in seven and a half,
+// so this is about three sweeps. Long enough that a board which is merely
+// between beacons does not abandon a working channel; short enough that a
+// split ride reconverges in well under a minute.
+const uint32_t HOME_AFTER_MS = 25000;
+
 // How old the local fix may be before this board stops beaconing it.
 //
 // The phone feeds a position every few seconds, so ten is several missed
@@ -802,10 +819,11 @@ void TougeFastModule::status(uint32_t nowMs)
         char js[192];
         int n = snprintf(
             js, sizeof(js),
-            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u}}",
+            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u}}",
             (unsigned)fastRadio.channel(), schedule_.claimed() ? (int)schedule_.slot() : -1,
             (unsigned)schedule_.known(), (unsigned)fastNeighbours(nowMs), clock,
-            (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped());
+            (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
+            (unsigned)TOUGE_BUILD);
         if (n > 0 && (size_t)n < sizeof(js)) {
             meshtastic_MeshPacket *sp = router->allocForSending();
             if (sp) {
@@ -858,6 +876,30 @@ void TougeFastModule::hopKeeping(uint32_t nowMs)
     // with the group within a few seconds however it came to be lost - a
     // missed hop, switched off during one, or simply joining late.
     if (quiet >= LOST_MS) {
+        // Sweep for a while, then go and wait where everyone can find you.
+        //
+        // A sweep only works when exactly one board is lost. Two sweeping at
+        // the same rate can stay permanently out of phase - each arriving on a
+        // channel as the other leaves - and three boards ended the evening
+        // sitting on channels 1, 6 and 11, every one of them reporting that it
+        // could hear nobody, having each passed through the others' channels
+        // repeatedly.
+        //
+        // The ride key picks the same starting channel on every board, so that
+        // is somewhere they can agree to meet without being told. After a few
+        // fruitless sweeps a board stops hunting and waits there. A board that
+        // is not lost carries on as it was, so the lost ones come to it; if
+        // everyone is lost, everyone ends up at home.
+        if (quiet >= HOME_AFTER_MS) {
+            if (fastRadio.channel() != hop_.homeChannel()) {
+                hop_.goHome();
+                if (fastRadio.retuneTo(hop_.channel())) {
+                    LOG_INFO("touge: quiet for %ums, waiting on home channel %u",
+                             (unsigned)quiet, (unsigned)hop_.channel());
+                }
+            }
+            return;
+        }
         if ((uint32_t)(nowMs - lastScanMs_) >= SCAN_DWELL_MS) {
             lastScanMs_ = nowMs;
             uint8_t ch = hop_.scanNext();
