@@ -136,7 +136,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 8;
+const uint32_t TOUGE_BUILD = 9;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -391,6 +391,15 @@ void TougeFastModule::beacon(uint32_t nowMs)
     uint32_t nowSec = getValidTime(RTCQualityFromNet);
     if (nowSec > 0 && localPosition.time > 0 &&
         nowSec - localPosition.time > POSITION_STALE_S) {
+        // Out loud, and rate limited, because a board that has gone quiet on
+        // purpose is indistinguishable from one that is broken. Two boards a
+        // foot apart on the same channel, one hearing nothing, and no way to
+        // tell whether the other was silent or unheard.
+        if ((uint32_t)(nowMs - lastMuteLogMs_) >= 5000) {
+            lastMuteLogMs_ = nowMs;
+            LOG_INFO("touge: not beaconing, local fix is %us old",
+                     (unsigned)(nowSec - localPosition.time));
+        }
         wantBeacon_ = false;
         return;
     }
@@ -781,6 +790,7 @@ void TougeFastModule::status(uint32_t nowMs)
     if ((uint32_t)(nowMs - lastStatusMs_) < STATUS_EVERY_MS) return;
     lastStatusMs_ = nowMs;
 
+    uint32_t nowSec = getValidTime(RTCQualityFromNet);
     const char *clock = rideClock.locked((uint64_t)esp_timer_get_time()) ? "gps"
                         : schedule_.synced()                            ? "beacon"
                                                                         : "free";
@@ -819,11 +829,13 @@ void TougeFastModule::status(uint32_t nowMs)
         char js[192];
         int n = snprintf(
             js, sizeof(js),
-            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u}}",
+            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"mute\":%u}}",
             (unsigned)fastRadio.channel(), schedule_.claimed() ? (int)schedule_.slot() : -1,
             (unsigned)schedule_.known(), (unsigned)fastNeighbours(nowMs), clock,
             (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
-            (unsigned)TOUGE_BUILD);
+            (unsigned)TOUGE_BUILD,
+            (unsigned)((nowSec > 0 && localPosition.time > 0 &&
+                        nowSec - localPosition.time > POSITION_STALE_S) ? 1 : 0));
         if (n > 0 && (size_t)n < sizeof(js)) {
             meshtastic_MeshPacket *sp = router->allocForSending();
             if (sp) {

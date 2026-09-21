@@ -99,6 +99,8 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     uint32_t lastScanMs_ = 0;
     uint32_t lastHopCheckMs_ = 0;
     uint32_t lastStatusMs_ = 0;
+    /** Rate limit for saying why this board is not beaconing. */
+    uint32_t lastMuteLogMs_ = 0;
     uint32_t heardInWindow_ = 0;
     // The last reference beacon the clock was stepped to, so a repeat of
     // the same frame cannot step it a second time.
