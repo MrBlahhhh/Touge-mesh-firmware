@@ -64,6 +64,16 @@ struct Rider {
   uint8_t via = HEARD_NONE;
   int16_t rssi = 0;
   uint8_t hopsAway = 0;
+  /**
+   * The 2.4 GHz channel this car was last heard on.
+   *
+   * Without it, "heard" counted anyone noticed in the last few seconds while
+   * the channel was read at the instant of asking - so a sweeping board could
+   * hear a car on channel 11, move to channel 1, and report ch=1 heard=1. Both
+   * halves true, the line as a whole impossible, and no way to tell a real
+   * contact from that.
+   */
+  uint8_t chan = 0;
   bool used = false;
 };
 
@@ -100,7 +110,7 @@ class Mesh {
   // Fold a heard position into the roster. Returns the slot, or nullptr when
   // the roster is full and this rider is not already on it.
   Rider* note(uint32_t src, const Position& p, uint8_t via, int16_t rssi, uint8_t hopsAway,
-              uint32_t nowMs);
+              uint32_t nowMs, uint8_t chan);
 
   // Drop riders nobody has heard from in a very long time.
   void age(uint32_t nowMs);

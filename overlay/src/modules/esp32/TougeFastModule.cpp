@@ -136,7 +136,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 11;
+const uint32_t TOUGE_BUILD = 12;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -219,6 +219,8 @@ size_t TougeFastModule::fastNeighbours(uint32_t nowMs) const
         // LoRa, and reported it as the live fast count. That number is what
         // an antenna change gets judged on, so it has to mean what it says.
         if ((uint32_t)(nowMs - r[i].atMs) >= FAST_PRECEDENCE_MS) continue;
+        // On the channel we are sitting on now, not one we have since left.
+        if (r[i].chan != fastRadio.channel()) continue;
         n++;
     }
     return n;
@@ -677,7 +679,8 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         if (f.type == FRAME_POSITION) {
             Position p;
             if (decodePosition(body, bodyLen, p)) {
-                mesh_.note(f.src, p, HEARD_FAST, rx.rssi, FAST_HOPS - f.hops, nowMs);
+                mesh_.note(f.src, p, HEARD_FAST, rx.rssi, FAST_HOPS - f.hops, nowMs,
+                           fastRadio.channel());
                 // A newer belief about the channel wins, wherever it comes
                 // from. Only acted on after the tag has already passed, so a
                 // stranger cannot walk the ride off its channel.

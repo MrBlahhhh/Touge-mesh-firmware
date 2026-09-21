@@ -131,7 +131,7 @@ bool Mesh::nextDue(uint32_t nowMs, Forward& out) {
 }
 
 Rider* Mesh::note(uint32_t src, const Position& p, uint8_t via, int16_t rssi, uint8_t hopsAway,
-                  uint32_t nowMs) {
+                  uint32_t nowMs, uint8_t chan) {
   Rider* slot = nullptr;
   for (size_t i = 0; i < MAX_RIDERS; i++) {
     if (riders_[i].used && riders_[i].id == src) {
@@ -176,6 +176,7 @@ Rider* Mesh::note(uint32_t src, const Position& p, uint8_t via, int16_t rssi, ui
   slot->via = via;
   slot->rssi = rssi;
   slot->hopsAway = hopsAway;
+  slot->chan = chan;
   slot->used = true;
   return slot;
 }
