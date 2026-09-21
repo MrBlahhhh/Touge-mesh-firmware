@@ -136,7 +136,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 9;
+const uint32_t TOUGE_BUILD = 10;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -146,12 +146,6 @@ const uint32_t TOUGE_BUILD = 9;
 // split ride reconverges in well under a minute.
 const uint32_t HOME_AFTER_MS = 25000;
 
-// How old the local fix may be before this board stops beaconing it.
-//
-// The phone feeds a position every few seconds, so ten is several missed
-// updates - long enough to ride out a hiccup, short enough that a radio whose
-// phone has gone stops claiming to know where its car is.
-const uint32_t POSITION_STALE_S = 10;
 
 // The shortest PSK worth deriving a 2.4 GHz key from.
 //
@@ -388,21 +382,22 @@ void TougeFastModule::beacon(uint32_t nowMs)
     // advancing, we have nothing new to say and should say nothing, which also
     // lets the far end fall back to LoRa after FAST_PRECEDENCE_MS rather than
     // preferring our stale copy forever.
+    // The staleness mute is gone, and the age is reported instead.
+    //
+    // It silenced a board whose phone was connected and exchanging normally:
+    // every status report from that radio read MUTED(stale fix) while the
+    // other board heard nothing from it, and the whole lane was down because
+    // of a guard meant to protect it. localPosition.time evidently does not
+    // advance the way this assumed.
+    //
+    // A board with no phone beaconing a frozen fix is a real problem and this
+    // is not the way to detect it. The age goes into the status report so the
+    // right signal can be chosen from evidence rather than from another guess.
     uint32_t nowSec = getValidTime(RTCQualityFromNet);
-    if (nowSec > 0 && localPosition.time > 0 &&
-        nowSec - localPosition.time > POSITION_STALE_S) {
-        // Out loud, and rate limited, because a board that has gone quiet on
-        // purpose is indistinguishable from one that is broken. Two boards a
-        // foot apart on the same channel, one hearing nothing, and no way to
-        // tell whether the other was silent or unheard.
-        if ((uint32_t)(nowMs - lastMuteLogMs_) >= 5000) {
-            lastMuteLogMs_ = nowMs;
-            LOG_INFO("touge: not beaconing, local fix is %us old",
-                     (unsigned)(nowSec - localPosition.time));
-        }
-        wantBeacon_ = false;
-        return;
-    }
+    uint32_t fixAge = (nowSec > 0 && localPosition.time > 0 && nowSec > localPosition.time)
+                          ? nowSec - localPosition.time
+                          : 0;
+    (void)fixAge;
 
     if (!wantBeacon_) {
         uint32_t since = (uint32_t)(nowMs - lastBeaconMs_);
@@ -829,13 +824,14 @@ void TougeFastModule::status(uint32_t nowMs)
         char js[192];
         int n = snprintf(
             js, sizeof(js),
-            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"mute\":%u}}",
+            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u}}",
             (unsigned)fastRadio.channel(), schedule_.claimed() ? (int)schedule_.slot() : -1,
             (unsigned)schedule_.known(), (unsigned)fastNeighbours(nowMs), clock,
             (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
             (unsigned)TOUGE_BUILD,
-            (unsigned)((nowSec > 0 && localPosition.time > 0 &&
-                        nowSec - localPosition.time > POSITION_STALE_S) ? 1 : 0));
+            (unsigned)((nowSec > 0 && localPosition.time > 0 && nowSec > localPosition.time)
+                           ? nowSec - localPosition.time
+                           : 0));
         if (n > 0 && (size_t)n < sizeof(js)) {
             meshtastic_MeshPacket *sp = router->allocForSending();
             if (sp) {
