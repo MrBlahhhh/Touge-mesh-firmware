@@ -666,6 +666,15 @@ static void addRiderOn(Rider *r, size_t i, uint32_t id, uint8_t slot) {
   r[i].pos.slot = slot;
 }
 
+// A car that holds a slot and has an opinion about who is keeping time.
+static void addRiderBelieving(Rider *r, size_t i, uint32_t id, uint8_t slot, uint32_t refId,
+                              uint8_t refHops, bool refLocked = false) {
+  addRiderOn(r, i, id, slot);
+  r[i].pos.refId = refId;
+  r[i].pos.refHops = refHops;
+  r[i].pos.refLocked = refLocked;
+}
+
 void test_we_take_a_slot_nobody_else_holds() {
   // Not the lowest free one. The search enters the ring at our own node
   // number, so that boards booting together with nothing on the roster do not
@@ -774,6 +783,163 @@ void test_every_car_lands_on_a_slot_of_its_own() {
   }
 }
 
+void test_a_reference_travels_past_the_cars_that_can_hear_it() {
+  // We cannot hear 100 at all. The car in front of us can, and says so, which
+  // is the whole mechanism: the claim walks the convoy rather than depending
+  // on everybody being in range of one car.
+  Rider riders[MAX_RIDERS] = {};
+  addRiderBelieving(riders, 0, 300, 2, /*refId=*/100, /*refHops=*/1);
+
+  Schedule s;
+  s.rebuild(500, false, riders, MAX_RIDERS, 0);
+
+  TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
+  TEST_ASSERT_FALSE(s.weAreReference());
+  // Two hops: 300 is one from the reference, and we are one from 300.
+  TEST_ASSERT_EQUAL_UINT8(2, s.hopsToReference());
+  // And the clock comes from 300, because a beacon from 100 is never coming.
+  TEST_ASSERT_EQUAL_UINT32(300, s.parentId());
+  TEST_ASSERT_EQUAL_UINT8(2, s.syncSlot());
+}
+
+void test_the_reference_is_no_hops_from_itself_and_syncs_to_nobody() {
+  Rider riders[MAX_RIDERS] = {};
+  addRiderOn(riders, 0, 500, 1);
+
+  Schedule s;
+  s.rebuild(100, false, riders, MAX_RIDERS, 0);
+  TEST_ASSERT_TRUE(s.weAreReference());
+  TEST_ASSERT_EQUAL_UINT8(0, s.hopsToReference());
+  TEST_ASSERT_EQUAL_UINT32(0, s.parentId());
+  // Its own slot is what syncTo would subtract, so declaring an epoch does not
+  // move its transmissions.
+  TEST_ASSERT_EQUAL_UINT8(s.slot(), s.syncSlot());
+}
+
+void test_the_nearest_route_to_the_reference_wins() {
+  // Two neighbours both know the way; the clock comes from the shorter route,
+  // because every hop is another car's beacon timing to inherit.
+  Rider riders[MAX_RIDERS] = {};
+  addRiderBelieving(riders, 0, 300, 2, /*refId=*/100, /*refHops=*/3);
+  addRiderBelieving(riders, 1, 400, 5, /*refId=*/100, /*refHops=*/1);
+
+  Schedule s;
+  s.rebuild(500, false, riders, MAX_RIDERS, 0);
+  TEST_ASSERT_EQUAL_UINT32(100, s.referenceId());
+  TEST_ASSERT_EQUAL_UINT32(400, s.parentId());
+  TEST_ASSERT_EQUAL_UINT8(5, s.syncSlot());
+  TEST_ASSERT_EQUAL_UINT8(2, s.hopsToReference());
+}
+
+void test_a_relayed_locked_reference_beats_a_free_running_one_in_earshot() {
+  // The rule is unchanged - locked beats unlocked, then lowest number - but it
+  // now applies to cars we cannot hear. A GPS-disciplined car three back still
+  // takes the job from the free-running car sitting next to us.
+  Rider riders[MAX_RIDERS] = {};
+  addRiderOn(riders, 0, 200, 1); // free-running, right here, lower than us
+  addRiderBelieving(riders, 1, 300, 2, /*refId=*/700, /*refHops=*/1, /*refLocked=*/true);
+
+  Schedule s;
+  s.rebuild(500, false, riders, MAX_RIDERS, 0);
+  TEST_ASSERT_EQUAL_UINT32(700, s.referenceId());
+  TEST_ASSERT_TRUE(s.referenceLocked());
+  TEST_ASSERT_EQUAL_UINT32(300, s.parentId());
+}
+
+void test_a_route_longer_than_the_cap_is_not_believed() {
+  // Two cars naming each other as the way to a reference that has gone away
+  // will count upward for ever. The cap turns that into a few wasted beacons.
+  Rider riders[MAX_RIDERS] = {};
+  addRiderBelieving(riders, 0, 300, 2, /*refId=*/100, /*refHops=*/MAX_REF_HOPS);
+
+  Schedule s;
+  s.rebuild(500, false, riders, MAX_RIDERS, 0);
+  // 100 is not adopted, so the best thing we can actually see wins.
+  TEST_ASSERT_EQUAL_UINT32(300, s.referenceId());
+}
+
+void test_a_convoy_strung_out_converges_on_one_reference() {
+  // Four cars in a line, each able to hear only the ones beside it. The tail
+  // has never heard the head and never will.
+  //
+  // This is the failure that made the per-observer election worth fixing: the
+  // head elected itself, the tail elected the lowest car in the tail, and both
+  // were free to decide the channel was bad and hop - taking half the ride
+  // each. Neither half was ever "lost", because each could hear plenty of
+  // cars, so neither went looking and nothing reconverged them.
+  const uint32_t id[4] = {100, 200, 300, 400};
+  Schedule s[4];
+  Position belief[4];
+  for (int i = 0; i < 4; i++) {
+    belief[i] = Position{};
+    belief[i].refHops = REF_UNREACHABLE;
+  }
+
+  // Six beacon rounds. The claim moves one car per round, so four would do.
+  for (int round = 0; round < 6; round++) {
+    for (int me = 0; me < 4; me++) {
+      Rider roster[MAX_RIDERS] = {};
+      size_t n = 0;
+      for (int other = 0; other < 4; other++) {
+        if (other != me - 1 && other != me + 1) continue; // out of range
+        addRider(roster, n, id[other]);
+        roster[n].pos = belief[other];
+        n++;
+      }
+      s[me].rebuild(id[me], false, roster, MAX_RIDERS, 0);
+    }
+    // What each car puts on the air next time round.
+    for (int me = 0; me < 4; me++) {
+      belief[me].refId = s[me].referenceId();
+      belief[me].refHops = s[me].hopsToReference();
+      belief[me].refLocked = s[me].referenceLocked();
+      belief[me].slot = s[me].slot();
+    }
+  }
+
+  for (int me = 0; me < 4; me++) TEST_ASSERT_EQUAL_UINT32(100, s[me].referenceId());
+
+  // Each one a hop further out, and each taking its clock from the car in
+  // front rather than from a beacon it cannot receive.
+  TEST_ASSERT_EQUAL_UINT8(0, s[0].hopsToReference());
+  TEST_ASSERT_EQUAL_UINT8(1, s[1].hopsToReference());
+  TEST_ASSERT_EQUAL_UINT8(2, s[2].hopsToReference());
+  TEST_ASSERT_EQUAL_UINT8(3, s[3].hopsToReference());
+
+  TEST_ASSERT_EQUAL_UINT32(0, s[0].parentId());
+  TEST_ASSERT_EQUAL_UINT32(100, s[1].parentId());
+  TEST_ASSERT_EQUAL_UINT32(200, s[2].parentId());
+  TEST_ASSERT_EQUAL_UINT32(300, s[3].parentId());
+
+  // Exactly one car thinks it is in charge.
+  int anchors = 0;
+  for (int me = 0; me < 4; me++)
+    if (s[me].weAreReference()) anchors++;
+  TEST_ASSERT_EQUAL_INT(1, anchors);
+}
+
+void test_the_position_carries_the_reference_across_the_wire() {
+  Position p{};
+  p.lat = 351102700;
+  p.lon = -790018400;
+  p.slot = 5;
+  p.refId = 0xDEADBEEF;
+  p.refHops = 3;
+  p.refLocked = true;
+
+  uint8_t wire[64];
+  size_t n = encodePosition(p, wire, sizeof(wire));
+  TEST_ASSERT_EQUAL_UINT32(POSITION_MIN, n);
+
+  Position got{};
+  TEST_ASSERT_TRUE(decodePosition(wire, n, got));
+  TEST_ASSERT_EQUAL_UINT32(0xDEADBEEF, got.refId);
+  TEST_ASSERT_EQUAL_UINT8(3, got.refHops);
+  TEST_ASSERT_TRUE(got.refLocked);
+  TEST_ASSERT_EQUAL_UINT8(5, got.slot);
+  TEST_ASSERT_EQUAL_INT32(351102700, got.lat);
+}
+
 void test_the_lowest_node_number_is_the_reference() {
   Rider riders[MAX_RIDERS] = {};
   addRiderOn(riders, 0, 500, 1);
@@ -815,7 +981,7 @@ void test_slot_window_opens_once_per_cycle() {
   const uint32_t opens = (uint32_t)mine * width;
   // The reference advertises slot zero, so its beacon lands on the cycle start
   // with nothing to subtract.
-  TEST_ASSERT_EQUAL_UINT8(0, s.referenceSlot());
+  TEST_ASSERT_EQUAL_UINT8(0, s.syncSlot());
 
   s.syncTo(1000, cycle); // the reference's beacon landed here, so a cycle began
   TEST_ASSERT_TRUE(s.synced());
@@ -1263,7 +1429,7 @@ void test_sync_backs_out_the_reference_slot() {
   s.rebuild(300, false, riders, MAX_RIDERS, 0); // slots 0 and 2 taken
   TEST_ASSERT_EQUAL_UINT32(700, s.referenceId());
   // Read off the reference's own beacon, not derived from its rank.
-  TEST_ASSERT_EQUAL_UINT8(2, s.referenceSlot());
+  TEST_ASSERT_EQUAL_UINT8(2, s.syncSlot());
   TEST_ASSERT_TRUE(s.claimed());
   const uint8_t mine = s.slot();
   TEST_ASSERT_NOT_EQUAL(0, mine);
@@ -1321,7 +1487,7 @@ void test_a_mixed_ride_puts_everyone_on_one_cycle() {
   Schedule phone;
   phone.rebuild(300, false, phoneRoster, MAX_RIDERS, 0);
   TEST_ASSERT_EQUAL_UINT32(700, phone.referenceId());
-  TEST_ASSERT_EQUAL_UINT8(gpsSlot, phone.referenceSlot());
+  TEST_ASSERT_EQUAL_UINT8(gpsSlot, phone.syncSlot());
   TEST_ASSERT_TRUE(phone.claimed());
   const uint8_t phoneSlot = phone.slot();
   TEST_ASSERT_NOT_EQUAL(gpsSlot, phoneSlot); // the two never share one
@@ -1613,6 +1779,13 @@ int main(int, char**) {
   RUN_TEST(test_boards_starting_together_do_not_all_take_slot_zero);
   RUN_TEST(test_an_unclaimed_car_free_runs_until_it_has_been_heard);
   RUN_TEST(test_every_car_lands_on_a_slot_of_its_own);
+  RUN_TEST(test_a_reference_travels_past_the_cars_that_can_hear_it);
+  RUN_TEST(test_the_reference_is_no_hops_from_itself_and_syncs_to_nobody);
+  RUN_TEST(test_the_nearest_route_to_the_reference_wins);
+  RUN_TEST(test_a_relayed_locked_reference_beats_a_free_running_one_in_earshot);
+  RUN_TEST(test_a_route_longer_than_the_cap_is_not_believed);
+  RUN_TEST(test_a_convoy_strung_out_converges_on_one_reference);
+  RUN_TEST(test_the_position_carries_the_reference_across_the_wire);
   RUN_TEST(test_the_lowest_node_number_is_the_reference);
   RUN_TEST(test_a_car_alone_does_not_wait_for_a_schedule);
   RUN_TEST(test_slot_window_opens_once_per_cycle);

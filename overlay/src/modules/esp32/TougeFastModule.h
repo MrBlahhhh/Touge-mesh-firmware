@@ -82,6 +82,9 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // See handleReceived for why the LoRa copy is now allowed through at all.
     void reassertFastPositions();
 
+    // The car whose beacon sets our clock. See Schedule::parentId.
+    uint32_t syncSource() const;
+
     // Packet ids are half the AES-CTR nonce, so they must never repeat under
     // one channel key. NVS holds a value safely ahead of anything already
     // sent, and it is re-armed in blocks rather than written every packet.

@@ -66,6 +66,24 @@ bool decodeFrame(const uint8_t* in, size_t len, Frame& out);
 // Fixed point at 1e7, the same scale the app and Meshtastic both use, so a
 // coordinate survives the trip through either without a second rounding.
 
+// How far the reference's claim is allowed to travel.
+//
+// Two cars can end up naming each other as the way to a reference that has
+// gone away, each adding one to the other's count for ever. The cap turns that
+// into a few wasted beacons: past it the route reads as unreachable, the car
+// falls back to the best reference it can hear directly, and the ride
+// re-converges from the anchor outward.
+//
+// Eight is far more than half a mile of road needs at these ranges, and the
+// count rides in a nibble alongside the flag, so it costs nothing to be
+// generous.
+static const uint8_t MAX_REF_HOPS = 8;
+
+// A route to the reference that does not exist, or does not exist yet.
+static const uint8_t REF_UNREACHABLE = 0x0F;
+
+static_assert(MAX_REF_HOPS < REF_UNREACHABLE, "the cap has to fit under the sentinel");
+
 struct Position {
   int32_t lat = 0; // degrees * 1e7
   int32_t lon = 0;
@@ -87,12 +105,44 @@ struct Position {
   // announced by one, so a car that missed a hop hears about it from whoever
   // it hears from next instead of having had one chance at a command.
   uint8_t hop = 0;
+  // Which car this one believes is keeping time for the whole ride, and how
+  // many hops away it thinks that car is.
+  //
+  // ## Why the reference has to travel
+  //
+  // Every car used to elect the lowest node number *it could hear*, which is
+  // fine in a car park and wrong on half a mile of mountain road. The head
+  // cannot hear the tail, so the head elects itself and the tail elects the
+  // lowest car in the tail, and now there are two references - each free to
+  // decide the channel is bad and hop, taking its own half of the ride with
+  // it. Worse, neither half is ever "lost": each can hear plenty of cars, so
+  // neither goes looking, and nothing ever brings them back together.
+  //
+  // So the belief travels instead of the signal. A car advertises the best
+  // reference it knows of, not merely the best one it can hear, and takes the
+  // best of what its neighbours advertise. The head's claim reaches the tail
+  // through the cars in between, one hop per beacon, and the whole ride
+  // converges on one answer without any car having to hear any particular
+  // other car.
+  //
+  // refHops is what makes that safe to act on. A car five hops from the
+  // reference cannot sync its clock to a beacon it will never receive, so it
+  // syncs to whichever neighbour is closest to the reference instead - and
+  // that neighbour's epoch is already the reference's. The count is what picks
+  // that parent out, and capping it is what stops two cars pointing at each
+  // other and counting to infinity when the reference goes away.
+  uint32_t refId = 0;
+  uint8_t refHops = REF_UNREACHABLE;
+  // Whether that reference is disciplined by its own GPS. Travels with the id
+  // because the rule is "locked beats unlocked, then lowest number", and a car
+  // relaying the claim has to relay what makes it good.
+  bool refLocked = false;
   // Carried only now and then. A name on every ping is pure airtime, and the
   // roster on the other end only needs to learn it once.
   char name[16] = {0};
 };
 
-static const size_t POSITION_MIN = 13;
+static const size_t POSITION_MIN = 18;
 
 size_t encodePosition(const Position& p, uint8_t* out, size_t cap);
 bool decodePosition(const uint8_t* in, size_t len, Position& out);

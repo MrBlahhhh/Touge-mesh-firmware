@@ -128,7 +128,39 @@ class Schedule {
   bool claimed() const { return slot_ < MAX_SLOTS; }
   uint8_t known() const { return known_; }
   uint32_t referenceId() const { return referenceId_; }
-  uint8_t referenceSlot() const { return referenceSlot_; }
+
+  /**
+   * The car whose beacon this one sets its clock by.
+   *
+   * Not necessarily the reference. On half a mile of road most cars cannot
+   * hear the reference at all, and a car that adopted a reference it can never
+   * receive would sit waiting for a beacon that is not coming. So it syncs to
+   * whichever neighbour is nearest the reference instead - and that
+   * neighbour's cycle is already the reference's cycle, so the whole line ends
+   * up on one clock by passing it hand to hand.
+   *
+   * Zero when we are the reference, or when nobody we can hear has a route to
+   * it yet.
+   */
+  uint32_t parentId() const { return parentId_; }
+
+  /**
+   * The slot held by whoever we sync to, which is what syncTo subtracts.
+   *
+   * Was referenceSlot(). The rename is the point of the change: the beacon we
+   * pin the cycle to is our parent's, not the reference's, and subtracting the
+   * wrong car's slot would put this car a slot or two out from everyone else.
+   * They are the same number for a car in direct earshot of the reference,
+   * which is every car this had ever been tested with.
+   */
+  uint8_t syncSlot() const { return syncSlot_; }
+
+  /** How many hops away the reference is, or REF_UNREACHABLE. */
+  uint8_t hopsToReference() const { return refHops_; }
+
+  /** Whether the reference we believe in is disciplined by its own GPS. */
+  bool referenceLocked() const { return referenceLocked_; }
+
   bool weAreReference() const { return known_ > 0 && referenceId_ == selfId_; }
 
   // Pin the cycle to the reference car's beacon. The reference does not
@@ -179,7 +211,10 @@ class Schedule {
   uint32_t selfId_ = 0;
   uint32_t referenceId_ = 0;
   uint8_t slot_ = SLOT_NONE;
-  uint8_t referenceSlot_ = 0;
+  uint32_t parentId_ = 0;
+  uint8_t syncSlot_ = 0;
+  uint8_t refHops_ = REF_UNREACHABLE;
+  bool referenceLocked_ = false;
   uint8_t known_ = 0;
   uint32_t epochMs_ = 0;
   bool haveEpoch_ = false;

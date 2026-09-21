@@ -142,7 +142,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 14;
+const uint32_t TOUGE_BUILD = 15;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -486,6 +486,17 @@ void TougeFastModule::beacon(uint32_t nowMs)
     // car that missed a hop learns it from whoever it hears next rather than
     // from an announcement it had one chance at.
     p.hop = hopPack(hop_.index(), hop_.generation());
+    // Who we think is keeping time, and how far away that is.
+    //
+    // Relayed, not merely reported: a car that cannot hear the reference still
+    // tells its neighbours about it, so the claim walks the length of the
+    // convoy one hop per beacon. Without this every neighbourhood elected its
+    // own timekeeper and each was free to hop channel on its own, splitting
+    // the ride into groups that were never lost enough to go looking for each
+    // other.
+    p.refId = schedule_.referenceId();
+    p.refHops = schedule_.hopsToReference();
+    p.refLocked = schedule_.referenceLocked();
 
     uint8_t battery = powerStatus ? (uint8_t)powerStatus->getBatteryChargePercent() : 255;
     p.batteryPct = battery;
@@ -676,6 +687,15 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
     service->sendToPhone(p);
 }
 
+uint32_t TougeFastModule::syncSource() const
+{
+    // The reference when it is in earshot; otherwise whoever is closest to it.
+    // Zero for the reference itself, which has nobody to sync to and declares
+    // its own epoch instead.
+    const uint32_t parent = schedule_.parentId();
+    return parent != 0 ? parent : schedule_.referenceId();
+}
+
 void TougeFastModule::drainRadio(uint32_t nowMs)
 {
     FastRx rx;
@@ -729,7 +749,11 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         // and would drag the whole schedule sideways. Once per frame, because
         // a genuine retransmission of the same id arrives later than the
         // first and syncing to it would step the epoch backwards.
-        if (f.src == schedule_.referenceId() && f.hops == FAST_HOPS &&
+        // The car we take the clock from, which is the reference when we can
+        // hear it and otherwise the neighbour nearest to it. Waiting for the
+        // reference itself would mean a car three hops down the line waiting
+        // for a beacon that is never going to arrive.
+        if (f.src == syncSource() && f.hops == FAST_HOPS &&
             !(f.src == lastSyncSrc_ && f.id == lastSyncId_)) {
             lastSyncSrc_ = f.src;
             lastSyncId_ = f.id;
@@ -906,11 +930,12 @@ void TougeFastModule::status(uint32_t nowMs)
         slotText[sizeof(slotText) - 1] = 0;
     }
 
-    LOG_INFO("touge: ch=%u slot=%s/%u known=%u ref=%08x%s clock=%s fast=%u suppressed=%u dropped=%u "
-             "txfail=%u(%d)",
+    LOG_INFO("touge: ch=%u slot=%s/%u known=%u ref=%08x%s +%uhop via=%08x clock=%s fast=%u "
+             "suppressed=%u dropped=%u txfail=%u(%d)",
              (unsigned)fastRadio.channel(), slotText, (unsigned)MAX_SLOTS,
              (unsigned)schedule_.known(), (unsigned)schedule_.referenceId(),
-             schedule_.weAreReference() ? " (us)" : "", clock, (unsigned)fastNeighbours(nowMs),
+             schedule_.weAreReference() ? " (us)" : "", (unsigned)schedule_.hopsToReference(),
+             (unsigned)schedule_.parentId(), clock, (unsigned)fastNeighbours(nowMs),
              (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
              (unsigned)fastRadio.sendFailed(), fastRadio.lastSendError());
 

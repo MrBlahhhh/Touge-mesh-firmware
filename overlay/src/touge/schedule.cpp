@@ -6,11 +6,29 @@ void Schedule::reset() {
   selfId_ = 0;
   referenceId_ = 0;
   slot_ = SLOT_NONE;
-  referenceSlot_ = 0;
+  parentId_ = 0;
+  syncSlot_ = 0;
+  refHops_ = REF_UNREACHABLE;
+  referenceLocked_ = false;
   known_ = 0;
   epochMs_ = 0;
   haveEpoch_ = false;
 }
+
+namespace {
+
+// Locked beats unlocked; among equals, the lowest node number wins.
+//
+// A car whose own cycle is disciplined by GPS always takes the job, because
+// cars with a fix follow the pulse and cars without follow the reference's
+// beacons, and a free-running reference would put those two groups on
+// unrelated cycles.
+bool betterReference(bool aLocked, uint32_t aId, bool bLocked, uint32_t bId) {
+  if (aLocked != bLocked) return aLocked;
+  return aId < bId;
+}
+
+} // namespace
 
 void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders,
                        uint32_t nowMs) {
@@ -20,9 +38,17 @@ void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, si
   // job, because cars with a fix follow the pulse and cars without follow the
   // reference's beacons; a free-running reference would put those two groups
   // on unrelated cycles. The node number only breaks the tie.
-  uint32_t lowestLocked = selfLocked ? selfId : 0;
-  bool anyLocked = selfLocked;
-  uint32_t lowestAny = selfId;
+  // The best reference anyone knows of, not the best one we can hear.
+  //
+  // Locked beats unlocked, then the lowest node number breaks the tie - the
+  // rule has not changed. What has changed is the candidate set: as well as
+  // every car we can hear, it now includes every car those cars have told us
+  // about. The head's claim reaches the tail through the cars between them,
+  // one hop per beacon, so a convoy strung out past radio range converges on a
+  // single timekeeper instead of quietly electing one per neighbourhood and
+  // then hopping channel independently.
+  uint32_t bestId = selfId;
+  bool bestLocked = selfLocked;
   uint8_t count = 1; // ourselves
 
   // Who holds which slot, as advertised. A slot goes to the lowest node number
@@ -57,10 +83,19 @@ void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, si
     // missed beacons - that is how two cars end up transmitting together.
     const bool audible = (uint32_t)(nowMs - riders[i].atMs) < REFERENCE_LAPSE_MS;
 
-    if (audible && riders[i].id < lowestAny) lowestAny = riders[i].id;
-    if (audible && riders[i].pos.clockLocked && (!anyLocked || riders[i].id < lowestLocked)) {
-      lowestLocked = riders[i].id;
-      anyLocked = true;
+    if (audible) {
+      // The car itself.
+      if (betterReference(riders[i].pos.clockLocked, riders[i].id, bestLocked, bestId)) {
+        bestLocked = riders[i].pos.clockLocked;
+        bestId = riders[i].id;
+      }
+      // And whatever it believes in, which may be a car we cannot hear.
+      // Ignored past the hop cap: see MAX_REF_HOPS.
+      if (riders[i].pos.refId != 0 && riders[i].pos.refHops < MAX_REF_HOPS &&
+          betterReference(riders[i].pos.refLocked, riders[i].pos.refId, bestLocked, bestId)) {
+        bestLocked = riders[i].pos.refLocked;
+        bestId = riders[i].pos.refId;
+      }
     }
 
     // A claim lapses well before the roster forgets the car.
@@ -76,7 +111,8 @@ void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, si
     if (owner[s] == 0 || riders[i].id < owner[s]) owner[s] = riders[i].id;
   }
 
-  referenceId_ = anyLocked ? lowestLocked : lowestAny;
+  referenceId_ = bestId;
+  referenceLocked_ = bestLocked;
   known_ = count;
 
   // Keep the slot we hold unless somebody with a better claim is on it. Slots
@@ -113,24 +149,53 @@ void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, si
     if (slot_ >= MAX_SLOTS) slot_ = (uint8_t)(selfId % MAX_SLOTS);
   }
 
-  // The reference advertises its own slot, so there is nothing to derive. It
-  // is not necessarily slot zero: a GPS-locked car outranks a lower-numbered
-  // one for the timekeeping job, and it holds whatever slot it claimed.
-  referenceSlot_ = 0;
+  // Who we take the clock from, and how far that is from the reference.
+  //
+  // The reference itself when we can hear it, which is the case this has
+  // always handled. Otherwise the neighbour with the shortest route to it:
+  // that car's epoch is already the reference's, so pinning to its beacon puts
+  // us on the same cycle as a car we have never heard. Its slot is subtracted
+  // rather than the reference's, because its slot is what its beacon landed
+  // in.
+  parentId_ = 0;
+  syncSlot_ = 0;
+  refHops_ = REF_UNREACHABLE;
+
   if (referenceId_ == selfId) {
-    referenceSlot_ = (slot_ < MAX_SLOTS) ? slot_ : 0;
+    // We are the anchor. Nothing to sync to, and zero hops from ourselves.
+    refHops_ = 0;
+    syncSlot_ = (slot_ < MAX_SLOTS) ? slot_ : 0;
   } else {
+    uint8_t bestVia = REF_UNREACHABLE;
     for (size_t i = 0; i < maxRiders; i++) {
-      if (!riders[i].used || riders[i].id != referenceId_) continue;
-      if (riders[i].pos.slot < MAX_SLOTS) referenceSlot_ = riders[i].pos.slot;
-      break;
+      if (!riders[i].used) continue;
+      if (riders[i].id == selfId) continue;
+      if ((uint32_t)(nowMs - riders[i].atMs) >= REFERENCE_LAPSE_MS) continue;
+
+      uint8_t via;
+      if (riders[i].id == referenceId_) {
+        via = 0; // it is the reference; we are one hop from it
+      } else if (riders[i].pos.refId == referenceId_ && riders[i].pos.refHops < MAX_REF_HOPS) {
+        via = riders[i].pos.refHops;
+      } else {
+        continue; // knows nothing useful about where the reference is
+      }
+
+      // Nearest first, lowest node number to break a tie so that two cars at
+      // equal distance do not oscillate between parents beacon by beacon.
+      if (via < bestVia || (via == bestVia && riders[i].id < parentId_)) {
+        bestVia = via;
+        parentId_ = riders[i].id;
+        syncSlot_ = (riders[i].pos.slot < MAX_SLOTS) ? riders[i].pos.slot : 0;
+      }
     }
+    if (parentId_ != 0) refHops_ = (uint8_t)(bestVia + 1);
   }
 }
 
 void Schedule::syncTo(uint32_t heardAtMs, uint32_t cycleMs) {
   // Back out the reference's own slot to get the start of the cycle.
-  epochMs_ = heardAtMs - (uint32_t)referenceSlot_ * slotWidthMs(cycleMs);
+  epochMs_ = heardAtMs - (uint32_t)syncSlot_ * slotWidthMs(cycleMs);
   haveEpoch_ = true;
 }
 

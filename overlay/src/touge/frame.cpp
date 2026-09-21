@@ -87,6 +87,10 @@ size_t encodePosition(const Position& p, uint8_t* out, size_t cap) {
   out[11] = (uint8_t)((p.hasFix ? 0x01 : 0) | (p.phoneAttached ? 0x02 : 0) |
                       (p.clockLocked ? 0x04 : 0) | ((p.slot & 0x0F) << 4));
   out[12] = p.hop;
+  put32(out + 13, p.refId);
+  // The hop count in the low nibble, whether that reference is GPS-locked in
+  // the next bit up. Both are about the same claim, so they travel together.
+  out[17] = (uint8_t)((p.refHops & 0x0F) | (p.refLocked ? 0x10 : 0));
   if (nameLen > 0) memcpy(out + POSITION_MIN, p.name, nameLen);
   return POSITION_MIN + nameLen;
 }
@@ -104,6 +108,9 @@ bool decodePosition(const uint8_t* in, size_t len, Position& out) {
   out.clockLocked = (in[11] & 0x04) != 0;
   out.slot = (uint8_t)((in[11] >> 4) & 0x0F);
   out.hop = in[12];
+  out.refId = get32(in + 13);
+  out.refHops = (uint8_t)(in[17] & 0x0F);
+  out.refLocked = (in[17] & 0x10) != 0;
 
   size_t nameLen = len - POSITION_MIN;
   // A sender on a newer build may carry a longer name than this build knows
