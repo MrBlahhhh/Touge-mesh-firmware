@@ -88,6 +88,31 @@ class Hop {
     scan_ = home_;
   }
 
+  /**
+   * Believe the channel we are actually standing on.
+   *
+   * A sweep retunes the radio without touching the belief, on purpose: a
+   * search is not a decision. But a board that hears the ride mid-sweep then
+   * stops sweeping, and nothing ever reconciled the two - the radio sat on the
+   * channel where contact happened while index_ still named home, so the next
+   * decision was made against a channel it was not on. Two boards that found
+   * each other this way stayed found, on a channel the rest of the ride never
+   * visits.
+   *
+   * Hearing a ride somewhere is evidence, so it updates the belief without
+   * touching the generation: we are joining what is already there, not
+   * announcing a hop.
+   */
+  void adopt(uint8_t channel)
+  {
+    for (uint8_t i = 0; i < FAST_CHANNELS; i++) {
+      if (HOP_CHANNELS[i] != channel) continue;
+      index_ = i;
+      scan_ = i;
+      return;
+    }
+  }
+
   /** The channel the key chose, whatever the ride has since hopped to. */
   uint8_t homeChannel() const { return HOP_CHANNELS[home_ % FAST_CHANNELS]; }
 

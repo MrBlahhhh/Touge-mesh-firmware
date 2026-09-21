@@ -136,7 +136,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 12;
+const uint32_t TOUGE_BUILD = 13;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -662,7 +662,14 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
 
         // Authenticated, so it is genuinely one of ours. That makes it evidence
         // the channel works, which is what the hop decision is measuring.
+        //
+        // And evidence about where the ride is. A sweep moves the radio and
+        // leaves the belief alone, so a board that finds the ride mid-sweep
+        // would otherwise stop sweeping with the radio on one channel and
+        // index_ naming another, and every later decision made against the
+        // wrong one. Adopting costs nothing when we were already here.
         lastHeardMs_ = nowMs;
+        hop_.adopt(fastRadio.channel());
 
         // Keep time before the dedupe, not after it.
         //
@@ -968,7 +975,11 @@ void TougeFastModule::hopKeeping(uint32_t nowMs)
     // Expected against received over the window. Every car beacons at least
     // once per idle heartbeat, so a roster that is present but barely audible
     // is interference rather than an empty road.
-    size_t cars = mesh_.count();
+    // Cars we should have heard from on this channel in this window, not
+    // every seat filled in the last ten minutes. Those are different questions
+    // and using the roster for both is what made a working channel look
+    // broken after any large gathering.
+    size_t cars = mesh_.countOn(fastRadio.channel(), HOP_WINDOW_MS, nowMs);
     uint32_t expect = (uint32_t)cars * (HOP_WINDOW_MS / GATE_IDLE_MS);
     uint32_t got = heardInWindow_;
     heardInWindow_ = 0;

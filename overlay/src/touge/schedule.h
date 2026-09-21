@@ -44,10 +44,15 @@ namespace touge {
 // never mind guard time.
 //
 // So the two are now separate. The slot count comes from what the air can
-// carry; the roster comes from how many cars are on the ride. With more cars
-// than slots, the cars without one free-run - which is what `inSlotAtPhase`
-// already does for an unclaimed car, and degrades to carrier sense rather
-// than to silence.
+// carry; the roster comes from how many cars are on the ride.
+//
+// With more cars than slots they do not free-run, whatever an earlier version
+// of this comment claimed. `rebuild` falls back to `selfId % MAX_SLOTS`, so
+// twenty-eight cars deal themselves into nine slots about three deep and those
+// three transmit together every idle beacon. That is a real collision every
+// cycle, not a graceful degradation, and it feeds the hop decision: lost
+// frames look like a bad channel, the reference moves the ride, everyone
+// spends seconds scanning, and more frames are lost.
 //
 // The real answer is spatial reuse: a slot only has to be unique within a
 // car's two-hop interference neighbourhood, so the front and the tail of a

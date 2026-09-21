@@ -35,7 +35,14 @@ static const size_t SEEN_SLOTS = 64;
 // frame rebroadcast in the same microsecond and collide, so nobody downstream
 // gets it. Each forward waits a random slice of this instead.
 static const uint32_t FORWARD_JITTER_MS = 15;
-static const size_t FORWARD_SLOTS = 8;
+// Frames waiting their turn to be forwarded.
+//
+// Eight, chosen when the roster was eight. Twenty-eight cars that all hear one
+// frame all try to defer it and twenty are refused - and the one refused may
+// be the only board that can reach the tail. The queue holds a frame each, so
+// thirty-two is about eight kilobytes of heap, which is affordable and a great
+// deal cheaper than a silently dropped relay.
+static const size_t FORWARD_SLOTS = 32;
 
 // Having heard this many copies of a packet, everyone within earshot already
 // has it and adding another transmission helps nobody. In a four-car convoy
@@ -125,6 +132,20 @@ class Mesh {
 
   const Rider* riders() const { return riders_; }
   size_t count() const;
+
+  /**
+   * Cars heard on one channel inside a window. The denominator for the hop
+   * decision.
+   *
+   * count() is every seat filled in the last ten minutes on any channel, which
+   * is the right answer for a map and a badly wrong one for airtime. After a
+   * car park gathering of twenty-eight that rolls out as eight, count() stays
+   * at twenty-eight for ten minutes, so the reference expects the airtime of
+   * twenty-eight cars, receives the airtime of eight, reads twenty-eight
+   * percent against a forty percent threshold, and moves the whole ride off a
+   * channel that was working.
+   */
+  size_t countOn(uint8_t chan, uint32_t windowMs, uint32_t nowMs) const;
   const Rider* find(uint32_t id) const;
 
   // Packet ids must never be reused under one channel key, because the id is

@@ -137,10 +137,19 @@ bool Schedule::inSlot(uint32_t nowMs, uint32_t cycleMs) const {
   // no schedule worth keeping to, and waiting for a sync that will never
   // arrive would mean never transmitting.
   if (known_ <= 1) return true;
-  if (weAreReference()) return true;
   if (!haveEpoch_) return true;
-
+  // The timekeeper keeps to its slot like everybody else.
+  //
+  // This returned true for the reference unconditionally, on the reasoning
+  // that the car defining the epoch cannot be out of step with it. True of a
+  // PPS-disciplined board, which goes through inSlotAtPhase anyway. Not true
+  // of a phone-tethered one: with no pulse it wins the vote on node number and
+  // then transmits the moment it wants to, on top of whichever cars share its
+  // slot - and with more cars than slots there are always some.
+  //
+  // It still free-runs before it has an epoch, which is the case above.
   return inSlotAtPhase((uint32_t)(nowMs - epochMs_) % cycleMs, cycleMs);
 }
+
 
 } // namespace touge

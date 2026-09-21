@@ -7,11 +7,19 @@ three and a design ceiling of eight.
 
 ## Why the current design cannot get there
 
-- `MAX_RIDERS = 8` (mesh.h) and `MAX_SLOTS = MAX_RIDERS + 1`. The roster is a
-  fixed array. Thirty cars do not fit in memory, never mind on air.
-- One 250 ms cycle of 9 slots, assigned per cycle. Only 9 cars can ever hold
-  distinct slots; the rest free-run and TDMA stops being TDMA at a third of
-  the group.
+- `MAX_RIDERS` was 8 and `MAX_SLOTS` was `MAX_RIDERS + 1`. Raised to 28 and
+  decoupled in 116560f: the roster holds a real ride now, and slots are an
+  airtime budget rather than a headcount.
+- That does **not** give 28 cars 28 slots. `rebuild` deals them into 9 by
+  `selfId % MAX_SLOTS`, about three deep, and those three transmit together
+  every idle beacon. They do not free-run - an earlier note here said they did
+  and it was wrong. The roster fix makes cars 9-28 exist; the collision is
+  exactly what two-hop colouring is for.
+- The collisions feed the hop decision. Lost frames read as a bad channel, the
+  reference moves the whole ride, everyone spends seconds scanning, more frames
+  are lost. Countermeasures so far: the hop denominator now counts cars heard
+  on this channel rather than every seat in the roster, and the reference keeps
+  to its own slot instead of transmitting whenever it likes.
 - Clock sync comes only from beacons heard **directly** from one reference car.
   Over half a mile of mountain most cars cannot hear it. The machinery is
   unavailable precisely where hidden nodes make it necessary.

@@ -704,16 +704,62 @@ void test_slots_keep_running_across_the_millis_wrap() {
 }
 
 void test_more_cars_than_slots_doubles_up_rather_than_falling_off() {
-  // Nine claimed slots and a tenth car. Doubling up costs those two a
+  // Every slot taken and one more car. Doubling up costs those two a
   // collision; falling off the end of the cycle would cost the newcomer every
   // transmission it ever made.
+  //
+  // This used to hand out slots 0..MAX_RIDERS-1, so with nine slots and
+  // twenty-eight riders everything past the ninth advertised a slot number no
+  // slot has and was read as unclaimed. It filled nine slots by accident and
+  // asserted only that a slot was claimed, which is true of every path through
+  // this code including the ones that are wrong.
   Rider riders[MAX_RIDERS] = {};
-  for (size_t i = 0; i < MAX_RIDERS; i++) addRiderOn(riders, i, (uint32_t)(i + 1), (uint8_t)i);
+  for (size_t i = 0; i < MAX_RIDERS; i++) {
+    addRiderOn(riders, i, (uint32_t)(i + 1), (uint8_t)(i % MAX_SLOTS));
+  }
 
   Schedule s;
   s.rebuild(1000, false, riders, MAX_RIDERS, 0);
   TEST_ASSERT_TRUE(s.claimed());
   TEST_ASSERT_TRUE(s.slot() < MAX_SLOTS);
+
+  // Every slot was owned, so the claim fell through to the node number. Naming
+  // the rule rather than the outcome: this is the line that says twenty-eight
+  // cars share nine slots by arithmetic and nothing stops them landing on the
+  // same one.
+  TEST_ASSERT_EQUAL_UINT8((uint8_t)(1000 % MAX_SLOTS), s.slot());
+
+  // And it is a genuine collision. Somebody already advertises the slot we
+  // just took, which is the cost being accepted here and the reason two-hop
+  // colouring is the real answer.
+  bool shared = false;
+  for (size_t i = 0; i < MAX_RIDERS; i++) {
+    if (riders[i].used && riders[i].pos.slot == s.slot()) shared = true;
+  }
+  TEST_ASSERT_TRUE_MESSAGE(shared, "expected to double up on an occupied slot");
+}
+
+void test_a_full_roster_crowds_every_slot() {
+  // Twenty-eight cars into nine slots is about three deep. Worth stating as a
+  // test so that a change making it worse - or a slot count raised without the
+  // colouring to go with it - shows up here rather than on a mountain.
+  Rider riders[MAX_RIDERS] = {};
+  for (size_t i = 0; i < MAX_RIDERS; i++) {
+    addRiderOn(riders, i, (uint32_t)(i + 1), (uint8_t)(i % MAX_SLOTS));
+  }
+
+  uint8_t perSlot[MAX_SLOTS] = {};
+  for (size_t i = 0; i < MAX_RIDERS; i++) perSlot[riders[i].pos.slot]++;
+
+  uint8_t deepest = 0;
+  for (uint8_t sIdx = 0; sIdx < MAX_SLOTS; sIdx++) {
+    if (perSlot[sIdx] > deepest) deepest = perSlot[sIdx];
+  }
+  // Ceiling of riders over slots. Three today; the point is that it is more
+  // than one and the number is not an accident.
+  const uint8_t expected = (uint8_t)((MAX_RIDERS + MAX_SLOTS - 1) / MAX_SLOTS);
+  TEST_ASSERT_EQUAL_UINT8(expected, deepest);
+  TEST_ASSERT_TRUE_MESSAGE(deepest > 1, "a full roster must share slots; that is the known cost");
 }
 
 void test_a_duplicate_node_number_does_not_corrupt_the_claim() {
@@ -1331,6 +1377,7 @@ int main(int, char**) {
   RUN_TEST(test_slot_window_opens_once_per_cycle);
   RUN_TEST(test_slots_keep_running_across_the_millis_wrap);
   RUN_TEST(test_more_cars_than_slots_doubles_up_rather_than_falling_off);
+  RUN_TEST(test_a_full_roster_crowds_every_slot);
   RUN_TEST(test_a_duplicate_node_number_does_not_corrupt_the_claim);
   RUN_TEST(test_the_cycle_must_divide_a_second);
   RUN_TEST(test_no_phase_before_the_first_pulse);

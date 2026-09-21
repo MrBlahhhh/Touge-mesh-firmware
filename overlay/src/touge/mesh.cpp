@@ -196,6 +196,17 @@ size_t Mesh::count() const {
   return n;
 }
 
+size_t Mesh::countOn(uint8_t chan, uint32_t windowMs, uint32_t nowMs) const {
+  size_t n = 0;
+  for (size_t i = 0; i < MAX_RIDERS; i++) {
+    if (!riders_[i].used) continue;
+    if (riders_[i].chan != chan) continue;
+    if ((uint32_t)(nowMs - riders_[i].atMs) > windowMs) continue;
+    n++;
+  }
+  return n;
+}
+
 const Rider* Mesh::find(uint32_t id) const {
   for (size_t i = 0; i < MAX_RIDERS; i++)
     if (riders_[i].used && riders_[i].id == id) return &riders_[i];

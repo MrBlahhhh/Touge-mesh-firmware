@@ -17,7 +17,13 @@ namespace {
 // Eight frames is a little under a second of speech at three 20 ms codec
 // frames per packet. Deeper would only add delay to audio that is already
 // late; shallower drops packets when the module misses a scheduling slot.
-const int RX_DEPTH = 8;
+// Frames the WiFi callback can hand over before it starts dropping.
+//
+// Eight was a bench number. A burst from twenty-eight cars fills it in one
+// cycle and dropped climbs while every phone still reports a healthy lane,
+// because a frame refused at the queue was never heard as far as anything
+// above it is concerned.
+const int RX_DEPTH = 32;
 
 QueueHandle_t rxQueue = nullptr;
 volatile uint32_t dropCount = 0;
