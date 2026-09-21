@@ -113,6 +113,15 @@ void Schedule::syncTo(uint32_t heardAtMs, uint32_t cycleMs) {
   haveEpoch_ = true;
 }
 
+void Schedule::startEpoch(uint32_t nowMs, uint32_t cycleMs) {
+  if (cycleMs == 0 || haveEpoch_) return;
+  // Put our own slot where it already is, so declaring the epoch does not move
+  // this car's transmissions the moment it takes effect.
+  const uint8_t s = (slot_ < MAX_SLOTS) ? slot_ : 0;
+  epochMs_ = nowMs - (uint32_t)s * slotWidthMs(cycleMs);
+  haveEpoch_ = true;
+}
+
 bool Schedule::inSlotAtPhase(uint32_t phaseMs, uint32_t cycleMs) const {
   if (cycleMs == 0) return false;
   // Alone on the channel there is nothing to collide with, so there is no

@@ -740,25 +740,39 @@ void test_more_cars_than_slots_doubles_up_rather_than_falling_off() {
 }
 
 void test_a_full_roster_crowds_every_slot() {
-  // Twenty-eight cars into nine slots is about three deep. Worth stating as a
-  // test so that a change making it worse - or a slot count raised without the
-  // colouring to go with it - shows up here rather than on a mountain.
+  // Twenty-eight cars into nine slots. The previous version of this built an
+  // array, counted the array, and asserted the arithmetic it had just done -
+  // it never called rebuild at all, so it could not have caught a scheduler
+  // that handed every car the same slot.
+  //
+  // This runs the real claim for every car against the same roster and counts
+  // what the scheduler actually produced.
   Rider riders[MAX_RIDERS] = {};
   for (size_t i = 0; i < MAX_RIDERS; i++) {
     addRiderOn(riders, i, (uint32_t)(i + 1), (uint8_t)(i % MAX_SLOTS));
   }
 
   uint8_t perSlot[MAX_SLOTS] = {};
-  for (size_t i = 0; i < MAX_RIDERS; i++) perSlot[riders[i].pos.slot]++;
+  for (size_t i = 0; i < MAX_RIDERS; i++) {
+    Schedule s;
+    s.rebuild(riders[i].id, false, riders, MAX_RIDERS, 0);
+    TEST_ASSERT_TRUE(s.claimed());
+    TEST_ASSERT_TRUE(s.slot() < MAX_SLOTS);
+    perSlot[s.slot()]++;
+  }
 
   uint8_t deepest = 0;
+  uint8_t empty = 0;
   for (uint8_t sIdx = 0; sIdx < MAX_SLOTS; sIdx++) {
     if (perSlot[sIdx] > deepest) deepest = perSlot[sIdx];
+    if (perSlot[sIdx] == 0) empty++;
   }
-  // Ceiling of riders over slots. Three today; the point is that it is more
-  // than one and the number is not an accident.
-  const uint8_t expected = (uint8_t)((MAX_RIDERS + MAX_SLOTS - 1) / MAX_SLOTS);
-  TEST_ASSERT_EQUAL_UINT8(expected, deepest);
+
+  // Every slot gets used and more than one car lands on some of them. Both
+  // halves matter: all in one slot would be a broken scheduler, and one car
+  // per slot would mean the roster no longer exceeds the slots and this test
+  // has stopped testing anything.
+  TEST_ASSERT_EQUAL_UINT8(0, empty);
   TEST_ASSERT_TRUE_MESSAGE(deepest > 1, "a full roster must share slots; that is the known cost");
 }
 

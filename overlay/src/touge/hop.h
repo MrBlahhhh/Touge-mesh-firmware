@@ -103,8 +103,23 @@ class Hop {
    * touching the generation: we are joining what is already there, not
    * announcing a hop.
    */
-  void adopt(uint8_t channel)
+  void adopt(uint8_t channel, uint8_t senderGeneration)
   {
+    // Never let an older belief drag a newer one backwards.
+    //
+    // The first version of this took the channel alone, which quietly undid
+    // the one thing a hop is for. A reference that hops is the only car on the
+    // new channel; the other twenty-seven still hear each other on the old one
+    // and never go looking. So the reference alone goes lost, sweeps, lands
+    // back on the old channel, hears the ride it just left - and adopted it,
+    // keeping the new generation. Its next beacon then announced the old
+    // channel with a newer generation, every car accepted it, and the hop was
+    // not merely abandoned but spent: the generation it needed was gone and it
+    // could not be announced again without another advance().
+    //
+    // observe() has always refused an older generation. Adoption has to
+    // refuse it too, or the two disagree about which way evidence flows.
+    if (hopNewer(generation_, senderGeneration)) return;
     for (uint8_t i = 0; i < FAST_CHANNELS; i++) {
       if (HOP_CHANNELS[i] != channel) continue;
       index_ = i;

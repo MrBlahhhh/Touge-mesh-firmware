@@ -114,6 +114,24 @@ class Schedule {
   // lower-numbered one that is free-running, so its own slot is subtracted to
   // recover the start of the cycle.
   void syncTo(uint32_t heardAtMs, uint32_t cycleMs);
+
+  /**
+   * Start the cycle here, because nobody else is going to.
+   *
+   * A reference only ever got an epoch by hearing a previous reference, and it
+   * never hears itself. So on a ride with no GPS-disciplined board the lowest
+   * node number is the timekeeper from the first roster onwards and never
+   * acquires one - it falls through `!haveEpoch_` and beacons whenever the
+   * gate fires. Every other car then re-pins its epoch to that arrival, so the
+   * whole schedule walks by whatever the gate interval happens to be modulo
+   * the cycle: a few milliseconds a beacon when parked, effectively random
+   * while moving.
+   *
+   * Declaring one costs nothing and makes the reference keep to its own slot
+   * like everybody else. Only ever called by a car that is the reference and
+   * has no epoch; anyone who can hear a reference should sync to it instead.
+   */
+  void startEpoch(uint32_t nowMs, uint32_t cycleMs);
   bool synced() const { return haveEpoch_; }
 
   // True while we are inside our own slot, with the cycle recovered from the

@@ -136,7 +136,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 13;
+const uint32_t TOUGE_BUILD = 14;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -435,6 +435,10 @@ void TougeFastModule::beacon(uint32_t nowMs)
     // time are already in step. When the receiver has no fix this falls back
     // to the cycle recovered from the reference car's beacons rather than
     // going quiet.
+    // A reference with nobody to sync to declares the cycle itself, rather
+    // than free-running and dragging everyone else's slots along behind it.
+    if (schedule_.weAreReference()) schedule_.startEpoch(nowMs, CYCLE_MS);
+
     uint32_t phase = 0;
     bool mine;
     if (rideClock.phaseMs((uint64_t)esp_timer_get_time(), CYCLE_MS, phase)) {
@@ -669,7 +673,6 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         // index_ naming another, and every later decision made against the
         // wrong one. Adopting costs nothing when we were already here.
         lastHeardMs_ = nowMs;
-        hop_.adopt(fastRadio.channel());
 
         // Keep time before the dedupe, not after it.
         //
@@ -708,6 +711,20 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
                 // A newer belief about the channel wins, wherever it comes
                 // from. Only acted on after the tag has already passed, so a
                 // stranger cannot walk the ride off its channel.
+                // Where the ride actually is, now that the sender has told us
+                // what it believes.
+                //
+                // A sweep retunes the radio and deliberately leaves the belief
+                // alone, so a board that finds the ride mid-sweep would
+                // otherwise stop sweeping with the radio on one channel and
+                // its belief naming another. Gated on the sender's generation
+                // so that hearing an older belief cannot undo a hop we are in
+                // the middle of announcing.
+                uint8_t heardIndex = 0;
+                uint8_t heardGen = 0;
+                hopUnpack(p.hop, heardIndex, heardGen);
+                hop_.adopt(fastRadio.channel(), heardGen);
+
                 // Snapshot before observe(), which is what moves the belief.
                 const uint8_t wasIndex = hop_.index();
                 const uint8_t wasGen = hop_.generation();
