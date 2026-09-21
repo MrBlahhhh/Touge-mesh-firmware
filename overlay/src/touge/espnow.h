@@ -95,6 +95,14 @@ class FastRadio {
    */
   uint32_t sendFailed() const;
 
+  /**
+   * What the radio says it is actually transmitting at, in whole dBm.
+   *
+   * Read back rather than remembered, because the interesting case is the one
+   * where the driver did not give us what we asked for.
+   */
+  int8_t txPowerDbm() const;
+
   /** The last error the driver gave, for the status line. */
   int lastSendError() const;
 

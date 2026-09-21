@@ -142,7 +142,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 16;
+const uint32_t TOUGE_BUILD = 17;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -180,6 +180,16 @@ const uint32_t TICK_MS = 5;
 const uint32_t SYNC_BIAS_MS = TICK_MS / 2 + 1;
 
 static_assert(SYNC_BIAS_MS * 2 >= TICK_MS, "the correction has to cover the tick it is for");
+
+// The guard has to cover a whole frame, or it is not a guard.
+static_assert(SLOT_GUARD_MS >= FRAME_AIRTIME_MS,
+              "a frame must fit inside the room the guard reserves for it");
+
+// And a slot has to be wide enough to be worth holding once the guard is out
+// of it: a tick has to be able to land in what is left.
+static_assert(CYCLE_MS / MAX_SLOTS > SLOT_GUARD_MS + TICK_MS,
+              "the usable part of a slot must outlast a tick, or a car can be "
+              "refused its turn every cycle and never transmit");
 
 // The deepest car in the convoy still has to fit inside its slot.
 //
@@ -964,13 +974,14 @@ void TougeFastModule::status(uint32_t nowMs)
     }
 
     LOG_INFO("touge: ch=%u slot=%s/%u known=%u ref=%08x%s +%uhop via=%08x clock=%s fast=%u "
-             "suppressed=%u dropped=%u txfail=%u(%d)",
+             "suppressed=%u dropped=%u txfail=%u(%d) txpwr=%ddBm",
              (unsigned)fastRadio.channel(), slotText, (unsigned)MAX_SLOTS,
              (unsigned)schedule_.known(), (unsigned)schedule_.referenceId(),
              schedule_.weAreReference() ? " (us)" : "", (unsigned)schedule_.hopsToReference(),
              (unsigned)schedule_.parentId(), clock, (unsigned)fastNeighbours(nowMs),
              (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
-             (unsigned)fastRadio.sendFailed(), fastRadio.lastSendError());
+             (unsigned)fastRadio.sendFailed(), fastRadio.lastSendError(),
+             (int)fastRadio.txPowerDbm());
 
     // The same line, to the phone.
     //

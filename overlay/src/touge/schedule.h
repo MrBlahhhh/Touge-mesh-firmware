@@ -105,6 +105,27 @@ static_assert(SLOT_LAPSE_MS < RIDER_DROP_MS,
 // rides in the same nibble as the slot itself and costs nothing.
 static const uint8_t SLOT_NONE = 0x0F;
 
+/**
+ * How much of a slot a frame needs in front of it before it may start.
+ *
+ * Holding a slot is permission to *finish* inside it, not merely to begin
+ * inside it. The test used to be "is the phase within my window", which says
+ * yes on the last millisecond of a twenty-seven millisecond slot - and an
+ * eight millisecond frame started there lands eight milliseconds inside the
+ * next car's. The slot boundary is the only thing keeping twenty-eight cars
+ * off each other, so it has to bound the whole transmission.
+ *
+ * In practice the module looks at this every five milliseconds and so starts
+ * near the top of its slot anyway. That is a property of the tick, not of the
+ * rule, and it stops holding the moment a tick is late - which is exactly when
+ * the radio is busy, which is exactly when a collision costs most.
+ *
+ * Eight milliseconds of frame and two of margin. Every TDMA scheme carries
+ * some version of this; OMI spends a quarter of its two-millisecond slot on
+ * the same idea.
+ */
+static const uint32_t SLOT_GUARD_MS = 10;
+
 class Schedule {
  public:
   void reset();

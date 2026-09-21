@@ -783,6 +783,45 @@ void test_every_car_lands_on_a_slot_of_its_own() {
   }
 }
 
+void test_a_frame_that_cannot_finish_in_the_slot_does_not_start() {
+  // The slot boundary is the only thing keeping twenty-eight cars off each
+  // other, so it has to bound the whole transmission rather than its first
+  // byte. In practice the module looks every five milliseconds and so starts
+  // near the top of its slot - but that is a property of the tick, and it
+  // stops holding the moment a tick is late, which is when the radio is busy,
+  // which is when a collision costs most.
+  Rider riders[MAX_RIDERS] = {};
+  addRiderOn(riders, 0, 100, 0);
+  addRiderOn(riders, 1, 900, 2);
+
+  const uint32_t cycle = 250;
+  const uint32_t width = Schedule::slotWidthMs(cycle);
+  TEST_ASSERT_TRUE(width > SLOT_GUARD_MS); // or the guard would have to give way
+
+  Schedule s;
+  s.rebuild(300, false, riders, MAX_RIDERS, 0);
+  TEST_ASSERT_TRUE(s.claimed());
+  const uint32_t opens = (uint32_t)s.slot() * width;
+
+  // Right at the top: all the room in the world.
+  TEST_ASSERT_TRUE(s.inSlotAtPhase(opens, cycle));
+  // One frame's worth of room left: still fine.
+  TEST_ASSERT_TRUE(s.inSlotAtPhase(opens + width - SLOT_GUARD_MS, cycle));
+  // A millisecond less than that, and the frame would cross the boundary.
+  TEST_ASSERT_FALSE(s.inSlotAtPhase(opens + width - SLOT_GUARD_MS + 1, cycle));
+  // And the old behaviour, which said yes here and put a frame in the next
+  // car's slot.
+  TEST_ASSERT_FALSE(s.inSlotAtPhase(opens + width - 1, cycle));
+}
+
+void test_a_car_alone_still_speaks_whatever_the_guard_says() {
+  // The guard must never be the reason a car is silent. Alone on the channel
+  // there is nothing to collide with and no slot worth keeping to.
+  Schedule s;
+  TEST_ASSERT_TRUE(s.inSlotAtPhase(249, 250));
+  TEST_ASSERT_TRUE(s.inSlot(249, 250));
+}
+
 void test_syncing_allows_for_the_sender_waiting_for_a_tick() {
   // A beacon does not leave on its slot boundary. It leaves on the first
   // module tick at or after it, so it is always a little late and never early.
@@ -1037,7 +1076,12 @@ void test_slot_window_opens_once_per_cycle() {
   TEST_ASSERT_FALSE(s.inSlot(1000, cycle));
   TEST_ASSERT_FALSE(s.inSlot(1000 + opens - 1, cycle));
   TEST_ASSERT_TRUE(s.inSlot(1000 + opens, cycle));
-  TEST_ASSERT_TRUE(s.inSlot(1000 + opens + width - 1, cycle));
+  // The last instant a whole frame still fits, and the first one where it does
+  // not. Holding a slot is permission to finish inside it, not to begin inside
+  // it: starting on the final millisecond would put eight milliseconds of
+  // frame into the next car's slot.
+  TEST_ASSERT_TRUE(s.inSlot(1000 + opens + width - SLOT_GUARD_MS, cycle));
+  TEST_ASSERT_FALSE(s.inSlot(1000 + opens + width - SLOT_GUARD_MS + 1, cycle));
   TEST_ASSERT_FALSE(s.inSlot(1000 + opens + width, cycle));
 
   // And again a cycle later, without another sync.
@@ -1826,6 +1870,8 @@ int main(int, char**) {
   RUN_TEST(test_boards_starting_together_do_not_all_take_slot_zero);
   RUN_TEST(test_an_unclaimed_car_free_runs_until_it_has_been_heard);
   RUN_TEST(test_every_car_lands_on_a_slot_of_its_own);
+  RUN_TEST(test_a_frame_that_cannot_finish_in_the_slot_does_not_start);
+  RUN_TEST(test_a_car_alone_still_speaks_whatever_the_guard_says);
   RUN_TEST(test_syncing_allows_for_the_sender_waiting_for_a_tick);
   RUN_TEST(test_the_chain_is_short_enough_to_stay_inside_a_slot);
   RUN_TEST(test_a_reference_travels_past_the_cars_that_can_hear_it);

@@ -223,7 +223,14 @@ bool Schedule::inSlotAtPhase(uint32_t phaseMs, uint32_t cycleMs) const {
   if (width == 0) return true;
 
   uint32_t start = (uint32_t)slot_ * width;
-  return phaseMs >= start && phaseMs < start + width;
+  // Room to finish, not merely room to start. See SLOT_GUARD_MS.
+  //
+  // A slot narrower than one frame cannot honour this, and refusing every
+  // transmission would be worse than overrunning: a car that never speaks is
+  // invisible. So the guard gives way rather than silencing the car, and the
+  // static_assert in the module is what stops that case existing at all.
+  if (width <= SLOT_GUARD_MS) return phaseMs >= start && phaseMs < start + width;
+  return phaseMs >= start && phaseMs + SLOT_GUARD_MS <= start + width;
 }
 
 bool Schedule::inSlot(uint32_t nowMs, uint32_t cycleMs) const {

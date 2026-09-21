@@ -33,6 +33,9 @@ volatile int lastSendErr = 0;
 // Read by the receive callback, which has no handle on the FastRadio.
 volatile uint8_t currentChannel = 0;
 
+// Whether the radio accepted the transmit power we asked for.
+bool txPowerSet = false;
+
 const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // arduino-esp32 3.x (ESP-IDF 5.x) hands the callback a struct carrying the
@@ -103,6 +106,24 @@ bool FastRadio::begin(const FastNet& net) {
                                          WIFI_PROTOCOL_LR);
 #endif
 
+  // Ask for the full legal transmit power rather than whatever was left set.
+  //
+  // Long-range mode buys sensitivity at the receiver; this is the other half,
+  // and it was simply never asked for. The driver's default is not guaranteed
+  // to be the maximum and anything else on the system that has touched Wi-Fi
+  // may have lowered it, so a board could be running a long-range link at
+  // reduced power and nothing anywhere would say so.
+  //
+  // Units are quarter-dBm, so 80 is 20 dBm - the ceiling the ESP32 will accept
+  // and inside 2.4 GHz limits in the regions this is used. A failure here is
+  // not fatal: a quieter radio still works, it just does not reach as far.
+  if (esp_wifi_set_max_tx_power(80) != ESP_OK) {
+    // Nothing to do about it, but the status line should not imply otherwise.
+    txPowerSet = false;
+  } else {
+    txPowerSet = true;
+  }
+
   if (esp_now_init() != ESP_OK) return false;
   if (esp_now_register_recv_cb(onRecv) != ESP_OK) {
     esp_now_deinit();
@@ -161,6 +182,12 @@ bool FastRadio::poll(FastRx& out) {
 }
 
 uint32_t FastRadio::dropped() const { return dropCount; }
+
+int8_t FastRadio::txPowerDbm() const {
+  int8_t q = 0;
+  if (esp_wifi_get_max_tx_power(&q) != ESP_OK) return 0;
+  return (int8_t)(q / 4); // quarter-dBm on the wire, whole dBm for a human
+}
 
 uint32_t FastRadio::sendFailed() const { return sendFailCount; }
 
