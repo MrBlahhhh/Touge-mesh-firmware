@@ -45,9 +45,22 @@ const uint32_t GATE_METRES = 20;
 const uint32_t GATE_IDLE_MS = 3000;
 
 // How long a car stays "on 2.4 GHz" for the purpose of outranking its own LoRa
-// positions. Short on purpose: when the fast link drops, LoRa has to take over
-// without a gap, and a two-second-old position beats none at all.
-const uint32_t FAST_PRECEDENCE_MS = 2000;
+// positions, and for being counted as being on the lane at all.
+//
+// This has to be longer than the gap between one car's beacons or a healthy
+// car falls off the lane between them. It was two seconds against a three
+// second idle heartbeat, so a parked car was absent for one second in every
+// three: the live count flapped 2, 1, 2, 0, its LoRa position took over each
+// time the fast one aged out, and the hop logic read the resulting gaps as a
+// bad channel and moved the whole ride off it. Voice would have been declared
+// dead between every pair of frames.
+//
+// Two heartbeats plus a margin, so a car has to miss a beacon outright before
+// anything treats it as gone. The cost is that a genuinely dead fast link
+// takes this long to hand back to LoRa, which is the right way to be wrong:
+// a seven second old position from the car beats a fresh one routed through a
+// tower and a database, and staying put is what voice needs.
+const uint32_t FAST_PRECEDENCE_MS = 7000;
 
 // The name rides along every half minute rather than on every ping. Everyone
 // who can hear you has it after one, and after that it is just bytes.
@@ -69,9 +82,13 @@ const uint32_t ID_BLOCK = 65536;
 const uint32_t SYNC_EVERY_MS = 2000;
 
 // Silence long enough to mean something is wrong rather than that the road is
-// quiet. Every car beacons at least once per idle heartbeat, so four seconds
-// is more than one missed beacon from everybody at once.
-const uint32_t LOST_MS = 4000;
+// quiet.
+//
+// Four seconds was barely one idle heartbeat plus jitter, so a board went
+// hunting for a ride that was still there and stopped sending held traffic
+// while it hunted. Everybody has to miss two heartbeats before this board
+// concludes it is the one that is lost.
+const uint32_t LOST_MS = 12000;
 
 // A second on each candidate while searching. Long enough to catch a beacon
 // from a car on its idle heartbeat, short enough that three channels is three
@@ -79,10 +96,21 @@ const uint32_t LOST_MS = 4000;
 const uint32_t SCAN_DWELL_MS = 1000;
 
 // How long the reference watches before deciding the channel is unusable, and
-// the share of expected beacons below which it moves the ride. Generous: a hop
-// costs everyone a few seconds of scanning, so it has to be worth it.
-const uint32_t HOP_WINDOW_MS = 10000;
-const uint32_t HOP_KEEP_PCT = 40;
+// the share of expected beacons below which it moves the ride.
+//
+// Both were far too eager. The expectation is cars x (window / heartbeat),
+// which at ten seconds was exactly three beacons per car with no margin at
+// all, so ordinary jitter read as a failing channel and the board moved the
+// whole ride to another one - splitting it, because the others had no reason
+// to follow. Seen on a bench with three boards a foot apart and a perfect
+// channel.
+//
+// Thirty seconds averages over ten heartbeats per car, and a quarter of that
+// is a channel genuinely carrying almost nothing rather than one having a bad
+// second. A hop costs everyone seconds of scanning and risks splitting the
+// ride, so it has to be the last explanation left, not the first.
+const uint32_t HOP_WINDOW_MS = 30000;
+const uint32_t HOP_KEEP_PCT = 25;
 
 // How often the state of the fast lane is printed. Often enough to watch a
 // bench of boards find each other, rare enough not to drown the log.
@@ -130,6 +158,9 @@ TougeFastModule::TougeFastModule()
     // The whole scheme rests on a second being a whole number of cycles: that
     // is what makes the pulse a cycle boundary and a missed pulse harmless.
     static_assert(1000 % CYCLE_MS == 0, "the cycle must divide a second exactly");
+    // A car must not age off the fast lane between its own beacons.
+    static_assert(FAST_PRECEDENCE_MS > 2 * GATE_IDLE_MS,
+                  "the fast-lane window must outlast two idle heartbeats");
 
 #ifdef PIN_GPS_PPS
     pinMode(PIN_GPS_PPS, INPUT);
