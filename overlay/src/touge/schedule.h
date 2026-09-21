@@ -39,11 +39,12 @@ static const uint8_t MAX_SLOTS = MAX_RIDERS + 1;
 
 // How long a car may be quiet and still keep the job of keeping time.
 //
-// Long enough that a couple of lost beacons change nothing, short enough that
+// Eight beacons at the idle heartbeat: long enough that a handful of losses
+// change nothing, short enough that
 // switching off the reference does not leave everyone timing off a radio in
 // somebody's pocket. The roster's own ten minutes is right for the map and far
 // too long for the clock.
-static const uint32_t REFERENCE_LAPSE_MS = 15000;
+static const uint32_t REFERENCE_LAPSE_MS = 8000;
 
 // No slot held yet. Nine slots leave four bits with values to spare, so this
 // rides in the same nibble as the slot itself and costs nothing.

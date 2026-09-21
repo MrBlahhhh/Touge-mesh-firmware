@@ -40,9 +40,14 @@ const uint32_t CYCLE_MS = 250;
 // airtime on the car that has not moved.
 const uint32_t GATE_METRES = 20;
 
-// The heartbeat for a car that is parked. Long, because a stationary car needs
-// to prove it is alive and nothing more.
-const uint32_t GATE_IDLE_MS = 3000;
+// The heartbeat for a car that is parked.
+//
+// One a second. Three was chosen when this was only about proving a parked car
+// was alive, but the interval is also the floor on how fast anything else can
+// notice a car has gone: every other timer here is a multiple of it, so three
+// seconds made the whole lane sluggish to state a fact it already knew. A
+// stationary car at 1 Hz is a few bytes a second against a 250 ms cycle.
+const uint32_t GATE_IDLE_MS = 1000;
 
 // How long a car stays "on 2.4 GHz" for the purpose of outranking its own LoRa
 // positions, and for being counted as being on the lane at all.
@@ -55,12 +60,11 @@ const uint32_t GATE_IDLE_MS = 3000;
 // bad channel and moved the whole ride off it. Voice would have been declared
 // dead between every pair of frames.
 //
-// Two heartbeats plus a margin, so a car has to miss a beacon outright before
-// anything treats it as gone. The cost is that a genuinely dead fast link
-// takes this long to hand back to LoRa, which is the right way to be wrong:
-// a seven second old position from the car beats a fresh one routed through a
-// tower and a database, and staying put is what voice needs.
-const uint32_t FAST_PRECEDENCE_MS = 7000;
+// Three heartbeats, so a car has to miss three beacons outright before
+// anything treats it as gone, and LoRa fills within a few seconds rather than
+// most of a minute. At the old three second heartbeat this had to be seven to
+// clear two beacons; at 1 Hz the same safety costs three.
+const uint32_t FAST_PRECEDENCE_MS = 3000;
 
 // The name rides along every half minute rather than on every ping. Everyone
 // who can hear you has it after one, and after that it is just bytes.
@@ -84,11 +88,11 @@ const uint32_t SYNC_EVERY_MS = 2000;
 // Silence long enough to mean something is wrong rather than that the road is
 // quiet.
 //
-// Four seconds was barely one idle heartbeat plus jitter, so a board went
-// hunting for a ride that was still there and stopped sending held traffic
-// while it hunted. Everybody has to miss two heartbeats before this board
-// concludes it is the one that is lost.
-const uint32_t LOST_MS = 12000;
+// Everybody has to go quiet for six heartbeats before this board concludes it
+// is the one that is lost. Four seconds was barely one heartbeat plus jitter,
+// so a board went hunting for a ride that was still there and stopped sending
+// held traffic while it hunted.
+const uint32_t LOST_MS = 6000;
 
 // A second on each candidate while searching. Long enough to catch a beacon
 // from a car on its idle heartbeat, short enough that three channels is three
@@ -373,7 +377,16 @@ void TougeFastModule::beacon(uint32_t nowMs)
     p.headingDeg = (uint16_t)(localPosition.ground_track / 1e5);
     p.speedMph = speedToMph((float)localPosition.ground_speed);
     p.hasFix = true;
-    p.phoneAttached = false;
+    // Whose fix this is, honestly.
+    //
+    // Hardcoded false, while inject() on the far end stamped every arriving
+    // 2.4 GHz position as LOC_EXTERNAL - so a board beaconing its own GPS, or
+    // a position frozen because the phone stopped feeding it, arrived
+    // everywhere claiming to be a phone fix. The app ranks a phone fix above a
+    // radio's own, so the worse position won and held for the whole precedence
+    // window with the LoRa copy suppressed behind it.
+    p.phoneAttached =
+        localPosition.location_source == meshtastic_Position_LocSource_LOC_EXTERNAL;
     // Tells everyone else whether we are fit to be the reference car.
     p.clockLocked = rideClock.locked((uint64_t)esp_timer_get_time());
     // And which slot we are holding, which is how anyone else knows to stay
@@ -426,7 +439,9 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
         mp.has_longitude_i = true;
         mp.ground_track = (uint32_t)p.headingDeg * 100000;
         mp.ground_speed = (uint32_t)(p.speedMph / 2.23694f);
-        mp.location_source = meshtastic_Position_LocSource_LOC_EXTERNAL;
+        // What the sender said it was, not what we wish it were.
+        mp.location_source = p.phoneAttached ? meshtastic_Position_LocSource_LOC_EXTERNAL
+                                             : meshtastic_Position_LocSource_LOC_INTERNAL;
         mp.time = getValidTime(RTCQualityFromNet);
 
         nodeDB->updatePosition(f.src, mp, RX_SRC_RADIO);
