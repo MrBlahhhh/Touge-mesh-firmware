@@ -142,7 +142,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 19;
+const uint32_t TOUGE_BUILD = 22;
 
 // How long a board hunts before giving up and waiting at home.
 //

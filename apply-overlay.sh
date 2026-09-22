@@ -88,6 +88,27 @@ fi
 
 rm -f "$MODULES.bak"
 
+# The Meshtastic *core* files we patch beyond Modules.cpp, kept as unified diffs
+# in core-patches/ so a fresh checkout gets them too - the rate limit that lets
+# the fast lane's 1 Hz feed through (PhoneAPI.cpp) and the BLE params that stop
+# the radio throttling itself after setup (NimbleBluetooth.cpp). Without these
+# the fast lane builds but does not carry. Idempotent: a patch that already
+# reverse-applies is in, and is skipped.
+if ls "$HERE"/core-patches/*.patch >/dev/null 2>&1; then
+  echo "==> core patches"
+  for patch in "$HERE"/core-patches/*.patch; do
+    name="$(basename "$patch")"
+    if patch -p1 -d "$DEST" -R --dry-run -f <"$patch" >/dev/null 2>&1; then
+      echo "    $name already applied"
+    elif patch -p1 -d "$DEST" --dry-run -f <"$patch" >/dev/null 2>&1; then
+      patch -p1 -d "$DEST" -f <"$patch" >/dev/null && echo "    applied $name"
+    else
+      echo "    error: $name does not apply; upstream moved, patch by hand" >&2
+      exit 1
+    fi
+  done
+fi
+
 echo
 echo "done. now, from $DEST:"
 echo "    pio run -e heltec-v4"

@@ -104,6 +104,20 @@ bool FastRadio::begin(const FastNet& net) {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(false, false);
 
+  // Keep the receiver awake, the single most important line for ESP-NOW.
+  //
+  // The ESP32 defaults Wi-Fi to modem power-save, and with no access point to
+  // schedule wake-ups around, an ESP-NOW station sleeps straight through
+  // frames. It shows up as a lane that works until it does not: on a board
+  // also running BLE for the phone, the two share the one 2.4 GHz radio, and
+  // under any real BLE load the receiver stops waking and the board hears
+  // nobody on 2.4 for minutes at a stretch while LoRa and BLE carry on fine -
+  // heard=0, dropped=0, txfail=0, and no way to tell from the outside that the
+  // radio had quietly gone to sleep. WIFI_PS_NONE is what every dependable
+  // ESP-NOW setup sets and what this was missing. It costs receive-side power
+  // the car is already supplying.
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
 #if TOUGE_FAST_LONG_RANGE
   // Has to be set before esp_now_init, and on the interface ESP-NOW will use.
   // A node with LR on cannot hear a node with LR off, so this is all or none

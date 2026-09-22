@@ -1,0 +1,24 @@
+diff --git a/src/nimble/NimbleBluetooth.cpp b/src/nimble/NimbleBluetooth.cpp
+index e01c32c..c840a8b 100644
+--- a/src/nimble/NimbleBluetooth.cpp
++++ b/src/nimble/NimbleBluetooth.cpp
+@@ -278,10 +278,17 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
+     {
+         LOG_INFO("BLE onConfigComplete");
+ 
+-        // Switch to lower power consumption BLE connection params for steady-state use after config/setup is complete
++        // Touge: stay on the high-throughput connection params, do NOT drop to
++        // low power. The fast lane hands the phone a position per car per second
++        // plus its telemetry, and each of those is a separate GATT read; at the
++        // stock 50 ms / latency-2 steady-state interval the link cannot carry
++        // that, the radio's to-phone queue backs up, and the newest packets -
++        // the live positions and the lane report - get dropped, so the phone
++        // ends up reading a stale backlog and shows the group on cell. The car
++        // supplies the extra receive power. See requestHighThroughputConnection.
+         uint16_t conn_handle = nimbleBluetoothConnHandle.load();
+         if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+-            requestLowerPowerConnection(conn_handle);
++            requestHighThroughputConnection(conn_handle);
+         }
+     }
+ 
