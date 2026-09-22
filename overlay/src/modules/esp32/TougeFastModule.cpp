@@ -142,7 +142,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 22;
+const uint32_t TOUGE_BUILD = 23;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -380,6 +380,7 @@ void TougeFastModule::syncChannel()
                       mesh_.riders(), MAX_RIDERS, millis());
     wantBeacon_ = false;
     sentOnce_ = false;
+    nextBeaconMs_ = 0;
     mesh_.seedIds(idCeiling_ ? idCeiling_ - ID_BLOCK : nodeDB->getNodeNum());
 
     // Which of the three non-overlapping channels this ride starts on. Derived,
@@ -481,11 +482,17 @@ void TougeFastModule::beacon(uint32_t nowMs)
     (void)fixAge;
 
     if (!wantBeacon_) {
-        uint32_t since = (uint32_t)(nowMs - lastBeaconMs_);
         uint32_t moved = sentOnce_ ? distanceM(sentLat_, sentLon_, localPosition.latitude_i,
                                                localPosition.longitude_i)
                                    : GATE_METRES;
-        if (!sentOnce_ || moved >= GATE_METRES || since >= GATE_IDLE_MS) wantBeacon_ = true;
+        // Time trigger on a fixed 1 s grid, not GATE_IDLE_MS after the last
+        // actual send. The send waits for our TDMA slot, up to a cycle, and
+        // measuring the next interval from the send folded that wait into every
+        // gap - a steady drift toward 1.25 s. nextBeaconMs_ advances from
+        // itself, so however long the slot wait ran the cadence holds on the
+        // second. Distance still triggers an extra beacon between deadlines.
+        bool timeDue = !sentOnce_ || (int32_t)(nowMs - nextBeaconMs_) >= 0;
+        if (timeDue || moved >= GATE_METRES) wantBeacon_ = true;
     }
     if (!wantBeacon_) return;
 
@@ -512,6 +519,13 @@ void TougeFastModule::beacon(uint32_t nowMs)
 
     wantBeacon_ = false;
     lastBeaconMs_ = nowMs;
+    // Advance the beacon deadline on the 1 s grid, catching up if a long slot
+    // wait or a distance-triggered send put us past it, so the next time-beacon
+    // lands on the second rather than a slot-wait later.
+    if (nextBeaconMs_ == 0) nextBeaconMs_ = nowMs;
+    do {
+        nextBeaconMs_ += GATE_IDLE_MS;
+    } while ((int32_t)(nowMs - nextBeaconMs_) >= 0);
     sentLat_ = localPosition.latitude_i;
     sentLon_ = localPosition.longitude_i;
     sentOnce_ = true;

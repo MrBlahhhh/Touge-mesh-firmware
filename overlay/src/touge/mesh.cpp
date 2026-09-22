@@ -237,11 +237,21 @@ size_t Mesh::countOn(uint8_t chan, uint32_t windowMs, uint32_t nowMs) const {
 bool Mesh::phoneDue(uint32_t id, uint32_t everyMs, uint32_t nowMs) {
   for (size_t i = 0; i < MAX_RIDERS; i++) {
     if (!riders_[i].used || riders_[i].id != id) continue;
-    // Never sent: send. Otherwise only once the interval has passed. Unsigned,
-    // so a car first heard before a millis() wrap is not silenced for
-    // forty-nine days afterwards.
-    if (riders_[i].phoneMs != 0 && (uint32_t)(nowMs - riders_[i].phoneMs) < everyMs) return false;
-    riders_[i].phoneMs = nowMs;
+    // phoneMs is the next deadline on a fixed everyMs grid, not the last send
+    // time. Measuring from the last send threw away a position that arrived a
+    // few milliseconds early and made the phone wait a whole beacon for the
+    // next one - ordinary jitter turned into a two-second gap. A deadline that
+    // advances from itself forwards on a steady cadence and lets a slightly
+    // early arrival through. Signed compares, so a millis() wrap is a small
+    // negative rather than a forty-nine-day silence.
+    if (riders_[i].phoneMs == 0) {
+      riders_[i].phoneMs = nowMs + everyMs;
+      return true;
+    }
+    if ((int32_t)(nowMs - riders_[i].phoneMs) < 0) return false;
+    do {
+      riders_[i].phoneMs += everyMs;
+    } while ((int32_t)(nowMs - riders_[i].phoneMs) >= 0);
     return true;
   }
   // Not on the roster at all, so there is nothing to throttle against and no

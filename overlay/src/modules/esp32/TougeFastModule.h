@@ -113,6 +113,7 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     uint32_t nodeId_ = 0;
     uint32_t idCeiling_ = 0;
     uint32_t lastBeaconMs_ = 0;
+    uint32_t nextBeaconMs_ = 0;
     uint32_t lastNameMs_ = 0;
     uint32_t lastSyncMs_ = 0;
     uint32_t lastHeardMs_ = 0;
