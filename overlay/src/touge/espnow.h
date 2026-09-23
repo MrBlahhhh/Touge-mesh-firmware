@@ -78,6 +78,14 @@ class FastRadio {
   // Non-blocking. False when nothing is waiting.
   bool poll(FastRx& out);
 
+  // Why begin() last failed (an esp_err_t, ESP_OK once it has started), and
+  // the heap it had to work with at the time. A board that cannot start the
+  // lane otherwise just says "LoRa only", which reads the same whether the
+  // cause is memory, a Wi-Fi association or a bad key.
+  int beginError() const;
+  uint32_t beginFreeHeap() const;
+  uint32_t beginLargestBlock() const;
+
   // Frames the driver handed us that we had nowhere to put. Worth watching:
   // a number that climbs means the module is not draining fast enough.
   uint32_t dropped() const;

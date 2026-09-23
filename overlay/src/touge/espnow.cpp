@@ -3,8 +3,9 @@
 #include <string.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_event.h>
+#include <esp_heap_caps.h>
 #include <Arduino.h>
-#include <WiFi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
@@ -85,6 +86,79 @@ bool startPeer() {
   return err == ESP_OK || err == ESP_ERR_ESPNOW_EXIST;
 }
 
+// Why the last begin() failed, for the status line. ESP_OK once it has worked.
+esp_err_t initErr = ESP_OK;
+uint32_t initFreeHeap = 0;
+uint32_t initLargestBlock = 0;
+
+// The Wi-Fi driver, brought up for ESP-NOW and nothing else.
+//
+// This used to be WiFi.mode(WIFI_STA), which initialises the driver with the
+// Arduino core's defaults - a configuration for a Wi-Fi client: AMPDU
+// aggregation windows in both directions, a bank of static receive buffers and
+// the driver's NVS store. None of that does anything for connectionless
+// broadcast frames of a couple of hundred bytes, and all of it is allocated up
+// front.
+//
+// On a Heltec V3, which has no PSRAM, that allocation happens after NimBLE has
+// taken its share, and it does not fit:
+//
+//     E (8579) wifi:Expected to init 4 rx buffer, actual is 1
+//     wifiLowLevelInit(): esp_wifi_init 0x101: ESP_ERR_NO_MEM
+//
+// so the board ran LoRa-only for good while every sign on the phone said only
+// that the lane had stopped reporting. The return of WiFi.mode() was not
+// checked either, and the half-initialised driver it left behind could not be
+// torn down again, so the retry every few seconds could never succeed.
+//
+// Brought up directly instead, with aggregation off, the minimum static receive
+// buffers (the rest are allocated per frame as they arrive), no NVS and no
+// encrypted ESP-NOW peers - encryption happens above this, under the ride key.
+bool startWifi() {
+  static bool up = false;
+  if (up) return true;
+
+  initFreeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  initLargestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+  // The driver posts its events to the default loop. The core usually has one
+  // already; if it does, this says so and nothing changes.
+  esp_err_t err = esp_event_loop_create_default();
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    initErr = err;
+    return false;
+  }
+
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  cfg.static_rx_buf_num = 2;       // the driver's floor
+  cfg.dynamic_rx_buf_num = 16;     // allocated per frame, not up front
+  cfg.cache_tx_buf_num = 0;
+  cfg.ampdu_rx_enable = 0;
+  cfg.ampdu_tx_enable = 0;
+  cfg.amsdu_tx_enable = 0;
+  cfg.nvs_enable = 0;
+  cfg.espnow_max_encrypt_num = 0;
+
+  err = esp_wifi_init(&cfg);
+  if (err != ESP_OK) {
+    initErr = err;
+    return false;
+  }
+  esp_wifi_set_storage(WIFI_STORAGE_RAM);
+  err = esp_wifi_set_mode(WIFI_MODE_STA);
+  if (err == ESP_OK) err = esp_wifi_start();
+  if (err != ESP_OK) {
+    // Handed back whole, so the next attempt starts from nothing rather than
+    // from a driver it cannot initialise twice.
+    esp_wifi_deinit();
+    initErr = err;
+    return false;
+  }
+  initErr = ESP_OK;
+  up = true;
+  return true;
+}
+
 } // namespace
 
 bool FastRadio::begin(const FastNet& net) {
@@ -97,12 +171,11 @@ bool FastRadio::begin(const FastNet& net) {
   }
 
   // Station mode with no connection. Meshtastic may also want Wi-Fi; if it has
-  // already joined an access point, the AP owns the channel and the call below
-  // will not move us off it. That is correct behaviour, not a failure: the
-  // ride simply runs on the AP's channel instead of the derived one, and the
-  // boards still agree because they all read the same interface.
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(false, false);
+  // already joined an access point, the AP owns the channel and retuning will
+  // not move us off it. That is correct behaviour, not a failure: the ride
+  // simply runs on the AP's channel instead of the derived one, and the boards
+  // still agree because they all read the same interface.
+  if (!startWifi()) return false;
 
   // Keep the receiver awake, the single most important line for ESP-NOW.
   //
@@ -144,7 +217,11 @@ bool FastRadio::begin(const FastNet& net) {
     txPowerSet = true;
   }
 
-  if (esp_now_init() != ESP_OK) return false;
+  esp_err_t nowErr = esp_now_init();
+  if (nowErr != ESP_OK) {
+    initErr = nowErr;
+    return false;
+  }
   if (esp_now_register_recv_cb(onRecv) != ESP_OK) {
     esp_now_deinit();
     return false;
@@ -212,5 +289,11 @@ int8_t FastRadio::txPowerDbm() const {
 uint32_t FastRadio::sendFailed() const { return sendFailCount; }
 
 int FastRadio::lastSendError() const { return lastSendErr; }
+
+int FastRadio::beginError() const { return (int)initErr; }
+
+uint32_t FastRadio::beginFreeHeap() const { return initFreeHeap; }
+
+uint32_t FastRadio::beginLargestBlock() const { return initLargestBlock; }
 
 } // namespace touge

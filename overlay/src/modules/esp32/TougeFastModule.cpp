@@ -10,6 +10,7 @@
 #include "main.h"
 #include "touge/cipher.h"
 #include <Preferences.h>
+#include <esp_err.h>
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <string.h>
@@ -142,7 +143,7 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 23;
+const uint32_t TOUGE_BUILD = 25;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -179,10 +180,18 @@ const uint32_t FRAME_AIRTIME_MS = 8;
 // down the convoy.
 const uint32_t TICK_MS = 5;
 
-// How long after boot the fast lane waits before starting WiFi, so Bluetooth
-// initialises first and the two do not fight over heap on a no-PSRAM board.
-// See runOnce.
+// The earliest the fast lane may start WiFi after boot. A floor, not the gate:
+// the gate is Bluetooth being up. See bleSettled.
 const uint32_t FAST_LANE_START_DELAY_MS = 8000;
+
+// How long after the BLE server exists before WiFi may start, for NimBLE to
+// finish building and starting its advertising, which is where it allocates.
+const uint32_t FAST_LANE_AFTER_BLE_MS = 2000;
+
+// The longest the fast lane waits for Bluetooth at all. A board with Bluetooth
+// switched off never gets a BLE server, and must not sit off 2.4 GHz for good
+// waiting for one.
+const uint32_t FAST_LANE_BLE_WAIT_MAX_MS = 45000;
 
 // What a listener assumes about how late a beacon was.
 //
@@ -392,7 +401,9 @@ void TougeFastModule::syncChannel()
     heardInWindow_ = 0;
 
     if (!fastRadio.begin(net_)) {
-        LOG_WARN("touge: ESP-NOW would not start, LoRa only");
+        LOG_WARN("touge: ESP-NOW would not start (%s, heap %u free, %u largest), LoRa only",
+                 esp_err_to_name((esp_err_t)fastRadio.beginError()),
+                 (unsigned)fastRadio.beginFreeHeap(), (unsigned)fastRadio.beginLargestBlock());
         started_ = false;
         return;
     }
@@ -680,7 +691,13 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
             pp->channel = channels.getPrimaryIndex();
             pp->hop_limit = 0;
             pp->hop_start = 0;
+            // rx_rssi has explicit presence in this Meshtastic: without the
+            // has_ flag the number is dropped on the way to the phone, and the
+            // app showed the fast lane with no signal strength at all while
+            // LoRa, set by Meshtastic's own receive path, had one. Zero is what
+            // an old core gives when it cannot see the RSSI; leave that absent.
             pp->rx_rssi = rssi;
+            pp->has_rx_rssi = rssi != 0;
             pp->rx_time = mp.time;
             pp->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
             pp->decoded.portnum = meshtastic_PortNum_POSITION_APP;
@@ -749,6 +766,7 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
     p->hop_limit = 0;
     p->hop_start = 0;
     p->rx_rssi = rssi;
+    p->has_rx_rssi = rssi != 0; // see the position path above
     p->rx_time = getValidTime(RTCQualityFromNet);
     p->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
     p->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
@@ -929,6 +947,39 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
     }
 }
 
+namespace
+{
+uint32_t bleUpMs = 0;
+
+// Whether Bluetooth has had its memory, so WiFi may take what is left.
+//
+// This used to be a fixed eight seconds after boot, on the measurement that
+// Meshtastic had brought BLE up by then. On a Heltec V4 it had not: NimBLE
+// started at 11.4 s, found WiFi already holding the heap, and could not
+// allocate its advertising data -
+//
+//     E (12129) BLE_INIT: Malloc failed
+//     start(): Error setting advertisement data; rc=519
+//
+// - so the board booted, ran, and was invisible to every phone. Waiting on the
+// event rather than a guess at when it happens is the fix; the eight seconds
+// stays as a floor.
+bool bleSettled(uint32_t now)
+{
+    if (now < FAST_LANE_START_DELAY_MS) return false;
+#if defined(ARCH_ESP32) && !defined(CONFIG_IDF_TARGET_ESP32S2) && !MESHTASTIC_EXCLUDE_BLUETOOTH
+    if (!config.bluetooth.enabled) return true;
+    if (nimbleBluetooth && nimbleBluetooth->isActive()) {
+        if (bleUpMs == 0) bleUpMs = now;
+        return (uint32_t)(now - bleUpMs) >= FAST_LANE_AFTER_BLE_MS;
+    }
+    return now >= FAST_LANE_BLE_WAIT_MAX_MS;
+#else
+    return true;
+#endif
+}
+} // namespace
+
 int32_t TougeFastModule::runOnce()
 {
     if (nodeId_ == 0) nodeId_ = nodeDB->getNodeNum();
@@ -945,12 +996,17 @@ int32_t TougeFastModule::runOnce()
     // loop. Our own WiFi bring-up, by contrast, checks its return and falls
     // back to LoRa-only.
     //
-    // So we wait. By the time this fires, Meshtastic has initialised BLE and
-    // taken its memory; if what is left is not enough for WiFi, the fast lane
-    // degrades to LoRa rather than taking Bluetooth - and the phone link - down
-    // with it. A few seconds of no 2.4 GHz at boot is invisible next to a radio
-    // that never finishes booting.
-    if (now < FAST_LANE_START_DELAY_MS) return (int32_t)(FAST_LANE_START_DELAY_MS - now);
+    // So we wait until Meshtastic has initialised BLE and taken its memory; if
+    // what is left is not enough for WiFi, the fast lane degrades to LoRa
+    // rather than taking Bluetooth - and the phone link - down with it. A few
+    // seconds of no 2.4 GHz at boot is invisible next to a radio no phone can
+    // find. Once open, the gate stays open.
+    static bool gateOpen = false;
+    if (!gateOpen) {
+        if (!bleSettled(now)) return 250;
+        gateOpen = true;
+        LOG_INFO("touge: bluetooth settled at %u ms, starting fast lane", (unsigned)now);
+    }
 
     // First thing in the tick: PositionModule ran a few milliseconds ago and
     // may have written a stale LoRa fix over a fresher 2.4 GHz one. See
