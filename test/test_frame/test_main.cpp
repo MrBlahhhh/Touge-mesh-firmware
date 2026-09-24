@@ -18,6 +18,7 @@
 #include "rideclock.h"
 #include "hmac.h"
 #include "hop.h"
+#include "gnssfix.h"
 
 using namespace touge;
 
@@ -1815,6 +1816,61 @@ void test_two_rides_do_not_have_to_start_together() {
   TEST_ASSERT_NOT_EQUAL(a.channel(), b.channel());
 }
 
+// --- the receiver's own fix, to the phone ---------------------------------
+
+static GnssFix sampleFix() {
+  GnssFix f;
+  f.latE7 = 351234567;
+  f.lonE7 = -839876543;
+  f.altitudeM = 512;
+  f.speedKmh = 72;
+  f.trackE5 = 27012345; // 270.12345 degrees
+  f.sats = 11;
+  f.hdopE2 = 94;
+  f.fixTimeSec = 1790000000;
+  return f;
+}
+
+void test_gnss_fix_formats_as_the_app_expects() {
+  char js[160];
+  size_t n = formatGnssFix(sampleFix(), js, sizeof(js));
+  TEST_ASSERT_EQUAL_STRING(
+      "{\"gf\":{\"la\":351234567,\"lo\":-839876543,\"al\":512,\"kh\":72,"
+      "\"tr\":27012,\"sa\":11,\"hd\":94,\"t\":1790000000}}",
+      js);
+  TEST_ASSERT_EQUAL_size_t(strlen(js), n);
+}
+
+void test_gnss_fix_refuses_a_short_buffer() {
+  char js[20];
+  TEST_ASSERT_EQUAL_size_t(0, formatGnssFix(sampleFix(), js, sizeof(js)));
+}
+
+void test_gnss_forward_sends_each_new_fix_once_a_second() {
+  GnssForward fwd;
+  GnssFix f = sampleFix();
+  TEST_ASSERT_TRUE(fwd.due(f, 1000));
+  fwd.sent(f, 1000);
+  // Same solution read again on the next 5 ms pass.
+  TEST_ASSERT_FALSE(fwd.due(f, 1005));
+  TEST_ASSERT_FALSE(fwd.due(f, 5000));
+  // A new second, but too soon after the last send.
+  f.fixTimeSec++;
+  TEST_ASSERT_FALSE(fwd.due(f, 1500));
+  TEST_ASSERT_TRUE(fwd.due(f, 1950));
+}
+
+void test_gnss_forward_skips_no_fix() {
+  GnssForward fwd;
+  GnssFix f = sampleFix();
+  f.latE7 = 0;
+  f.lonE7 = 0;
+  TEST_ASSERT_FALSE(fwd.due(f, 1000));
+  f = sampleFix();
+  f.fixTimeSec = 0;
+  TEST_ASSERT_FALSE(fwd.due(f, 1000));
+}
+
 void setUp() {}
 void tearDown() {}
 
@@ -1919,5 +1975,9 @@ int main(int, char**) {
   RUN_TEST(test_a_lost_car_visits_every_candidate);
   RUN_TEST(test_searching_does_not_change_what_we_believe);
   RUN_TEST(test_two_rides_do_not_have_to_start_together);
+  RUN_TEST(test_gnss_fix_formats_as_the_app_expects);
+  RUN_TEST(test_gnss_fix_refuses_a_short_buffer);
+  RUN_TEST(test_gnss_forward_sends_each_new_fix_once_a_second);
+  RUN_TEST(test_gnss_forward_skips_no_fix);
   return UNITY_END();
 }

@@ -33,6 +33,7 @@
 #include "concurrency/OSThread.h"
 #include "touge/espnow.h"
 #include "touge/frame.h"
+#include "touge/gnssfix.h"
 #include "touge/mesh.h"
 #include "touge/ride.h"
 #include "touge/hop.h"
@@ -67,6 +68,11 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // it is visible anywhere else.
     void status(uint32_t nowMs);
     void beacon(uint32_t nowMs);
+
+    // The receiver's own fix to the phone, about 1 Hz, so a tablet with no GPS
+    // can navigate on it. See touge/gnssfix.h.
+    void forwardGnssFix(uint32_t nowMs);
+    touge::GnssForward gnssForward_;
 
     // Hands a frame heard on 2.4 GHz to the rest of Meshtastic as though it
     // had come off the LoRa radio, so NodeDB, the OLED and the phone all see

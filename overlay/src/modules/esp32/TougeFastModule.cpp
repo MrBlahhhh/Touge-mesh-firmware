@@ -9,6 +9,9 @@
 #include "Router.h"
 #include "main.h"
 #include "touge/cipher.h"
+#if !MESHTASTIC_EXCLUDE_GPS
+#include "gps/GPS.h"
+#endif
 #include <Preferences.h>
 #include <esp_err.h>
 #include <esp_random.h>
@@ -92,6 +95,10 @@ const uint32_t ID_BLOCK = 65536;
 // somebody reconfigures the ride.
 const uint32_t SYNC_EVERY_MS = 2000;
 
+// The pass while there is no ride channel. Only the GNSS forward has work to
+// do then, and it wants about a second.
+const uint32_t IDLE_PASS_MS = 1000;
+
 // Silence long enough to mean something is wrong rather than that the road is
 // quiet.
 //
@@ -143,7 +150,9 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // was unanswerable from the phone - which is how an evening went by with three
 // boards on three different sets of timing constants and no way to tell. Bump
 // it whenever the on-air behaviour changes.
-const uint32_t TOUGE_BUILD = 25;
+// 26: core-patches/0003, the BLE advertising restart a disconnect could lose.
+// 27: the receiver's own fix to the phone ("gf"), and GNSS speed read as km/h.
+const uint32_t TOUGE_BUILD = 27;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -545,7 +554,14 @@ void TougeFastModule::beacon(uint32_t nowMs)
     p.lat = localPosition.latitude_i;
     p.lon = localPosition.longitude_i;
     p.headingDeg = (uint16_t)(localPosition.ground_track / 1e5);
-    p.speedMph = speedToMph((float)localPosition.ground_speed);
+    // The app's LOC_EXTERNAL fix carries m/s. The board's own GNSS fix carries
+    // whole km/h (GPS.cpp, TinyGPS kmph()), which read as m/s put a car on its
+    // own receiver at 3.6 times its real speed.
+    const bool fromReceiver =
+        localPosition.location_source == meshtastic_Position_LocSource_LOC_INTERNAL;
+    const float speedMps =
+        fromReceiver ? (float)localPosition.ground_speed / 3.6f : (float)localPosition.ground_speed;
+    p.speedMph = speedToMph(speedMps);
     p.hasFix = true;
     // Whose fix this is, honestly.
     //
@@ -1015,11 +1031,19 @@ int32_t TougeFastModule::runOnce()
     // The channel only changes when somebody reconfigures the ride, so this is
     // checked on a slow clock. Running it every pass would compare and rederive
     // keys fifty times a second for no reason.
-    if (!started_ || (uint32_t)(now - lastSyncMs_) >= SYNC_EVERY_MS) {
+    //
+    // With no channel this pass used to run every 5 s and sync each time. The
+    // pass is now 1 s so the GNSS fix keeps reaching the phone, and the sync
+    // stays at 5 s so a failing WiFi bring-up is not retried five times as often.
+    const uint32_t syncEveryMs = started_ ? SYNC_EVERY_MS : IDLE_PASS_MS * 5;
+    if ((uint32_t)(now - lastSyncMs_) >= syncEveryMs) {
         lastSyncMs_ = now;
         syncChannel();
     }
-    if (!started_) return 5000; // nothing to do until there is a channel
+    // Before the channel check: a tablet with no GPS needs the radio's fix
+    // whether or not a ride is set up.
+    forwardGnssFix(now);
+    if (!started_) return IDLE_PASS_MS; // nothing else to do until there is a channel
 
     drainRadio(now);
     // Nothing held goes out while we are lost.
@@ -1044,6 +1068,54 @@ int32_t TougeFastModule::runOnce()
     // what bounds how promptly a beacon can leave its slot, which is what
     // limits how long the sync chain can be - see SYNC_BIAS_MS.
     return (int32_t)TICK_MS;
+}
+
+void TougeFastModule::forwardGnssFix(uint32_t nowMs)
+{
+#if !MESHTASTIC_EXCLUDE_GPS
+    // Stock Meshtastic writes a new GNSS fix into NodeDB and nowhere the phone
+    // can see until it reconnects. See touge/gnssfix.h.
+    if (!gps || !gps->hasLock()) return;
+    // Nobody to hear it. Queued anyway, 32 of these would fill the phone queue
+    // and push out the first real packets after a reconnect.
+    if (service->api_state == MeshService::STATE_DISCONNECTED) return;
+
+    // GPS::p is the receiver's own solution. localPosition is not: the
+    // phone's LOC_EXTERNAL fix overwrites it, and sending that back would be
+    // the phone's own fix wearing the radio's label.
+    const meshtastic_Position &rx = gps->p;
+    GnssFix fix;
+    fix.latE7 = rx.latitude_i;
+    fix.lonE7 = rx.longitude_i;
+    // Above the ellipsoid, like an Android Location's altitude, not MSL.
+    fix.altitudeM = rx.altitude_hae;
+    fix.speedKmh = rx.ground_speed;
+    fix.trackE5 = rx.ground_track;
+    fix.sats = rx.sats_in_view;
+    fix.hdopE2 = rx.HDOP;
+    fix.fixTimeSec = rx.timestamp;
+    if (!gnssForward_.due(fix, nowMs)) return;
+
+    char js[160];
+    size_t n = formatGnssFix(fix, js, sizeof(js));
+    if (n == 0) return;
+    meshtastic_MeshPacket *gp = router->allocForSending();
+    if (!gp) return;
+    gp->from = nodeDB->getNodeNum();
+    gp->to = NODENUM_BROADCAST;
+    gp->channel = channels.getPrimaryIndex();
+    gp->hop_limit = 0;
+    gp->hop_start = 0;
+    gp->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    gp->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
+    memcpy(gp->decoded.payload.bytes, js, n);
+    gp->decoded.payload.size = (uint16_t)n;
+    // Straight to the BLE queue, like the status report. Never on the air.
+    service->sendToPhone(gp);
+    gnssForward_.sent(fix, nowMs);
+#else
+    (void)nowMs;
+#endif
 }
 
 void TougeFastModule::status(uint32_t nowMs)
