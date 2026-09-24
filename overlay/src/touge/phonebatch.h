@@ -17,6 +17,7 @@
 //
 // Platform-free like mesh.h: time comes in as an argument.
 
+#include <atomic>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -27,7 +28,8 @@ static const uint8_t BATCH_VERSION = 1;
 
 // Header, version 1, big-endian like frame.cpp:
 //   0 magic 0xC1 | 1 version | 2 header length | 3 record length | 4 count
-//   5 reserved 0 | 6-7 batch sequence | 8-11 radio millis when encoded
+//   5 flags | 6-7 batch sequence | 8-11 radio millis when encoded, or from
+//   build 35 when handed to the phone (flag BATCH_AGES_AT_DELIVERY)
 // A decoder skips header and record bytes it does not know, so a later
 // version can append fields without breaking this one.
 static const size_t BATCH_HEADER = 12;
@@ -36,8 +38,23 @@ static const size_t BATCH_HEADER = 12;
 //   0-3 node | 4-7 lat e7 | 8-11 lon e7 | 12-15 sender frame id
 //   16-17 heading, centidegrees | 18-19 speed, 0.1 km/h
 //   20-21 ms since the radio heard it (saturates) | 22 rssi dBm, 0 unknown
-//   23 flags: bit 0 phone fix, bits 1-2 lane (0 = 2.4 GHz), bits 4-7 hops away
+//   23 flags: bit 0 phone fix, bits 1-2 lane (0 = 2.4 GHz), bit 3 expired,
+//      bits 4-7 hops away
 static const size_t BATCH_RECORD = 24;
+
+// Header flag (byte 5, zero before build 35): the header time is when the phone
+// got the batch and every age runs to then, so the phone takes "arrival minus
+// age" as the heard time with no clock to estimate. Set by deliverBatch.
+static const uint8_t BATCH_AGES_AT_DELIVERY = 0x01;
+
+// Record flag (build 35): held too long to be a position; the phone must not use
+// it. Set where a record cannot be taken out: a pre-encoded batch.
+static const uint8_t RECORD_EXPIRED = 0x08;
+
+// Older than this, a record is dropped rather than delivered. Under the age
+// field's 65.5 s range, so an age the phone does get is always exact; well
+// past the 1 Hz beacon, so only a stall or a disconnect gets a record here.
+static const uint32_t RECORD_EXPIRE_MS = 60000;
 
 // The largest age a record carries. 0xFFFF itself is left alone: build 30 radios
 // wrote it for a slightly negative age, and the app reads it as "just heard".
@@ -66,6 +83,7 @@ struct PhoneRecord {
   uint8_t hopsAway = 0;
   // Radio millis when this position was heard. Encoded as an age.
   uint32_t heardMs = 0;
+  bool expired = false;
 };
 
 struct BatchHeader {
@@ -73,6 +91,7 @@ struct BatchHeader {
   uint8_t count = 0;
   uint16_t seq = 0;
   uint32_t radioMs = 0;
+  uint8_t flags = 0;
 };
 
 // The largest payload a batch should be, for the MTU the phone negotiated.
@@ -129,7 +148,10 @@ class PhoneStore {
 
   // Encodes the longest-waiting records that fit and removes them. Returns
   // bytes written, 0 when nothing is pending. [taken] gets the record count.
+  // A record older than RECORD_EXPIRE_MS (a car gone quiet during a stall) is
+  // dropped instead and counted in expired().
   size_t takeBatch(uint8_t* out, size_t cap, uint16_t seq, uint32_t nowMs, size_t& taken);
+  uint32_t expired() const { return expired_; }
 
  private:
   struct Slot {
@@ -140,6 +162,7 @@ class PhoneStore {
     bool used = false;
   };
   Slot slots_[PHONE_STORE_SLOTS];
+  uint32_t expired_ = 0;
 };
 
 // ---- Batches handed over and not yet read ----------------------------------
@@ -196,11 +219,44 @@ class BatchesInFlight {
   uint8_t removeAt(size_t i);
 };
 
-// Moves a batch's clock to [nowMs], the moment it is handed to the phone:
-// every record's age grows by the time the batch waited in the queue, so a
-// batch read five seconds late says its positions are five seconds older.
-// False, changing nothing, if [payload] is not a batch.
-bool restampBatch(uint8_t* payload, size_t len, uint32_t nowMs);
+// Readies a batch at the moment the phone gets it. Every age grows by the time
+// the batch waited, so one read five seconds late says its positions are five
+// seconds older; the header time moves to [nowMs] and BATCH_AGES_AT_DELIVERY
+// is set. Records past RECORD_EXPIRE_MS are taken out when [canShrink] (a
+// MeshPacket about to be encoded), or flagged RECORD_EXPIRED when not (bytes
+// already encoded in NimBLE's read queue). Returns the new length, 0 if
+// [payload] is not a batch; [expired] gets how many records expired.
+size_t deliverBatch(uint8_t* payload, size_t len, uint32_t nowMs, bool canShrink, uint32_t& expired);
+
+// Where a batch's payload sits inside an encoded FromRadio, so a pre-encoded
+// batch can be readied in place when it is read. -1 if it is not there.
+int findPayload(const uint8_t* fromRadio, size_t len, const uint8_t* payload, size_t payloadLen);
+
+// ---- Writes the radio dropped ------------------------------------------------
+
+// The packet id inside a ToRadio { packet } write: field 1, then the
+// MeshPacket's fixed32 field 6. False for anything else (want_config...).
+bool toRadioPacketId(const uint8_t* toRadio, size_t len, uint32_t& id);
+
+// Packet ids of phone writes the radio dropped, from NimBLE's task to the
+// main one (core-patches/0007). One producer, one consumer; a full ring drops
+// the newest id and counts it, since the aggregate counter still has it.
+class DroppedWriteIds {
+ public:
+  static const size_t SLOTS = 16;
+  void push(uint32_t id);
+  bool pop(uint32_t& id);
+  uint32_t overflowed() const { return overflowed_.load(); }
+
+ private:
+  uint32_t ids_[SLOTS] = {0};
+  std::atomic<uint32_t> head_{0};  // advanced by the consumer only
+  std::atomic<uint32_t> tail_{0};  // advanced by the producer only
+  std::atomic<uint32_t> overflowed_{0};
+};
+
+// {"wd":[id,...]}, the ids above for the phone. 0 if nothing fits.
+size_t formatDroppedWrites(const uint32_t* ids, size_t n, char* out, size_t cap);
 
 // ---- Phone hello ------------------------------------------------------------
 //
@@ -248,6 +304,7 @@ struct LinkStats {
   uint32_t coreReplaced = 0;    // MeshService queue, newest-wins (patch 0005)
   uint32_t coreDropped = 0;     // MeshService queue full, packet lost (patch 0005)
   uint32_t coreEvicted = 0;     // MeshService queue full, oldest position dropped for room (patch 0005)
+  uint32_t dropExpired = 0;     // records too old to deliver, at packing or at delivery
   uint32_t writeDropped = 0;    // phone writes lost after a good BLE write (patch 0007)
   uint32_t writeDuplicate = 0;  // identical consecutive writes discarded (patch 0007)
   uint32_t preloadOffered = 0;
@@ -269,7 +326,7 @@ size_t formatLaneStats(const LinkStats& s, char* out, size_t cap);
 // {"fq":[1, queue depth, depth max, store pending, oldest queued ms,
 //        drop store full, alloc, lost, disconnect, stale, core replaced,
 //        core dropped, write dropped, write duplicate, preload offered,
-//        preload read, preload refused, min free heap, core evicted]}
+//        preload read, preload refused, min free heap, core evicted, expired]}
 // Depth max is the high-water mark since the previous report.
 size_t formatQueueStats(const LinkStats& s, char* out, size_t cap);
 

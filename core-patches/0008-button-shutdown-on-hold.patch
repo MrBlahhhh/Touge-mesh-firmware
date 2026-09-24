@@ -159,7 +159,7 @@
 +#endif
 +
 +#ifndef BUTTON_SHUTDOWN_HOLD_MS
-+#define BUTTON_SHUTDOWN_HOLD_MS 3000
++#define BUTTON_SHUTDOWN_HOLD_MS 4000
 +#endif
 +
 +// A shutdown-on-hold press counts only if it starts this long after boot and after the button has been

@@ -40,7 +40,8 @@ void encodeRecord(const PhoneRecord& r, uint32_t nowMs, uint8_t* b) {
   // negative age, i.e. "just heard", so a genuinely old position must not say it.
   put16(b + 20, age <= 0 ? (uint16_t)0 : age > (int32_t)AGE_MAX ? AGE_MAX : (uint16_t)age);
   b[22] = (uint8_t)r.rssi;
-  b[23] = (uint8_t)((r.external ? 0x01 : 0) | ((r.lane & 0x03) << 1) | ((r.hopsAway & 0x0F) << 4));
+  b[23] = (uint8_t)((r.external ? 0x01 : 0) | ((r.lane & 0x03) << 1) | (r.expired ? RECORD_EXPIRED : 0) |
+                    ((r.hopsAway & 0x0F) << 4));
 }
 
 void decodeRecord(const uint8_t* b, uint32_t radioMs, PhoneRecord& r) {
@@ -55,6 +56,7 @@ void decodeRecord(const uint8_t* b, uint32_t radioMs, PhoneRecord& r) {
   r.external = (b[23] & 0x01) != 0;
   r.lane = (uint8_t)((b[23] >> 1) & 0x03);
   r.hopsAway = (uint8_t)(b[23] >> 4);
+  r.expired = (b[23] & RECORD_EXPIRED) != 0;
 }
 
 }  // namespace
@@ -105,6 +107,7 @@ bool decodeBatchHeader(const uint8_t* in, size_t len, BatchHeader& header) {
   header.count = (uint8_t)count;
   header.seq = get16(in + 6);
   header.radioMs = get32(in + 8);
+  header.flags = in[5];
   return true;
 }
 
@@ -193,8 +196,12 @@ size_t PhoneStore::takeBatch(uint8_t* out, size_t cap, uint16_t seq, uint32_t no
       if (next == nullptr || (int32_t)(s.queuedMs - next->queuedMs) < 0) next = &s;
     }
     if (next == nullptr) break;
-    batch[taken++] = next->record;
     next->used = false;
+    if ((int32_t)(nowMs - next->record.heardMs) > (int32_t)RECORD_EXPIRE_MS) {
+      expired_++;
+      continue;
+    }
+    batch[taken++] = next->record;
   }
   if (taken == 0) return 0;
   return encodeBatch(batch, taken, seq, nowMs, out, cap);
@@ -272,20 +279,148 @@ uint32_t BatchesInFlight::oldestAgeMs(uint32_t nowMs) const {
   return oldest;
 }
 
-bool restampBatch(uint8_t* payload, size_t len, uint32_t nowMs) {
+size_t deliverBatch(uint8_t* payload, size_t len, uint32_t nowMs, bool canShrink, uint32_t& expired) {
+  expired = 0;
   BatchHeader h;
-  if (!decodeBatchHeader(payload, len, h)) return false;
+  if (!decodeBatchHeader(payload, len, h)) return 0;
   const int32_t waited = (int32_t)(nowMs - h.radioMs);
   const uint32_t extra = waited > 0 ? (uint32_t)waited : 0;
   const size_t headerLen = payload[2];
   const size_t recordLen = payload[3];
+  size_t kept = 0;
   for (size_t i = 0; i < h.count; i++) {
-    uint8_t* age = payload + headerLen + i * recordLen + 20;
-    const uint32_t older = (uint32_t)get16(age) + extra;
-    put16(age, older > AGE_MAX ? AGE_MAX : (uint16_t)older);
+    uint8_t* rec = payload + headerLen + i * recordLen;
+    const uint32_t age = (uint32_t)get16(rec + 20) + extra;
+    if (age > RECORD_EXPIRE_MS || (rec[23] & RECORD_EXPIRED) != 0) {
+      expired++;
+      if (canShrink) continue;
+      rec[23] |= RECORD_EXPIRED;
+      put16(rec + 20, AGE_MAX);
+    } else {
+      put16(rec + 20, (uint16_t)age);
+    }
+    uint8_t* to = payload + headerLen + kept * recordLen;
+    if (to != rec) memmove(to, rec, recordLen);
+    kept++;
   }
+  payload[4] = (uint8_t)kept;
+  payload[5] |= BATCH_AGES_AT_DELIVERY;
   put32(payload + 8, h.radioMs + extra);
+  return headerLen + kept * recordLen;
+}
+
+int findPayload(const uint8_t* fromRadio, size_t len, const uint8_t* payload, size_t payloadLen) {
+  if (fromRadio == nullptr || payload == nullptr || payloadLen == 0 || payloadLen > len) return -1;
+  for (size_t at = 0; at + payloadLen <= len; at++)
+    if (memcmp(fromRadio + at, payload, payloadLen) == 0) return (int)at;
+  return -1;
+}
+
+// ---- Writes the radio dropped --------------------------------------------------------
+
+namespace {
+
+bool readVarint(const uint8_t* b, size_t len, size_t& at, uint64_t& v) {
+  v = 0;
+  for (int shift = 0; shift < 64 && at < len; shift += 7) {
+    const uint8_t byte = b[at++];
+    v |= (uint64_t)(byte & 0x7F) << shift;
+    if ((byte & 0x80) == 0) return true;
+  }
+  return false;
+}
+
+// Moves [at] past one field of [wire] type. False on anything malformed.
+bool skipField(const uint8_t* b, size_t len, size_t& at, uint32_t wire) {
+  uint64_t n = 0;
+  switch (wire) {
+    case 0:
+      return readVarint(b, len, at, n);
+    case 1:
+      at += 8;
+      return at <= len;
+    case 2:
+      if (!readVarint(b, len, at, n) || n > len - at) return false;
+      at += (size_t)n;
+      return true;
+    case 5:
+      at += 4;
+      return at <= len;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
+bool toRadioPacketId(const uint8_t* toRadio, size_t len, uint32_t& id) {
+  if (toRadio == nullptr) return false;
+  size_t at = 0;
+  while (at < len) {
+    uint64_t key = 0;
+    if (!readVarint(toRadio, len, at, key)) return false;
+    const uint32_t field = (uint32_t)(key >> 3);
+    const uint32_t wire = (uint32_t)(key & 7);
+    if (field != 1 || wire != 2) {
+      if (!skipField(toRadio, len, at, wire)) return false;
+      continue;
+    }
+    uint64_t packetLen = 0;
+    if (!readVarint(toRadio, len, at, packetLen) || packetLen > len - at) return false;
+    const uint8_t* p = toRadio + at;
+    const size_t plen = (size_t)packetLen;
+    size_t pat = 0;
+    while (pat < plen) {
+      uint64_t k = 0;
+      if (!readVarint(p, plen, pat, k)) return false;
+      if ((k >> 3) == 6 && (k & 7) == 5) {
+        if (pat + 4 > plen) return false;
+        // fixed32 is little-endian on the wire.
+        id = (uint32_t)p[pat] | ((uint32_t)p[pat + 1] << 8) | ((uint32_t)p[pat + 2] << 16) |
+             ((uint32_t)p[pat + 3] << 24);
+        return true;
+      }
+      if (!skipField(p, plen, pat, (uint32_t)(k & 7))) return false;
+    }
+    return false;
+  }
+  return false;
+}
+
+void DroppedWriteIds::push(uint32_t id) {
+  const uint32_t tail = tail_.load(std::memory_order_relaxed);
+  const uint32_t head = head_.load(std::memory_order_acquire);
+  if (tail - head >= SLOTS) {
+    overflowed_.fetch_add(1);
+    return;
+  }
+  ids_[tail % SLOTS] = id;
+  tail_.store(tail + 1, std::memory_order_release);
+}
+
+bool DroppedWriteIds::pop(uint32_t& id) {
+  const uint32_t head = head_.load(std::memory_order_relaxed);
+  const uint32_t tail = tail_.load(std::memory_order_acquire);
+  if (head == tail) return false;
+  id = ids_[head % SLOTS];
+  head_.store(head + 1, std::memory_order_release);
   return true;
+}
+
+size_t formatDroppedWrites(const uint32_t* ids, size_t n, char* out, size_t cap) {
+  if (out == nullptr || cap == 0 || n == 0 || ids == nullptr) return 0;
+  size_t at = 0;
+  int w = snprintf(out, cap, "{\"wd\":[");
+  if (w <= 0 || (size_t)w >= cap) return 0;
+  at = (size_t)w;
+  for (size_t i = 0; i < n; i++) {
+    w = snprintf(out + at, cap - at, i == 0 ? "%lu" : ",%lu", (unsigned long)ids[i]);
+    if (w <= 0 || (size_t)w >= cap - at) return 0;
+    at += (size_t)w;
+  }
+  w = snprintf(out + at, cap - at, "]}");
+  if (w <= 0 || (size_t)w >= cap - at) return 0;
+  return at + (size_t)w;
 }
 
 // ---- Hello -------------------------------------------------------------------------
@@ -323,14 +458,14 @@ size_t formatLaneStats(const LinkStats& s, char* out, size_t cap) {
 size_t formatQueueStats(const LinkStats& s, char* out, size_t cap) {
   if (out == nullptr || cap == 0) return 0;
   int n = snprintf(out, cap,
-                   "{\"fq\":[1,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu]}",
+                   "{\"fq\":[1,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu]}",
                    (unsigned)s.queueDepth, (unsigned)s.queueDepthMax, (unsigned)s.storePending,
                    (unsigned long)s.oldestQueuedMs, (unsigned long)s.dropStoreFull, (unsigned long)s.dropAlloc,
                    (unsigned long)s.dropLost, (unsigned long)s.dropDisconnect, (unsigned long)s.dropStale,
                    (unsigned long)s.coreReplaced, (unsigned long)s.coreDropped, (unsigned long)s.writeDropped,
                    (unsigned long)s.writeDuplicate, (unsigned long)s.preloadOffered,
                    (unsigned long)s.preloadRead, (unsigned long)s.preloadRefused, (unsigned long)s.minFreeHeap,
-                   (unsigned long)s.coreEvicted);
+                   (unsigned long)s.coreEvicted, (unsigned long)s.dropExpired);
   if (n <= 0 || (size_t)n >= cap) return 0;
   return (size_t)n;
 }
@@ -355,7 +490,8 @@ size_t formatBaseline(const LinkStats& now, const LinkStats& before, uint32_t wi
   const unsigned long bq = perSecX10(now.batches, before.batches, windowMs);
   const uint32_t drops = (now.dropStoreFull - before.dropStoreFull) + (now.dropAlloc - before.dropAlloc) +
                          (now.dropLost - before.dropLost) + (now.dropDisconnect - before.dropDisconnect) +
-                         (now.coreDropped - before.coreDropped) + (now.coreEvicted - before.coreEvicted);
+                         (now.coreDropped - before.coreDropped) + (now.coreEvicted - before.coreEvicted) +
+                         (now.dropExpired - before.dropExpired);
   int n = snprintf(out, cap,
                    "BASELINE radio fast tx=%lu.%lu rx=%lu.%lu queued=%lu.%lu delivered=%lu.%lu/s "
                    "lora rx=%lu.%lu delivered=%lu.%lu/s batches=%lu.%lu/s depth=%u max=%u pending=%u "

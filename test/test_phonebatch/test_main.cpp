@@ -326,26 +326,136 @@ void test_in_flight_batches_are_bounded_and_never_time_out() {
   TEST_ASSERT_EQUAL(0, f.count());
 }
 
-void test_restamping_adds_the_queue_wait_to_every_age() {
+void test_delivery_adds_the_queue_wait_to_every_age() {
   PhoneRecord in[2] = {car(1, 1, 900), car(2, 1, 1000)};
   uint8_t buf[BATCH_MAX_PAYLOAD];
   size_t n = encodeBatch(in, 2, 7, 1000, buf, sizeof(buf));
-  TEST_ASSERT_TRUE(restampBatch(buf, n, 6000));
+  uint32_t expired = 99;
+  TEST_ASSERT_EQUAL(n, deliverBatch(buf, n, 6000, true, expired));
+  TEST_ASSERT_EQUAL(0, expired);
   BatchHeader h;
   PhoneRecord out[2];
   TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 2));
   TEST_ASSERT_EQUAL(6000, h.radioMs);
   TEST_ASSERT_EQUAL(7, h.seq);
-  // Ages are now 5.1 s and 5 s: heard at 900 and 1000 whatever the header says.
+  TEST_ASSERT_TRUE((h.flags & BATCH_AGES_AT_DELIVERY) != 0);
+  // Ages are now 5.1 s and 5 s: heard at 900 and 1000.
   TEST_ASSERT_EQUAL(900, out[0].heardMs);
   TEST_ASSERT_EQUAL(1000, out[1].heardMs);
-  // Long waits saturate one short of 0xFFFF, which the app reads as "just heard".
-  TEST_ASSERT_TRUE(restampBatch(buf, n, 200000));
-  TEST_ASSERT_EQUAL_HEX8(0xFF, buf[BATCH_HEADER + 20]);
-  TEST_ASSERT_EQUAL_HEX8(0xFE, buf[BATCH_HEADER + 21]);
   // Not a batch: untouched.
   uint8_t json[] = "{\"fl\":{}}";
-  TEST_ASSERT_FALSE(restampBatch(json, sizeof(json) - 1, 5));
+  TEST_ASSERT_EQUAL(0, deliverBatch(json, sizeof(json) - 1, 5, true, expired));
+}
+
+// The review case: the first batch after a connect is pre-encoded and the phone
+// does not read it for 5 s. It is readied as it is read, so it says 5 s.
+void test_a_pre_encoded_batch_read_5_s_late_says_so() {
+  PhoneRecord in[1] = {car(1, 1, 950)};
+  uint8_t buf[BATCH_MAX_PAYLOAD];
+  size_t n = encodeBatch(in, 1, 1, 1000, buf, sizeof(buf));
+  uint32_t expired = 0;
+  // Pre-encoded: readied in place, never shorter.
+  TEST_ASSERT_EQUAL(n, deliverBatch(buf, n, 6010, false, expired));
+  BatchHeader h;
+  PhoneRecord out[1];
+  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 1));
+  TEST_ASSERT_TRUE((h.flags & BATCH_AGES_AT_DELIVERY) != 0);
+  // What the phone computes: arrival minus age.
+  TEST_ASSERT_EQUAL(5060, h.radioMs - out[0].heardMs);
+  TEST_ASSERT_EQUAL(950, out[0].heardMs);
+}
+
+// The review case: a batch queued across a disconnect and read ten minutes
+// later. Every record is past RECORD_EXPIRE_MS: taken out of a queued batch,
+// flagged in a pre-encoded one. No age is capped into looking recent.
+void test_a_batch_ten_minutes_old_carries_no_position() {
+  PhoneRecord in[2] = {car(1, 1, 0), car(2, 1, 0)};
+  uint8_t queued[BATCH_MAX_PAYLOAD];
+  size_t n = encodeBatch(in, 2, 3, 0, queued, sizeof(queued));
+  uint32_t expired = 0;
+  const size_t left = deliverBatch(queued, n, 600000, true, expired);
+  TEST_ASSERT_EQUAL(2, expired);
+  TEST_ASSERT_EQUAL(BATCH_HEADER, left);
+  BatchHeader h;
+  PhoneRecord out[2];
+  TEST_ASSERT_TRUE(decodeBatch(queued, left, h, out, 2));
+  TEST_ASSERT_EQUAL(0, h.count);
+  TEST_ASSERT_EQUAL(3, h.seq);  // still accounts as delivered
+
+  uint8_t preloaded[BATCH_MAX_PAYLOAD];
+  n = encodeBatch(in, 2, 4, 0, preloaded, sizeof(preloaded));
+  TEST_ASSERT_EQUAL(n, deliverBatch(preloaded, n, 600000, false, expired));
+  TEST_ASSERT_EQUAL(2, expired);
+  TEST_ASSERT_TRUE(decodeBatch(preloaded, n, h, out, 2));
+  TEST_ASSERT_TRUE(out[0].expired);
+  TEST_ASSERT_TRUE(out[1].expired);
+
+  // Just inside the limit is still a position, with its exact age.
+  n = encodeBatch(in, 2, 5, 0, queued, sizeof(queued));
+  TEST_ASSERT_EQUAL(n, deliverBatch(queued, n, RECORD_EXPIRE_MS, true, expired));
+  TEST_ASSERT_EQUAL(0, expired);
+}
+
+// A car gone quiet while the phone stalled: its record is too old to pack.
+void test_the_store_drops_a_record_too_old_to_pack() {
+  PhoneStore s;
+  s.clear();
+  s.offer(car(1, 1, 0), 0);
+  s.offer(car(2, 1, 60500), 60500);
+  uint8_t buf[BATCH_MAX_PAYLOAD];
+  size_t taken = 0;
+  size_t n = s.takeBatch(buf, sizeof(buf), 1, 61000, taken);
+  TEST_ASSERT_EQUAL(1, taken);
+  TEST_ASSERT_EQUAL(1, s.expired());
+  BatchHeader h;
+  PhoneRecord out[1];
+  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 1));
+  TEST_ASSERT_EQUAL_HEX32(2, out[0].node);
+}
+
+// A pre-encoded batch is found inside its FromRadio so it can be readied there.
+void test_the_payload_is_found_inside_an_encoded_packet() {
+  PhoneRecord in[1] = {car(1, 1, 0)};
+  uint8_t payload[BATCH_MAX_PAYLOAD];
+  size_t n = encodeBatch(in, 1, 1, 0, payload, sizeof(payload));
+  uint8_t fromRadio[300] = {0x12, 0x40, 0x0d, 1, 2, 3, 4};
+  memcpy(fromRadio + 20, payload, n);
+  TEST_ASSERT_EQUAL(20, findPayload(fromRadio, 20 + n + 5, payload, n));
+  TEST_ASSERT_EQUAL(-1, findPayload(fromRadio, 20 + n - 1, payload, n));
+}
+
+// A ToRadio { packet { to, decoded { port, payload }, id, hop_limit } } as the
+// app writes one, and a want_config, which has no packet id.
+void test_the_packet_id_is_read_out_of_a_dropped_write() {
+  const uint8_t write[] = {0x0A, 0x14,                                          // ToRadio.packet, 20 bytes
+                           0x15, 0x11, 0x22, 0x33, 0x44,                        // to
+                           0x22, 0x06, 0x08, 0x03, 0x12, 0x02, 0xAA, 0xBB,      // decoded
+                           0x35, 0xEF, 0xBE, 0xAD, 0x7E,                        // id, little-endian
+                           0x48, 0x00};                                         // hop_limit
+  uint32_t id = 0;
+  TEST_ASSERT_TRUE(toRadioPacketId(write, sizeof(write), id));
+  TEST_ASSERT_EQUAL_HEX32(0x7EADBEEF, id);
+  const uint8_t wantConfig[] = {0x18, 0x05};
+  TEST_ASSERT_FALSE(toRadioPacketId(wantConfig, sizeof(wantConfig), id));
+  // Cut short: refused, not read past the end.
+  TEST_ASSERT_FALSE(toRadioPacketId(write, 16, id));
+}
+
+void test_dropped_write_ids_pass_between_tasks_in_order() {
+  static DroppedWriteIds ids;
+  for (uint32_t i = 1; i <= DroppedWriteIds::SLOTS + 2; i++) ids.push(i);
+  TEST_ASSERT_EQUAL(2, ids.overflowed());
+  uint32_t id = 0;
+  for (uint32_t i = 1; i <= DroppedWriteIds::SLOTS; i++) {
+    TEST_ASSERT_TRUE(ids.pop(id));
+    TEST_ASSERT_EQUAL(i, id);
+  }
+  TEST_ASSERT_FALSE(ids.pop(id));
+  const uint32_t list[2] = {7, 0xFFFFFFFFu};
+  char buf[64];
+  TEST_ASSERT_TRUE(formatDroppedWrites(list, 2, buf, sizeof(buf)) > 0);
+  TEST_ASSERT_EQUAL_STRING("{\"wd\":[7,4294967295]}", buf);
+  TEST_ASSERT_EQUAL(0, formatDroppedWrites(list, 2, buf, 10));
 }
 
 // ---- Both firmware queues, stalls and reordering ------------------------------
@@ -505,13 +615,18 @@ StallResult simulateStalls(uint32_t cars, uint32_t stallEveryMs, uint32_t stallM
     if (preloadFull) {
       got = preloaded;
       preloadFull = false;
+      // Readied in place as NimBLE hands it over (core-patches/0007, build 35).
+      uint32_t expired = 0;
+      TEST_ASSERT_EQUAL(got.len, deliverBatch(got.bytes, got.len, now, false, expired));
       r.delivered += flight.preloadRead();
     } else if (queue.n > 0) {
       got = queue.q[0];
       queue.removeAt(0);
       if (got.kind == K_BATCH) {
-        // The delivered hook (core-patches/0006) restamps, then accounts.
-        TEST_ASSERT_TRUE(restampBatch(got.bytes, got.len, now));
+        // The delivered hook (core-patches/0006) readies it, then accounts.
+        uint32_t expired = 0;
+        got.len = deliverBatch(got.bytes, got.len, now, true, expired);
+        TEST_ASSERT_TRUE(got.len > 0);
         BatchHeader h;
         TEST_ASSERT_TRUE(decodeBatchHeader(got.bytes, got.len, h));
         r.delivered += flight.delivered(h.seq);
@@ -526,10 +641,11 @@ StallResult simulateStalls(uint32_t cars, uint32_t stallEveryMs, uint32_t stallM
     PhoneRecord out[BATCH_MAX_RECORDS];
     TEST_ASSERT_TRUE(decodeBatch(got.bytes, got.len, h, out, BATCH_MAX_RECORDS));
     for (size_t i = 0; i < h.count; i++) {
-      // Age across the queue. A queued batch was restamped as it left, so its
-      // clock is the read time; a pre-encoded one is at most one read old.
-      // Either way header time minus age is exactly when the radio heard it.
-      TEST_ASSERT_TRUE(now - h.radioMs <= readMs + 5 || preload);
+      // Age across the queue. Both paths are readied as the phone gets them,
+      // so the phone's "arrival minus age" is exactly when the radio heard it.
+      TEST_ASSERT_EQUAL(now, h.radioMs);
+      TEST_ASSERT_TRUE((h.flags & BATCH_AGES_AT_DELIVERY) != 0);
+      TEST_ASSERT_FALSE(out[i].expired);
       // Its beacon time, on the first 5 ms tick at or after it.
       const uint32_t beaconMs = (out[i].node - 1) * 1000 / cars + (out[i].frameId - 1) * 1000;
       const uint32_t trueHeardMs = (beaconMs + 4) / 5 * 5;
@@ -633,7 +749,7 @@ static LinkStats maxed() {
   s.lora.rx = s.lora.delivered = m;
   s.fastTxFail = s.batches = s.batchesRead = s.replaced = m;
   s.dropStoreFull = s.dropAlloc = s.dropLost = s.dropDisconnect = s.dropStale = m;
-  s.coreReplaced = s.coreDropped = s.coreEvicted = s.writeDropped = s.writeDuplicate = m;
+  s.coreReplaced = s.coreDropped = s.coreEvicted = s.dropExpired = s.writeDropped = s.writeDuplicate = m;
   s.preloadOffered = s.preloadRead = s.preloadRefused = s.minFreeHeap = s.oldestQueuedMs = m;
   s.queueDepth = s.queueDepthMax = s.storePending = 0xFFFF;
   return s;
@@ -683,8 +799,9 @@ void test_stats_format_as_the_app_reads_them() {
   q.preloadRefused = 12;
   q.minFreeHeap = 40000;
   q.coreEvicted = 13;
+  q.dropExpired = 14;
   formatQueueStats(q, buf, sizeof(buf));
-  TEST_ASSERT_EQUAL_STRING("{\"fq\":[1,3,31,2,140,1,2,3,4,5,6,7,8,9,10,11,12,40000,13]}", buf);
+  TEST_ASSERT_EQUAL_STRING("{\"fq\":[1,3,31,2,140,1,2,3,4,5,6,7,8,9,10,11,12,40000,13,14]}", buf);
 }
 
 void test_baseline_reports_rates_over_the_window() {
@@ -833,7 +950,13 @@ int main(int, char**) {
   RUN_TEST(test_the_longest_waiting_cars_go_first);
   RUN_TEST(test_a_full_store_evicts_the_longest_waiting);
   RUN_TEST(test_in_flight_batches_are_bounded_and_never_time_out);
-  RUN_TEST(test_restamping_adds_the_queue_wait_to_every_age);
+  RUN_TEST(test_delivery_adds_the_queue_wait_to_every_age);
+  RUN_TEST(test_a_pre_encoded_batch_read_5_s_late_says_so);
+  RUN_TEST(test_a_batch_ten_minutes_old_carries_no_position);
+  RUN_TEST(test_the_store_drops_a_record_too_old_to_pack);
+  RUN_TEST(test_the_payload_is_found_inside_an_encoded_packet);
+  RUN_TEST(test_the_packet_id_is_read_out_of_a_dropped_write);
+  RUN_TEST(test_dropped_write_ids_pass_between_tasks_in_order);
   RUN_TEST(test_stalls_through_both_queues_keep_two_batches_and_the_newest);
   RUN_TEST(test_stalls_with_the_pre_encoded_slot_reorder_and_the_phone_rejects);
   RUN_TEST(test_a_batch_the_full_queue_refuses_frees_its_place);

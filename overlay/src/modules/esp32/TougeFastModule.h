@@ -161,7 +161,11 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     bool handPhoneBatch(const uint8_t *payload, size_t len, uint32_t &packetId, bool &preloaded);
     // Once a tick: queue depth, a phone that went away, batches read or discarded.
     void trackPhoneLink(uint32_t nowMs);
-    void notePhoneRead(uint16_t seq);
+    // A batch the phone read: [records] from its in-flight entry, [expired] of
+    // them held too long to deliver as positions.
+    void notePhoneRead(uint8_t records, uint32_t expired);
+    // Sends the phone the ids of its writes the radio dropped (core-patches/0007).
+    void reportDroppedWrites();
     void reportLinkStats(uint32_t nowMs, uint32_t windowMs);
     void queueJsonToPhone(const char *json, size_t len);
     // Not const: a batch is restamped on its way out (core-patches/0006).
@@ -179,6 +183,8 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // NimBLE counters last seen, to notice the pre-encoded batch being read or lost.
     uint32_t preloadReadSeen_ = 0;
     uint32_t preloadLostSeen_ = 0;
+    uint32_t preloadExpiredSeen_ = 0;
+    uint32_t storeExpiredSeen_ = 0;
 };
 
 extern TougeFastModule *tougeFastModule;
