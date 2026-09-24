@@ -763,7 +763,7 @@ void test_the_position_carries_the_lease_and_the_reference() {
   p.refLocked = true;
   p.clockLocked = true;
 
-  uint8_t wire[64];
+  uint8_t wire[POSITION_MIN];
   size_t n = encodePosition(p, wire, sizeof(wire));
   TEST_ASSERT_EQUAL_UINT32(POSITION_MIN, n);
   Position got{};
@@ -801,6 +801,9 @@ void test_a_version_1_frame_is_refused() {
   Frame got;
   TEST_ASSERT_TRUE(decodeFrame(wire, n, got));
   wire[1] = (uint8_t)((1 << 4) | FRAME_POSITION);
+  TEST_ASSERT_FALSE(decodeFrame(wire, n, got));
+  // Nor a build 30-37 one, whose position has no fix identity.
+  wire[1] = (uint8_t)((2 << 4) | FRAME_POSITION);
   TEST_ASSERT_FALSE(decodeFrame(wire, n, got));
 }
 

@@ -180,7 +180,10 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     dedupe and phone tables to a full ride, keeps 16 phone-queue slots (core-patches/0009),
 //     and drops the lane if it leaves BLE under LANE_HEAP_FLOOR; a "touge: heap" line every
 //     status cycle; no "fl" reports queue up while no phone is connected.
-const uint32_t TOUGE_BUILD = 37;
+// 38: every position carries its fix identity (session per boot, fix sequence, measured time)
+//     on both lanes: frame v3, batch v2 with 32-byte records, and the phone's LoRa position
+//     sent as the radio's own latest fix in sensor_id/seq_number/timestamp(+ms).
+const uint32_t TOUGE_BUILD = 38;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -535,50 +538,23 @@ void TougeFastModule::beacon(uint32_t nowMs)
 
     // No fix means nothing worth sending. The other cars keep the last one they
     // heard and show it as ageing, which is more useful than a zero.
-    if (!localPosition.has_latitude_i || !localPosition.has_longitude_i) return;
-    if (localPosition.latitude_i == 0 && localPosition.longitude_i == 0) return;
+    if (!ownFix_.has()) return;
+    const Fix &fix = ownFix_.fix();
 
-    // Two separate questions, deliberately. First: is there anything worth
-    // saying? Then: is it our turn to say it? Collapsing them would either
-    // give up the slot discipline or let a parked car hold one open.
-    // Nothing to say if nobody has told us anything lately.
+    // Two separate questions: is there anything worth saying, and is it our
+    // turn to say it? Collapsing them would either give up the slot discipline
+    // or let a parked car hold one open.
     //
-    // A board keeps beaconing whatever localPosition last held, so a radio
-    // left switched on after its phone walked away broadcast a frozen fix at
-    // 1 Hz indefinitely - and because a fast position outranks the LoRa one,
-    // everyone else pinned that car to a place it had left. Seen tonight: a
-    // rider who had closed the app, left the ride and turned her LoRa off was
-    // still on the map, because her board was still talking.
-    //
-    // The position carries the time it was measured. If that has stopped
-    // advancing, we have nothing new to say and should say nothing, which also
-    // lets the far end fall back to LoRa after FAST_PRECEDENCE_MS rather than
-    // preferring our stale copy forever.
-    // The staleness mute is gone, and the age is reported instead.
-    //
-    // It silenced a board whose phone was connected and exchanging normally:
-    // every status report from that radio read MUTED(stale fix) while the
-    // other board heard nothing from it, and the whole lane was down because
-    // of a guard meant to protect it. localPosition.time evidently does not
-    // advance the way this assumed.
-    //
-    // A board with no phone beaconing a frozen fix is a real problem and this
-    // is not the way to detect it. The age goes into the status report so the
-    // right signal can be chosen from evidence rather than from another guess.
-    uint32_t nowSec = getValidTime(RTCQualityFromNet);
-    uint32_t fixAge = (nowSec > 0 && localPosition.time > 0 && nowSec > localPosition.time)
-                          ? nowSec - localPosition.time
-                          : 0;
-    (void)fixAge;
+    // A board left on after its phone walked away still beacons its last fix.
+    // A mute on a stale fix time was tried and silenced a board whose phone was
+    // connected, so the fix age goes in the status report ("fix") instead.
 
     // Extra beacons use free slots of our row, never the lease slot, so the two
     // never compete for the same tick.
     if (sendExtraBeacon(nowMs)) return;
 
     if (!wantBeacon_) {
-        uint32_t moved = sentOnce_ ? distanceM(sentLat_, sentLon_, localPosition.latitude_i,
-                                               localPosition.longitude_i)
-                                   : GATE_METRES;
+        uint32_t moved = sentOnce_ ? distanceM(sentLat_, sentLon_, fix.lat, fix.lon) : GATE_METRES;
         // Time trigger on a fixed 1 s grid, not GATE_IDLE_MS after the last
         // actual send. The send waits for our TDMA slot, up to a cycle, and
         // measuring the next interval from the send folded that wait into every
@@ -632,8 +608,8 @@ void TougeFastModule::beacon(uint32_t nowMs)
     // run of them left a car that stopped silent for several seconds.
     if (nextBeaconMs_ == 0) nextBeaconMs_ = nowMs;
     nextBeaconMs_ = nextOnGrid(nextBeaconMs_, GATE_IDLE_MS, nowMs);
-    sentLat_ = localPosition.latitude_i;
-    sentLon_ = localPosition.longitude_i;
+    sentLat_ = fix.lat;
+    sentLon_ = fix.lon;
     sentOnce_ = true;
 
     Position p;
@@ -666,7 +642,8 @@ bool TougeFastModule::sendExtraBeacon(uint32_t nowMs)
     // gives one fix a second, has nothing new between lease beacons, and a
     // repeat is airtime for nothing.
     if (!sentOnce_) return false;
-    if (localPosition.latitude_i == sentLat_ && localPosition.longitude_i == sentLon_) return false;
+    const Fix &fix = ownFix_.fix();
+    if (fix.lat == sentLat_ && fix.lon == sentLon_) return false;
     // Extras sit 250 ms apart in the row; this only stops a second send in the
     // same slot on the next tick.
     if ((uint32_t)(nowMs - lastBeaconMs_) < EXTRA_MIN_GAP_MS) return false;
@@ -681,8 +658,8 @@ bool TougeFastModule::sendExtraBeacon(uint32_t nowMs)
     if (!mine) return false;
 
     lastBeaconMs_ = nowMs;
-    sentLat_ = localPosition.latitude_i;
-    sentLon_ = localPosition.longitude_i;
+    sentLat_ = fix.lat;
+    sentLon_ = fix.lon;
 
     Position p;
     fillBeacon(p, nowMs);
@@ -698,25 +675,21 @@ bool TougeFastModule::sendExtraBeacon(uint32_t nowMs)
 
 void TougeFastModule::fillBeacon(Position &p, uint32_t nowMs)
 {
-    p.lat = localPosition.latitude_i;
-    p.lon = localPosition.longitude_i;
+    const Fix &fix = ownFix_.fix();
+    p.lat = fix.lat;
+    p.lon = fix.lon;
+    // The same fix, under the same name, as our LoRa position (ownLoraPosition).
+    p.fix = ownFix_.id();
     // Meshtastic's units, whoever wrote the fix: ground_track is degrees x 1e5
     // (GPS.cpp) and ground_speed whole km/h (the proto comment, and GPS.cpp via
     // TinyGPS kmph()). From build 29 the app sends the same, so one conversion
     // covers the phone's LOC_EXTERNAL fix and the board's own receiver.
-    p.headingDeg = (uint16_t)(localPosition.ground_track / 100000);
-    p.speedMph = speedToMph((float)localPosition.ground_speed / 3.6f);
+    p.headingDeg = (uint16_t)(fix.trackE5 / 100000);
+    p.speedMph = speedToMph((float)fix.speedKmh / 3.6f);
     p.hasFix = true;
-    // Whose fix this is, honestly.
-    //
-    // Hardcoded false, while inject() on the far end stamped every arriving
-    // 2.4 GHz position as LOC_EXTERNAL - so a board beaconing its own GPS, or
-    // a position frozen because the phone stopped feeding it, arrived
-    // everywhere claiming to be a phone fix. The app ranks a phone fix above a
-    // radio's own, so the worse position won and held for the whole precedence
-    // window with the LoRa copy suppressed behind it.
-    p.phoneAttached =
-        localPosition.location_source == meshtastic_Position_LocSource_LOC_EXTERNAL;
+    // Whose fix this is, honestly: the app ranks a phone fix above a radio's
+    // own, so a board's GNSS fix must not arrive claiming to be the phone's.
+    p.phoneAttached = fix.external;
     // Tells everyone else whether we are fit to be the reference car.
     p.clockLocked = rideClock.locked((uint64_t)esp_timer_get_time());
     // Our lease, so everyone else stays off it, and the generations that
@@ -765,6 +738,87 @@ meshtastic_Position TougeFastModule::asMeshPosition(const Position &p)
                                          : meshtastic_Position_LocSource_LOC_INTERNAL;
     mp.time = getValidTime(RTCQualityFromNet);
     return mp;
+}
+
+// ---- Our own fix and its identity (SCALE-PLAN 5a) ----------------------------
+
+Fix TougeFastModule::fixOf(const meshtastic_Position &pos)
+{
+    Fix fix;
+    if (pos.has_latitude_i && pos.has_longitude_i) {
+        fix.lat = pos.latitude_i;
+        fix.lon = pos.longitude_i;
+    }
+    fix.trackE5 = pos.ground_track;
+    fix.speedKmh = pos.ground_speed;
+    fix.external = pos.location_source == meshtastic_Position_LocSource_LOC_EXTERNAL;
+    setMeasured(fix, pos.timestamp, pos.timestamp_millis_adjust, pos.time);
+    return fix;
+}
+
+void TougeFastModule::noteOwnFix()
+{
+    // localPosition is where the phone's fix lands (PositionModule, from its
+    // local write) and the board's own GNSS fix too (MeshService::onGPSChanged).
+    // The session is drawn on the first fix, long after boot, when the RNG has
+    // the radio's entropy behind it.
+    ownFix_.observe(fixOf(localPosition), esp_random() ^ (uint32_t)esp_timer_get_time());
+}
+
+meshtastic_Position TougeFastModule::ownLoraPosition() const
+{
+    const Fix &fix = ownFix_.fix();
+    const FixId id = ownFix_.id();
+    meshtastic_Position pos = meshtastic_Position_init_default;
+    pos.latitude_i = fix.lat;
+    pos.has_latitude_i = true;
+    pos.longitude_i = fix.lon;
+    pos.has_longitude_i = true;
+    pos.ground_track = fix.trackE5;
+    pos.has_ground_track = true;
+    pos.ground_speed = fix.speedKmh;
+    pos.has_ground_speed = true;
+    pos.location_source = fix.external ? meshtastic_Position_LocSource_LOC_EXTERNAL
+                                       : meshtastic_Position_LocSource_LOC_INTERNAL;
+    // The identity the 2.4 GHz beacon carries (FixId), in Meshtastic's own
+    // fields so relays keep it. time repeats the fix second as the phone's
+    // write always has, since the radio sets its clock from it (PositionModule).
+    pos.sensor_id = id.session;
+    pos.seq_number = id.seq;
+    pos.timestamp = id.fixSec;
+    pos.timestamp_millis_adjust = id.fixMs;
+    pos.time = id.fixSec;
+    return pos;
+}
+
+void TougeFastModule::alterReceived(meshtastic_MeshPacket &mp)
+{
+    // Our phone's LoRa position on its way to the air: Router::sendLocal runs
+    // the modules on a broadcast before sending it, and this module runs ahead
+    // of PositionModule (apply-overlay.sh). It goes out as our latest fix under
+    // the same identity as the 2.4 GHz beacon. 5b moves the send itself into
+    // the firmware, and this goes with the phone's write.
+    if (mp.which_payload_variant != meshtastic_MeshPacket_decoded_tag) return;
+    if (mp.decoded.portnum != meshtastic_PortNum_POSITION_APP) return;
+    if (!isFromUs(&mp) || isToUs(&mp)) return;
+
+    meshtastic_Position sent = meshtastic_Position_init_default;
+    if (!pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_Position_msg, &sent)) return;
+    noteOwnFix();
+    // Usually the fix its local write already gave us, or an older one queued
+    // behind it. Newer only if that write was lost or has not landed yet.
+    const Fix phoneFix = fixOf(sent);
+    if (!ownFix_.has() || measuredAfter(phoneFix, ownFix_.fix())) {
+        ownFix_.observe(phoneFix, esp_random() ^ (uint32_t)esp_timer_get_time());
+    }
+    if (!ownFix_.has()) return;
+
+    const meshtastic_Position own = ownLoraPosition();
+    uint8_t encoded[meshtastic_Constants_DATA_PAYLOAD_LEN];
+    const size_t n = pb_encode_to_bytes(encoded, sizeof(encoded), &meshtastic_Position_msg, &own);
+    if (n == 0) return;
+    memcpy(mp.decoded.payload.bytes, encoded, n);
+    mp.decoded.payload.size = (pb_size_t)n;
 }
 
 void TougeFastModule::reassertFastPositions()
@@ -1085,6 +1139,8 @@ bool bleSettled(uint32_t now)
 int32_t TougeFastModule::runOnce()
 {
     if (nodeId_ == 0) nodeId_ = nodeDB->getNodeNum();
+    // Every pass, lane up or not: the LoRa position carries the identity too.
+    noteOwnFix();
 
     uint32_t now = millis();
 
@@ -1553,7 +1609,7 @@ PhoneRecord TougeFastModule::phoneRecordFor(const Frame &f, const Position &p, i
     r.node = f.src;
     r.lat = p.lat;
     r.lon = p.lon;
-    r.frameId = f.id;
+    r.fix = p.fix;
     r.headingCdeg = (uint16_t)((p.headingDeg % 360) * 100);
     r.speedDkmh = (uint16_t)(p.speedMph * 16.09344f + 0.5f);
     r.rssi = rssi;

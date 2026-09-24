@@ -111,24 +111,39 @@ packet on the same port, over the BLE link it already has open.
 
 ## What is on the wire
 
-A position is 26 bytes: a 14-byte header and a 12-byte body. Meshtastic's is
-about 55 once the protobuf envelope is counted.
+A position frame is 89 bytes: a 14-byte header, a 67-byte body and an 8-byte
+tag, plus the name every 30 s. Frame version 3, from build 38; boards on
+another version drop it.
 
 ```
-header  0     magic 'T'
-        1     version | type
-        2..5  sender (Meshtastic node number, so both radios agree on identity)
-        6..9  packet id
-        10    hops remaining
-        11    channel byte, a cheap reject for another group's traffic
-        12,13 payload length
-body    0..7  lat, lon as int32 at 1e7
-        8     heading, two-degree steps
-        9     speed, mph
-        10    battery percent
-        11    flags
-        12..  name, sent every 30 s rather than every ping
+header  0      magic 'T'
+        1      version | type
+        2..5   sender (Meshtastic node number, so both radios agree on identity)
+        6..9   packet id
+        10     hops remaining
+        11     channel byte, a cheap reject for another group's traffic
+        12,13  payload length
+body    0..7   lat, lon as int32 at 1e7
+        8      heading, two-degree steps
+        9      speed, mph
+        10     battery percent
+        11     flags: fix, phone's fix, GPS-locked clock, extra beacon
+        12     channel belief (hop index and generation)
+        13..17 reference car, its hops and whether it is GPS-locked
+        18     leased slot
+        19..22 lease and schedule generations
+        23..54 slot map: who was heard in each of the 32 slots
+        55..66 fix identity: session (2), sequence (4), fix seconds (4), fix ms (2)
+        67..   name, sent every 30 s rather than every ping
 ```
+
+The fix identity (SCALE-PLAN step 5a) names each of a car's fixes once, on
+the radio whose car it is: a session drawn at random per boot, a sequence that
+counts up with every new fix, and when the fix was measured. Relays forward the
+frame untouched. The car's LoRa position carries the same values in
+Meshtastic's `sensor_id`, `seq_number`, `timestamp` and
+`timestamp_millis_adjust`, so the phone knows a fix heard on both lanes is one
+fix, and an older one arriving late is older (`rankFix` in `touge/frame.h`).
 
 The payload is AES-256-CTR under a key derived from the channel PSK. The packet
 id is half the nonce, which is why it is 32 bits and why the counter is kept in

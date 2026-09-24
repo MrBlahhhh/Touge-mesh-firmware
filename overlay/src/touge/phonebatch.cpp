@@ -28,32 +28,39 @@ void encodeRecord(const PhoneRecord& r, uint32_t nowMs, uint8_t* b) {
   put32(b + 0, r.node);
   put32(b + 4, (uint32_t)r.lat);
   put32(b + 8, (uint32_t)r.lon);
-  put32(b + 12, r.frameId);
-  put16(b + 16, r.headingCdeg);
-  put16(b + 18, r.speedDkmh);
+  put16(b + 12, r.fix.session);
+  put32(b + 14, r.fix.seq);
+  put32(b + 18, r.fix.fixSec);
+  put16(b + 22, r.fix.fixMs);
+  put16(b + 24, r.headingCdeg);
+  put16(b + 26, r.speedDkmh);
   // Signed: nowMs is the loop's timestamp, taken before a receive callback in
   // the same pass can stamp heardMs a few ms later, so an age can be slightly
   // negative. A plain clamp: records past RECORD_EXPIRE_MS never get here.
   const int32_t age = (int32_t)(nowMs - r.heardMs);
-  put16(b + 20, age <= 0 ? (uint16_t)0 : age > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)age);
-  b[22] = (uint8_t)r.rssi;
-  b[23] = (uint8_t)((r.external ? 0x01 : 0) | ((r.lane & 0x03) << 1) | (r.expired ? RECORD_EXPIRED : 0) |
-                    ((r.hopsAway & 0x0F) << 4));
+  put16(b + RECORD_AGE_AT, age <= 0 ? (uint16_t)0 : age > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)age);
+  b[30] = (uint8_t)r.rssi;
+  b[RECORD_FLAGS_AT] = (uint8_t)((r.external ? 0x01 : 0) | ((r.lane & 0x03) << 1) |
+                                 (r.expired ? RECORD_EXPIRED : 0) | ((r.hopsAway & 0x0F) << 4));
 }
 
 void decodeRecord(const uint8_t* b, uint32_t radioMs, PhoneRecord& r) {
   r.node = get32(b + 0);
   r.lat = (int32_t)get32(b + 4);
   r.lon = (int32_t)get32(b + 8);
-  r.frameId = get32(b + 12);
-  r.headingCdeg = get16(b + 16);
-  r.speedDkmh = get16(b + 18);
-  r.heardMs = radioMs - get16(b + 20);
-  r.rssi = (int8_t)b[22];
-  r.external = (b[23] & 0x01) != 0;
-  r.lane = (uint8_t)((b[23] >> 1) & 0x03);
-  r.hopsAway = (uint8_t)(b[23] >> 4);
-  r.expired = (b[23] & RECORD_EXPIRED) != 0;
+  r.fix.session = get16(b + 12);
+  r.fix.seq = get32(b + 14);
+  r.fix.fixSec = get32(b + 18);
+  r.fix.fixMs = get16(b + 22);
+  r.headingCdeg = get16(b + 24);
+  r.speedDkmh = get16(b + 26);
+  r.heardMs = radioMs - get16(b + RECORD_AGE_AT);
+  r.rssi = (int8_t)b[30];
+  const uint8_t flags = b[RECORD_FLAGS_AT];
+  r.external = (flags & 0x01) != 0;
+  r.lane = (uint8_t)((flags >> 1) & 0x03);
+  r.hopsAway = (uint8_t)(flags >> 4);
+  r.expired = (flags & RECORD_EXPIRED) != 0;
 }
 
 }  // namespace
@@ -97,7 +104,7 @@ bool decodeBatchHeader(const uint8_t* in, size_t len, BatchHeader& header) {
   const size_t headerLen = in[2];
   const size_t recordLen = in[3];
   const size_t count = in[4];
-  // Shorter than version 1 means fields we rely on are missing.
+  // Shorter than this version means fields we rely on are missing.
   if (headerLen < BATCH_HEADER || recordLen < BATCH_RECORD) return false;
   if (headerLen + count * recordLen != len) return false;
   header.version = in[1];
@@ -135,10 +142,10 @@ PhoneStore::Offer PhoneStore::offer(const PhoneRecord& r, uint32_t nowMs) {
       continue;
     }
     if (s.record.node == r.node) {
-      // A relayed copy of an older frame can land after the direct copy of a
-      // newer one. Frame ids count up per sender, so the signed difference
-      // says which is newer across the wrap.
-      if ((int32_t)(r.frameId - s.record.frameId) < 0) return STALE;
+      // A relayed copy of an older fix can land after the direct copy of a
+      // newer one. The same fix heard again replaces it: same position, fresher
+      // heard time and signal.
+      if (rankFix(r.fix, s.record.fix) == FixRank::OLDER) return STALE;
       s.record = r;
       return REPLACED;
     }
@@ -287,14 +294,14 @@ size_t deliverBatch(uint8_t* payload, size_t len, uint32_t nowMs, bool canShrink
   size_t kept = 0;
   for (size_t i = 0; i < h.count; i++) {
     uint8_t* rec = payload + headerLen + i * recordLen;
-    const uint32_t age = (uint32_t)get16(rec + 20) + extra;
-    if (age > RECORD_EXPIRE_MS || (rec[23] & RECORD_EXPIRED) != 0) {
+    const uint32_t age = (uint32_t)get16(rec + RECORD_AGE_AT) + extra;
+    if (age > RECORD_EXPIRE_MS || (rec[RECORD_FLAGS_AT] & RECORD_EXPIRED) != 0) {
       expired++;
       if (canShrink) continue;
-      rec[23] |= RECORD_EXPIRED;
-      put16(rec + 20, age > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)age);
+      rec[RECORD_FLAGS_AT] |= RECORD_EXPIRED;
+      put16(rec + RECORD_AGE_AT, age > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)age);
     } else {
-      put16(rec + 20, (uint16_t)age);
+      put16(rec + RECORD_AGE_AT, (uint16_t)age);
     }
     uint8_t* to = payload + headerLen + kept * recordLen;
     if (to != rec) memmove(to, rec, recordLen);

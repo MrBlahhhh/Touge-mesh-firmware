@@ -25,11 +25,10 @@ enum FrameType : uint8_t {
 };
 
 static const uint8_t FRAME_MAGIC = 0x54; // 'T', same as the app's VoicePacket
-// 2 from build 30: the position carries a whole-byte slot and two lease
-// generations for the 32-slot schedule. A version-1 board drops every
-// version-2 frame and the other way round, so a mixed ride only sees each
-// other over LoRa.
-static const uint8_t FRAME_VERSION = 2;
+// 2 from build 30: a whole-byte slot and two lease generations. 3 from build
+// 38: every position carries its fix identity (FixId). Boards on different
+// versions drop each other's frames; every radio is flashed together.
+static const uint8_t FRAME_VERSION = 3;
 static const size_t FRAME_HEADER = 14;
 
 // ESP-NOW tops out at 250 bytes and is the tightest of the two radios, so it
@@ -101,9 +100,40 @@ static const uint8_t SLOT_NONE = 0xFF;
 // One entry per slot in Position::slotMap. schedule.h asserts it matches.
 static const size_t SLOT_MAP_LEN = 32;
 
+// ---- Fix identity (SCALE-PLAN 5a) -------------------------------------------
+//
+// Which fix a position is. The radio whose car it is names each new fix once
+// (ownfix.h), and both lanes carry the name unchanged through every relay, so a
+// fix heard twice or late is known for what it is. LoRa carries the same values
+// in Meshtastic's Position: sensor_id, seq_number, timestamp and
+// timestamp_millis_adjust.
+struct FixId {
+  // Drawn at random once per radio boot, never 0. Two boots that draw the same
+  // one are still told apart by the fix time (rankFix).
+  uint16_t session = 0;
+  uint16_t fixMs = 0;  // milliseconds of fixSec
+  // Up by one with every new fix in the session, from 1. Thirty-two bits: at
+  // 4 Hz it would take 17 years to reach the half-range rankFix compares in.
+  uint32_t seq = 0;
+  uint32_t fixSec = 0;  // when the fix was measured, epoch seconds; 0 unknown
+};
+
+// session 2, seq 4, fix seconds 4, fix milliseconds 2, big-endian.
+static const size_t FIX_ID_LEN = 12;
+
+enum class FixRank : uint8_t { NEWER, SAME, OLDER };
+
+// How [incoming] stands against [held], two fixes from the same car. Within a
+// session the sequence decides. Across sessions (a reboot) the fix time does,
+// and so it does for a sequence that went back while the time went forward,
+// which is a reboot that drew the same session. The app's FixId.rank is the
+// same rule; the two test suites pin the same cases.
+FixRank rankFix(const FixId& incoming, const FixId& held);
+
 struct Position {
   int32_t lat = 0; // degrees * 1e7
   int32_t lon = 0;
+  FixId fix;
   uint16_t headingDeg = 0; // 0..359, quantised to 2 degrees on the wire
   uint8_t speedMph = 0;    // capped at 255, which no one on a touge will reach
   uint8_t batteryPct = 255; // 255 means unknown
@@ -177,7 +207,10 @@ struct Position {
   char name[16] = {0};
 };
 
-static const size_t POSITION_MIN = 23 + SLOT_MAP_LEN;
+// Body, version 3: 0-7 lat, lon | 8 heading | 9 speed | 10 battery | 11 flags
+// | 12 hop | 13-16 reference | 17 its hops and lock | 18 slot | 19-22 lease and
+// schedule generations | 23-54 slot map | 55-66 fix identity | 67.. name.
+static const size_t POSITION_MIN = 23 + SLOT_MAP_LEN + FIX_ID_LEN;
 
 size_t encodePosition(const Position& p, uint8_t* out, size_t cap);
 bool decodePosition(const uint8_t* in, size_t len, Position& out);

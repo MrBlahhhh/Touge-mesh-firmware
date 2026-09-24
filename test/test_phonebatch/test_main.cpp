@@ -13,12 +13,18 @@ using namespace touge;
 void setUp() {}
 void tearDown() {}
 
-static PhoneRecord car(uint32_t node, uint32_t frameId, uint32_t heardMs) {
+// Every car on one radio boot; fix [seq] measured [seq] seconds in.
+static const uint16_t SESSION = 0x5E55;
+
+static PhoneRecord car(uint32_t node, uint32_t seq, uint32_t heardMs) {
   PhoneRecord r;
   r.node = node;
   r.lat = 355000000 + (int32_t)node;
   r.lon = -825000000 - (int32_t)node;
-  r.frameId = frameId;
+  r.fix.session = SESSION;
+  r.fix.seq = seq;
+  r.fix.fixSec = 1790000000 + seq;
+  r.fix.fixMs = 125;
   r.headingCdeg = 27150;
   r.speedDkmh = 885;
   r.rssi = -71;
@@ -36,8 +42,8 @@ void test_a_record_heard_after_the_pack_time_is_age_zero() {
   PhoneRecord in[1] = {car(0x33, 1, 1005)};
   uint8_t buf[BATCH_MAX_PAYLOAD];
   size_t n = encodeBatch(in, 1, 1, 1000, buf, sizeof(buf));
-  TEST_ASSERT_EQUAL_UINT8(0, buf[BATCH_HEADER + 20]);
-  TEST_ASSERT_EQUAL_UINT8(0, buf[BATCH_HEADER + 21]);
+  TEST_ASSERT_EQUAL_UINT8(0, buf[BATCH_HEADER + RECORD_AGE_AT]);
+  TEST_ASSERT_EQUAL_UINT8(0, buf[BATCH_HEADER + RECORD_AGE_AT + 1]);
   BatchHeader h;
   PhoneRecord out[1];
   TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 1));
@@ -65,7 +71,10 @@ void test_a_batch_round_trips_every_field() {
     TEST_ASSERT_EQUAL_HEX32(in[i].node, out[i].node);
     TEST_ASSERT_EQUAL(in[i].lat, out[i].lat);
     TEST_ASSERT_EQUAL(in[i].lon, out[i].lon);
-    TEST_ASSERT_EQUAL_HEX32(in[i].frameId, out[i].frameId);
+    TEST_ASSERT_EQUAL_HEX16(in[i].fix.session, out[i].fix.session);
+    TEST_ASSERT_EQUAL_HEX32(in[i].fix.seq, out[i].fix.seq);
+    TEST_ASSERT_EQUAL(in[i].fix.fixSec, out[i].fix.fixSec);
+    TEST_ASSERT_EQUAL(in[i].fix.fixMs, out[i].fix.fixMs);
     TEST_ASSERT_EQUAL(in[i].headingCdeg, out[i].headingCdeg);
     TEST_ASSERT_EQUAL(in[i].speedDkmh, out[i].speedDkmh);
     TEST_ASSERT_EQUAL(in[i].rssi, out[i].rssi);
@@ -83,7 +92,10 @@ void test_a_known_batch_encodes_to_the_pinned_bytes() {
   r.node = 0xb03436ae;
   r.lat = 355123456;
   r.lon = -825654321;
-  r.frameId = 7;
+  r.fix.session = 0xA5C3;
+  r.fix.seq = 7;
+  r.fix.fixSec = 1790000000;
+  r.fix.fixMs = 987;
   r.headingCdeg = 27150;
   r.speedDkmh = 885;
   r.heardMs = 900;
@@ -97,7 +109,8 @@ void test_a_known_batch_encodes_to_the_pinned_bytes() {
   for (size_t i = 0; i < n; i++) sprintf(hexOut + 2 * i, "%02X", buf[i]);
   hexOut[2 * n] = 0;
   TEST_ASSERT_EQUAL_STRING(
-      "C1010C180100BEEF000003E8B03436AE152AC100CEC983CF000000076A0E03750064B911", hexOut);
+      "C1020C200100BEEF000003E8B03436AE152AC100CEC983CFA5C3000000076AB13B8003DB6A0E03750064B911",
+      hexOut);
 }
 
 // The first byte is what tells a batch from JSON and from a voice frame on the
@@ -172,16 +185,16 @@ void test_a_longer_future_record_still_decodes() {
 
   uint8_t v2[BATCH_MAX_PAYLOAD] = {0};
   memcpy(v2, v1, BATCH_HEADER);
-  v2[1] = 2;
+  v2[1] = BATCH_VERSION + 1;
   v2[2] = (uint8_t)header;
   v2[3] = (uint8_t)record;
   for (int i = 0; i < 2; i++) memcpy(v2 + header + i * record, v1 + BATCH_HEADER + i * BATCH_RECORD, BATCH_RECORD);
   BatchHeader h;
   PhoneRecord out[2];
   TEST_ASSERT_TRUE(decodeBatch(v2, header + 2 * record, h, out, 2));
-  TEST_ASSERT_EQUAL(2, h.version);
+  TEST_ASSERT_EQUAL(BATCH_VERSION + 1, h.version);
   TEST_ASSERT_EQUAL_HEX32(6, out[1].node);
-  TEST_ASSERT_EQUAL_HEX32(10, out[1].frameId);
+  TEST_ASSERT_EQUAL_HEX32(10, out[1].fix.seq);
 }
 
 void test_budget_follows_the_mtu_and_stops_at_the_payload_limit() {
@@ -189,10 +202,12 @@ void test_budget_follows_the_mtu_and_stops_at_the_payload_limit() {
   TEST_ASSERT_EQUAL(BATCH_MAX_PAYLOAD, batchBudgetForMtu(517));
   // 247, which one test radio settled on: one ATT response, no read blob.
   TEST_ASSERT_TRUE(batchBudgetForMtu(247) + 49 <= 247);
-  TEST_ASSERT_EQUAL(7, recordsThatFit(batchBudgetForMtu(247)));
+  TEST_ASSERT_EQUAL(5, recordsThatFit(batchBudgetForMtu(247)));
   // A default 23-byte MTU still gets one record rather than nothing.
   TEST_ASSERT_EQUAL(1, recordsThatFit(batchBudgetForMtu(23)));
-  TEST_ASSERT_EQUAL(9, recordsThatFit(BATCH_MAX_PAYLOAD));
+  // Six at most since the records carry the fix identity (build 38; nine before).
+  TEST_ASSERT_EQUAL(6, recordsThatFit(BATCH_MAX_PAYLOAD));
+  TEST_ASSERT_EQUAL(6, BATCH_MAX_RECORDS);
   // A phone that never learned its MTU still gets full batches; long reads cope.
   TEST_ASSERT_EQUAL(BATCH_MAX_PAYLOAD, batchBudgetForMtu(0));
 }
@@ -211,11 +226,11 @@ void test_a_second_record_for_a_car_replaces_the_first() {
   BatchHeader h;
   PhoneRecord out[1];
   TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 1));
-  TEST_ASSERT_EQUAL(11, out[0].frameId);
+  TEST_ASSERT_EQUAL(11, out[0].fix.seq);
   TEST_ASSERT_EQUAL(0, s.pending());
 }
 
-void test_an_older_frame_does_not_replace_a_newer_one() {
+void test_an_older_fix_does_not_replace_a_newer_one() {
   PhoneStore s;
   s.clear();
   s.offer(car(1, 20, 0), 0);
@@ -229,8 +244,41 @@ void test_an_older_frame_does_not_replace_a_newer_one() {
   BatchHeader h;
   PhoneRecord out[2];
   TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 2));
-  TEST_ASSERT_EQUAL(20, out[0].frameId);
-  TEST_ASSERT_EQUAL(3, out[1].frameId);
+  TEST_ASSERT_EQUAL(20, out[0].fix.seq);
+  TEST_ASSERT_EQUAL(3, out[1].fix.seq);
+}
+
+// The same fix again (a relay's copy, or a lease beacon repeating it) replaces
+// the pending record: same position, the later heard time and signal.
+void test_the_same_fix_heard_again_replaces_its_record() {
+  PhoneStore s;
+  s.clear();
+  s.offer(car(1, 20, 0), 0);
+  PhoneRecord relayed = car(1, 20, 30);
+  relayed.hopsAway = 2;
+  TEST_ASSERT_EQUAL(PhoneStore::REPLACED, s.offer(relayed, 30));
+  uint8_t buf[BATCH_MAX_PAYLOAD];
+  size_t taken = 0;
+  size_t n = s.takeBatch(buf, sizeof(buf), 1, 40, taken);
+  BatchHeader h;
+  PhoneRecord out[1];
+  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 1));
+  TEST_ASSERT_EQUAL(2, out[0].hopsAway);
+  TEST_ASSERT_EQUAL(30, out[0].heardMs);
+}
+
+// A car whose radio rebooted counts from 1 again under a new session. Its first
+// fix replaces the old boot's pending one; a late copy from the old boot does not
+// come back over it.
+void test_a_rebooted_car_replaces_its_pending_record() {
+  PhoneStore s;
+  s.clear();
+  s.offer(car(1, 5000, 0), 0);
+  PhoneRecord rebooted = car(1, 1, 40);
+  rebooted.fix.session = SESSION + 1;
+  rebooted.fix.fixSec = 1790000000 + 5030;
+  TEST_ASSERT_EQUAL(PhoneStore::REPLACED, s.offer(rebooted, 40));
+  TEST_ASSERT_EQUAL(PhoneStore::STALE, s.offer(car(1, 5000, 50), 50));
 }
 
 void test_a_replacement_keeps_its_place_in_the_flush() {
@@ -246,9 +294,9 @@ void test_a_replacement_keeps_its_place_in_the_flush() {
 void test_a_full_batch_goes_without_waiting() {
   PhoneStore s;
   s.clear();
-  for (uint32_t i = 0; i < 8; i++) s.offer(car(i + 1, 1, 0), 0);
+  for (uint32_t i = 0; i + 1 < BATCH_MAX_RECORDS; i++) s.offer(car(i + 1, 1, 0), 0);
   TEST_ASSERT_FALSE(s.due(1, BATCH_MAX_PAYLOAD, BATCH_FLUSH_MS));
-  s.offer(car(9, 1, 1), 1);
+  s.offer(car(99, 1, 1), 1);
   TEST_ASSERT_TRUE(s.due(1, BATCH_MAX_PAYLOAD, BATCH_FLUSH_MS));
 }
 
@@ -269,12 +317,12 @@ void test_the_longest_waiting_cars_go_first() {
   uint8_t buf[BATCH_MAX_PAYLOAD];
   size_t taken = 0;
   size_t n = s.takeBatch(buf, sizeof(buf), 1, 20, taken);
-  TEST_ASSERT_EQUAL(9, taken);
+  TEST_ASSERT_EQUAL(BATCH_MAX_RECORDS, taken);
   BatchHeader h;
-  PhoneRecord out[9];
-  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 9));
-  for (uint32_t i = 0; i < 9; i++) TEST_ASSERT_EQUAL_HEX32(100 + i, out[i].node);
-  TEST_ASSERT_EQUAL(3, s.pending());
+  PhoneRecord out[BATCH_MAX_RECORDS];
+  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, BATCH_MAX_RECORDS));
+  for (uint32_t i = 0; i < BATCH_MAX_RECORDS; i++) TEST_ASSERT_EQUAL_HEX32(100 + i, out[i].node);
+  TEST_ASSERT_EQUAL(12 - BATCH_MAX_RECORDS, s.pending());
 }
 
 void test_a_full_store_evicts_the_longest_waiting() {
@@ -288,8 +336,8 @@ void test_a_full_store_evicts_the_longest_waiting() {
   size_t taken = 0;
   size_t n = s.takeBatch(buf, sizeof(buf), 1, 200, taken);
   BatchHeader h;
-  PhoneRecord out[9];
-  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 9));
+  PhoneRecord out[BATCH_MAX_RECORDS];
+  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, BATCH_MAX_RECORDS));
   TEST_ASSERT_EQUAL_HEX32(2, out[0].node);
 }
 
@@ -533,10 +581,19 @@ struct PhoneQueue {
 bool queueHas(uint32_t id, void* ctx) { return static_cast<PhoneQueue*>(ctx)->has(id); }
 
 struct CarOnPhone {
-  uint32_t frameId = 0;
+  uint32_t seq = 0;
   uint32_t heardMs = 0;
   bool seen = false;
 };
+
+FixId fixOnPhone(const CarOnPhone& c) {
+  FixId f;
+  f.session = SESSION;
+  f.seq = c.seq;
+  f.fixSec = 1790000000 + c.seq;
+  f.fixMs = 125;
+  return f;
+}
 
 struct StallResult {
   uint32_t heard = 0, delivered = 0, superseded = 0, stale = 0, lostBatches = 0;
@@ -555,7 +612,7 @@ StallResult simulateStalls(uint32_t cars, uint32_t stallEveryMs, uint32_t stallM
   static Queued preloaded;
   bool preloadFull = false;
   CarOnPhone phone[32];
-  uint32_t frameIds[32] = {0};
+  uint32_t fixSeqs[32] = {0};
   uint32_t nextBeacon[32];
   for (uint32_t i = 0; i < cars; i++) nextBeacon[i] = i * 1000 / cars;
   uint16_t seq = 0;
@@ -571,7 +628,7 @@ StallResult simulateStalls(uint32_t cars, uint32_t stallEveryMs, uint32_t stallM
       if ((int32_t)(now - nextBeacon[i]) < 0) continue;
       nextBeacon[i] += 1000;
       r.heard++;
-      PhoneStore::Offer o = store.offer(car(i + 1, ++frameIds[i], now), now);
+      PhoneStore::Offer o = store.offer(car(i + 1, ++fixSeqs[i], now), now);
       TEST_ASSERT_NOT_EQUAL(PhoneStore::EVICTED, o);
       if (o == PhoneStore::REPLACED) r.superseded++;
       if (o == PhoneStore::STALE) r.stale++;
@@ -657,20 +714,20 @@ StallResult simulateStalls(uint32_t cars, uint32_t stallEveryMs, uint32_t stallM
       TEST_ASSERT_TRUE((h.flags & BATCH_AGES_AT_DELIVERY) != 0);
       TEST_ASSERT_FALSE(out[i].expired);
       // Its beacon time, on the first 5 ms tick at or after it.
-      const uint32_t beaconMs = (out[i].node - 1) * 1000 / cars + (out[i].frameId - 1) * 1000;
+      const uint32_t beaconMs = (out[i].node - 1) * 1000 / cars + (out[i].fix.seq - 1) * 1000;
       const uint32_t trueHeardMs = (beaconMs + 4) / 5 * 5;
       TEST_ASSERT_EQUAL(trueHeardMs, out[i].heardMs);
       r.agesChecked++;
       CarOnPhone& c = phone[out[i].node - 1];
-      if (c.seen && (int32_t)(out[i].frameId - c.frameId) < 0) {
+      if (c.seen && rankFix(out[i].fix, fixOnPhone(c)) == FixRank::OLDER) {
         // Older than what the phone has: overtaken via the pre-encoded slot.
-        // The phone drops it by frame id, and its heard time is older too.
+        // The phone drops it by its fix identity, and its heard time is older too.
         r.reordered++;
         TEST_ASSERT_TRUE((int32_t)(out[i].heardMs - c.heardMs) < 0);
         continue;
       }
       c.seen = true;
-      c.frameId = out[i].frameId;
+      c.seq = out[i].fix.seq;
       c.heardMs = out[i].heardMs;
     }
   }
@@ -678,7 +735,7 @@ StallResult simulateStalls(uint32_t cars, uint32_t stallEveryMs, uint32_t stallM
   // what was still in the pipe when the run ended.
   for (uint32_t i = 0; i < cars; i++) {
     TEST_ASSERT_TRUE(phone[i].seen);
-    TEST_ASSERT_TRUE(frameIds[i] - phone[i].frameId <= 3);
+    TEST_ASSERT_TRUE(fixSeqs[i] - phone[i].seq <= 3);
   }
   // Nothing vanished: every position heard was delivered, superseded by a
   // newer one for the same car, or is still waiting.
@@ -839,8 +896,8 @@ void test_ages_are_clamped_and_old_records_expire() {
   PhoneRecord in[2] = {car(1, 1, 1005), car(2, 1, 0)};
   uint8_t buf[BATCH_MAX_PAYLOAD];
   size_t n = encodeBatch(in, 2, 1, 1000, buf, sizeof(buf));
-  TEST_ASSERT_EQUAL_HEX8(0, buf[BATCH_HEADER + 20]);
-  TEST_ASSERT_EQUAL_HEX8(0, buf[BATCH_HEADER + 21]);
+  TEST_ASSERT_EQUAL_HEX8(0, buf[BATCH_HEADER + RECORD_AGE_AT]);
+  TEST_ASSERT_EQUAL_HEX8(0, buf[BATCH_HEADER + RECORD_AGE_AT + 1]);
   uint32_t expired = 0;
   // Read at 61 s: car 2 is 61 s old and flagged; car 1 is 60 s, still exact.
   TEST_ASSERT_EQUAL(n, deliverBatch(buf, n, 61000, false, expired));
@@ -886,7 +943,7 @@ static SimResult simulate(uint32_t peers, uint32_t readMs, uint32_t runMs) {
   s.clear();
   BatchesInFlight f;
   f.clear();
-  uint32_t frameId[32] = {0};
+  uint32_t fixSeq[32] = {0};
   uint32_t nextBeacon[32];
   for (uint32_t i = 0; i < peers; i++) nextBeacon[i] = i * 1000 / peers;
 
@@ -899,7 +956,7 @@ static SimResult simulate(uint32_t peers, uint32_t readMs, uint32_t runMs) {
       if ((int32_t)(now - nextBeacon[i]) < 0) continue;
       nextBeacon[i] += 1000;
       r.heard++;
-      PhoneStore::Offer o = s.offer(car(i + 1, ++frameId[i], now), now);
+      PhoneStore::Offer o = s.offer(car(i + 1, ++fixSeq[i], now), now);
       TEST_ASSERT_NOT_EQUAL(PhoneStore::EVICTED, o);
       if (o == PhoneStore::REPLACED) r.superseded++;
     }
@@ -974,9 +1031,9 @@ void test_a_stalled_reader_gets_the_newest_not_the_backlog() {
   size_t taken = 0;
   size_t n = s.takeBatch(buf, sizeof(buf), 1, 5000, taken);
   BatchHeader h;
-  PhoneRecord out[9];
-  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 9));
-  for (size_t i = 0; i < taken; i++) TEST_ASSERT_TRUE(out[i].frameId >= 5000 - 1000);
+  PhoneRecord out[BATCH_MAX_RECORDS];
+  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, BATCH_MAX_RECORDS));
+  for (size_t i = 0; i < taken; i++) TEST_ASSERT_TRUE(out[i].fix.seq >= 5000 - 1000);
 }
 
 int main(int, char**) {
@@ -992,7 +1049,9 @@ int main(int, char**) {
   RUN_TEST(test_a_longer_future_record_still_decodes);
   RUN_TEST(test_budget_follows_the_mtu_and_stops_at_the_payload_limit);
   RUN_TEST(test_a_second_record_for_a_car_replaces_the_first);
-  RUN_TEST(test_an_older_frame_does_not_replace_a_newer_one);
+  RUN_TEST(test_an_older_fix_does_not_replace_a_newer_one);
+  RUN_TEST(test_the_same_fix_heard_again_replaces_its_record);
+  RUN_TEST(test_a_rebooted_car_replaces_its_pending_record);
   RUN_TEST(test_a_replacement_keeps_its_place_in_the_flush);
   RUN_TEST(test_a_full_batch_goes_without_waiting);
   RUN_TEST(test_an_empty_store_is_never_due_and_takes_nothing);

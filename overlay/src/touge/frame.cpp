@@ -27,7 +27,29 @@ void put16(uint8_t* b, uint16_t v) {
 
 uint16_t get16(const uint8_t* b) { return (uint16_t)(((uint16_t)b[0] << 8) | (uint16_t)b[1]); }
 
+const size_t FIX_ID_AT = 23 + SLOT_MAP_LEN;
+
+// Milliseconds since the epoch, 0 when the fix time is unknown.
+uint64_t measuredMs(const FixId& f) { return f.fixSec == 0 ? 0 : (uint64_t)f.fixSec * 1000u + f.fixMs; }
+
 } // namespace
+
+FixRank rankFix(const FixId& incoming, const FixId& held) {
+  const uint64_t in = measuredMs(incoming);
+  const uint64_t was = measuredMs(held);
+  const bool timed = in != 0 && was != 0;
+  if (incoming.session == held.session) {
+    // Signed difference, so the order holds across the 32-bit wrap.
+    const int32_t ahead = (int32_t)(incoming.seq - held.seq);
+    if (ahead > 0) return FixRank::NEWER;
+    if (ahead == 0) return FixRank::SAME;
+    return timed && in > was ? FixRank::NEWER : FixRank::OLDER;
+  }
+  // Another boot of that car's radio: the two sequences are unrelated. With no
+  // time to go on, the newcomer is taken as the reboot it most likely is.
+  if (!timed) return FixRank::NEWER;
+  return in > was ? FixRank::NEWER : FixRank::OLDER;
+}
 
 size_t encodeFrame(const Frame& f, uint8_t* out, size_t cap) {
   if (f.len > FRAME_MAX_PAYLOAD) return 0;
@@ -94,6 +116,10 @@ size_t encodePosition(const Position& p, uint8_t* out, size_t cap) {
   put16(out + 19, p.leaseGen);
   put16(out + 21, p.schedGen);
   memcpy(out + 23, p.slotMap, SLOT_MAP_LEN);
+  put16(out + FIX_ID_AT, p.fix.session);
+  put32(out + FIX_ID_AT + 2, p.fix.seq);
+  put32(out + FIX_ID_AT + 6, p.fix.fixSec);
+  put16(out + FIX_ID_AT + 10, p.fix.fixMs);
   if (nameLen > 0) memcpy(out + POSITION_MIN, p.name, nameLen);
   return POSITION_MIN + nameLen;
 }
@@ -118,6 +144,10 @@ bool decodePosition(const uint8_t* in, size_t len, Position& out) {
   out.leaseGen = get16(in + 19);
   out.schedGen = get16(in + 21);
   memcpy(out.slotMap, in + 23, SLOT_MAP_LEN);
+  out.fix.session = get16(in + FIX_ID_AT);
+  out.fix.seq = get32(in + FIX_ID_AT + 2);
+  out.fix.fixSec = get32(in + FIX_ID_AT + 6);
+  out.fix.fixMs = get16(in + FIX_ID_AT + 10);
 
   size_t nameLen = len - POSITION_MIN;
   // A sender on a newer build may carry a longer name than this build knows

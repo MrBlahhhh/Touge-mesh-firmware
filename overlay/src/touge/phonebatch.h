@@ -26,9 +26,10 @@
 namespace touge {
 
 static const uint8_t BATCH_MAGIC = 0xC1;
-static const uint8_t BATCH_VERSION = 1;
+// 2 from build 38: records carry the fix identity in place of the frame id.
+static const uint8_t BATCH_VERSION = 2;
 
-// Header, version 1, big-endian like frame.cpp:
+// Header, big-endian like frame.cpp:
 //   0 magic 0xC1 | 1 version | 2 header length | 3 record length | 4 count
 //   5 flags | 6-7 batch sequence | 8-11 radio millis when encoded, or from
 //   build 35 when handed to the phone (flag BATCH_AGES_AT_DELIVERY)
@@ -36,13 +37,16 @@ static const uint8_t BATCH_VERSION = 1;
 // version can append fields without breaking this one.
 static const size_t BATCH_HEADER = 12;
 
-// Record, version 1:
-//   0-3 node | 4-7 lat e7 | 8-11 lon e7 | 12-15 sender frame id
-//   16-17 heading, centidegrees | 18-19 speed, 0.1 km/h
-//   20-21 ms since the radio heard it, at most RECORD_EXPIRE_MS | 22 rssi dBm, 0 unknown
-//   23 flags: bit 0 phone fix, bits 1-2 lane (0 = 2.4 GHz), bit 3 expired,
+// Record, version 2:
+//   0-3 node | 4-7 lat e7 | 8-11 lon e7
+//   12-23 fix identity: 12-13 session | 14-17 sequence | 18-21 fix seconds | 22-23 fix ms
+//   24-25 heading, centidegrees | 26-27 speed, 0.1 km/h
+//   28-29 ms since the radio heard it, at most RECORD_EXPIRE_MS | 30 rssi dBm, 0 unknown
+//   31 flags: bit 0 phone fix, bits 1-2 lane (0 = 2.4 GHz), bit 3 expired,
 //      bits 4-7 hops away
-static const size_t BATCH_RECORD = 24;
+static const size_t BATCH_RECORD = 32;
+static const size_t RECORD_AGE_AT = 28;
+static const size_t RECORD_FLAGS_AT = 31;
 
 // Header flag (byte 5): the header time is when the phone
 // got the batch and every age runs to then, so the phone takes "arrival minus
@@ -61,7 +65,7 @@ static const uint32_t RECORD_EXPIRE_MS = 60000;
 // Meshtastic's Data payload ceiling (meshtastic_Constants_DATA_PAYLOAD_LEN).
 // The batch rides in one, so this is the most a batch can be whatever the MTU.
 static const size_t BATCH_MAX_PAYLOAD = 233;
-static const size_t BATCH_MAX_RECORDS = (BATCH_MAX_PAYLOAD - BATCH_HEADER) / BATCH_RECORD;  // 9
+static const size_t BATCH_MAX_RECORDS = (BATCH_MAX_PAYLOAD - BATCH_HEADER) / BATCH_RECORD;  // 6
 
 static const uint8_t LANE_FAST = 0;
 static const uint8_t LANE_LORA = 1;
@@ -70,9 +74,9 @@ struct PhoneRecord {
   uint32_t node = 0;
   int32_t lat = 0;
   int32_t lon = 0;
-  // The sender's frame id. It counts up per sender, so it orders two copies of
-  // one car and shows gaps in what reached the phone.
-  uint32_t frameId = 0;
+  // Which fix this is, as its sender named it: orders two copies of one car
+  // here and on the phone, and tells the phone this fix from its LoRa copy.
+  FixId fix;
   uint16_t headingCdeg = 0;
   uint16_t speedDkmh = 0;
   int8_t rssi = 0;
@@ -118,7 +122,7 @@ bool decodeBatchHeader(const uint8_t* in, size_t len, BatchHeader& header);
 // ---- Newest unsent position per car ----------------------------------------
 
 // One pending record per car heard on 2.4 GHz, so the roster's size is enough;
-// a car past it evicts the longest-waiting record. 40 bytes a slot.
+// a car past it evicts the longest-waiting record. 48 bytes a slot.
 #if TOUGE_LEAN_RAM
 static const size_t PHONE_STORE_SLOTS = MAX_RIDERS;
 #else
@@ -133,8 +137,8 @@ class PhoneStore {
  public:
   enum Offer : uint8_t {
     ADDED,
-    REPLACED,  // a pending record for this car was superseded
-    STALE,     // older than what is pending for this car; kept the pending one
+    REPLACED,  // a pending record for this car was superseded, or heard again
+    STALE,     // an older fix than the one pending for this car; kept the pending one
     EVICTED,   // store full: the longest-waiting record was dropped for this one
   };
 

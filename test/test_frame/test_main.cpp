@@ -19,6 +19,7 @@
 #include "hmac.h"
 #include "hop.h"
 #include "gnssfix.h"
+#include "ownfix.h"
 
 using namespace touge;
 
@@ -226,9 +227,13 @@ void test_position_round_trip() {
   p.slot = 29;
   p.leaseGen = 0xBEEF;
   p.schedGen = 0xF00D;
+  p.fix.session = 0xA5C3;
+  p.fix.seq = 0x01020304;
+  p.fix.fixSec = 1790000000;
+  p.fix.fixMs = 987;
   strcpy(p.name, "mattmoto");
 
-  uint8_t buf[64];
+  uint8_t buf[POSITION_MIN + 16];
   size_t n = encodePosition(p, buf, sizeof(buf));
   TEST_ASSERT_EQUAL_UINT32(POSITION_MIN + 8, n);
 
@@ -246,7 +251,144 @@ void test_position_round_trip() {
   TEST_ASSERT_EQUAL_UINT8(29, got.slot);
   TEST_ASSERT_EQUAL_UINT16(0xBEEF, got.leaseGen);
   TEST_ASSERT_EQUAL_UINT16(0xF00D, got.schedGen);
+  TEST_ASSERT_EQUAL_UINT16(0xA5C3, got.fix.session);
+  TEST_ASSERT_EQUAL_UINT32(0x01020304, got.fix.seq);
+  TEST_ASSERT_EQUAL_UINT32(1790000000, got.fix.fixSec);
+  TEST_ASSERT_EQUAL_UINT16(987, got.fix.fixMs);
   TEST_ASSERT_EQUAL_STRING("mattmoto", got.name);
+
+  // Where the identity sits, big-endian, between the slot map and the name.
+  const uint8_t want[FIX_ID_LEN] = {0xA5, 0xC3, 0x01, 0x02, 0x03, 0x04, 0x6A, 0xB1, 0x3B, 0x80, 0x03, 0xDB};
+  TEST_ASSERT_EQUAL_MEMORY(want, buf + 23 + SLOT_MAP_LEN, FIX_ID_LEN);
+  TEST_ASSERT_EQUAL_UINT8('m', buf[POSITION_MIN]);
+}
+
+// ---- Fix identity (SCALE-PLAN 5a) -------------------------------------------
+//
+// The app's FixId.rank is the same rule, and PositionBatchTest pins the same
+// cases.
+
+static FixId fixId(uint16_t session, uint32_t seq, uint32_t fixSec, uint16_t fixMs = 0) {
+  FixId f;
+  f.session = session;
+  f.seq = seq;
+  f.fixSec = fixSec;
+  f.fixMs = fixMs;
+  return f;
+}
+
+void test_within_a_session_the_sequence_decides() {
+  const FixId held = fixId(7, 100, 1790000100);
+  TEST_ASSERT_EQUAL(FixRank::NEWER, rankFix(fixId(7, 101, 1790000101), held));
+  // The same fix again: its 2.4 GHz copy and its LoRa copy are one position.
+  TEST_ASSERT_EQUAL(FixRank::SAME, rankFix(fixId(7, 100, 1790000100), held));
+  // A late copy of an older fix never replaces the newer one.
+  TEST_ASSERT_EQUAL(FixRank::OLDER, rankFix(fixId(7, 99, 1790000099), held));
+  // The sequence wins over a clock stepped back mid-session.
+  TEST_ASSERT_EQUAL(FixRank::NEWER, rankFix(fixId(7, 101, 1790000090), held));
+}
+
+void test_a_long_drive_does_not_wrap_into_looking_older() {
+  TEST_ASSERT_EQUAL(FixRank::NEWER, rankFix(fixId(7, 2, 1790000002), fixId(7, 0xFFFFFFFF, 1790000001)));
+  TEST_ASSERT_EQUAL(FixRank::OLDER, rankFix(fixId(7, 0xFFFFFFFF, 1790000001), fixId(7, 2, 1790000002)));
+}
+
+void test_a_rebooted_radio_is_a_new_session() {
+  // A reboot starts the sequence at 1 under a new session, measured later.
+  const FixId before = fixId(7, 5000, 1790000100, 250);
+  TEST_ASSERT_EQUAL(FixRank::NEWER, rankFix(fixId(9, 1, 1790000130, 10), before));
+  // A late copy from the old boot after the switch is older.
+  TEST_ASSERT_EQUAL(FixRank::OLDER, rankFix(before, fixId(9, 1, 1790000130, 10)));
+  // A reboot that drew the same session: the sequence went back, the time on.
+  TEST_ASSERT_EQUAL(FixRank::NEWER, rankFix(fixId(7, 1, 1790000130), before));
+  // With no fix time either side, the newcomer is taken.
+  TEST_ASSERT_EQUAL(FixRank::NEWER, rankFix(fixId(9, 1, 0), before));
+  TEST_ASSERT_EQUAL(FixRank::OLDER, rankFix(fixId(7, 1, 0), before));
+}
+
+void test_the_same_millisecond_is_not_newer() {
+  TEST_ASSERT_EQUAL(FixRank::OLDER, rankFix(fixId(9, 1, 1790000100, 250), fixId(7, 5, 1790000100, 250)));
+  TEST_ASSERT_EQUAL(FixRank::NEWER, rankFix(fixId(9, 1, 1790000100, 251), fixId(7, 5, 1790000100, 250)));
+}
+
+static Fix reading(int32_t lat, uint32_t fixSec, uint16_t fixMs = 0) {
+  Fix f;
+  f.lat = lat;
+  f.lon = -825000000;
+  f.trackE5 = 9000000;
+  f.speedKmh = 88;
+  f.fixSec = fixSec;
+  f.fixMs = fixMs;
+  f.external = true;
+  return f;
+}
+
+void test_each_new_fix_takes_the_next_sequence() {
+  OwnFix own;
+  TEST_ASSERT_FALSE(own.has());
+  own.observe(reading(355000000, 1790000000, 100), 0x12345678);
+  TEST_ASSERT_TRUE(own.has());
+  const FixId first = own.id();
+  TEST_ASSERT_EQUAL_UINT32(1, first.seq);
+  TEST_ASSERT_EQUAL_UINT16(0x1234 ^ 0x5678, first.session);
+  TEST_ASSERT_EQUAL_UINT32(1790000000, first.fixSec);
+  TEST_ASSERT_EQUAL_UINT16(100, first.fixMs);
+
+  // Read again every pass: the same fix, the same name.
+  own.observe(reading(355000000, 1790000000, 100), 0x99999999);
+  TEST_ASSERT_EQUAL_UINT32(1, own.id().seq);
+  // A parked car's next fix: same place, measured later.
+  own.observe(reading(355000000, 1790000001, 100), 0x99999999);
+  TEST_ASSERT_EQUAL_UINT32(2, own.id().seq);
+  // The session is drawn once per boot, not per fix.
+  TEST_ASSERT_EQUAL_UINT16(first.session, own.id().session);
+}
+
+void test_no_coordinates_is_no_fix_until_one_comes_back() {
+  OwnFix own;
+  own.observe(reading(355000000, 1790000000), 1);
+  own.observe(reading(0, 1790000001), 1);  // lat 0 and lon set: still a place
+  TEST_ASSERT_TRUE(own.has());
+  Fix none;
+  own.observe(none, 1);
+  TEST_ASSERT_FALSE(own.has());
+  // Lock back on the very fix we had: not a new one.
+  own.observe(reading(0, 1790000001), 1);
+  TEST_ASSERT_TRUE(own.has());
+  TEST_ASSERT_EQUAL_UINT32(2, own.id().seq);
+  own.observe(reading(355000100, 1790000005), 1);
+  TEST_ASSERT_EQUAL_UINT32(3, own.id().seq);
+}
+
+void test_a_session_is_never_zero() {
+  OwnFix own;
+  own.observe(reading(355000000, 1790000000), 0x00010001);
+  TEST_ASSERT_NOT_EQUAL(0, own.id().session);
+}
+
+void test_the_fix_time_comes_from_the_solution_then_the_write() {
+  Fix f;
+  setMeasured(f, 1790000000, 250, 1790000009);
+  TEST_ASSERT_EQUAL_UINT32(1790000000, f.fixSec);
+  TEST_ASSERT_EQUAL_UINT16(250, f.fixMs);
+  // An adjustment past a second, or below zero, is folded into the seconds.
+  setMeasured(f, 1790000000, 1250, 0);
+  TEST_ASSERT_EQUAL_UINT32(1790000001, f.fixSec);
+  TEST_ASSERT_EQUAL_UINT16(250, f.fixMs);
+  setMeasured(f, 1790000000, -250, 0);
+  TEST_ASSERT_EQUAL_UINT32(1790000000 - 1, f.fixSec);
+  TEST_ASSERT_EQUAL_UINT16(750, f.fixMs);
+  // No solution time: the write's time, whole seconds.
+  setMeasured(f, 0, 400, 1790000009);
+  TEST_ASSERT_EQUAL_UINT32(1790000009, f.fixSec);
+  TEST_ASSERT_EQUAL_UINT16(0, f.fixMs);
+}
+
+void test_measured_after_needs_both_times() {
+  TEST_ASSERT_TRUE(measuredAfter(reading(1, 1790000000, 2), reading(1, 1790000000, 1)));
+  TEST_ASSERT_FALSE(measuredAfter(reading(1, 1790000000, 1), reading(1, 1790000000, 1)));
+  TEST_ASSERT_FALSE(measuredAfter(reading(1, 1789999999, 999), reading(1, 1790000000, 0)));
+  TEST_ASSERT_FALSE(measuredAfter(reading(1, 1790000000), reading(1, 0)));
 }
 
 void test_position_heading_quantises_to_two_degrees() {
@@ -699,11 +841,14 @@ void test_dedupe_holds_its_whole_window_at_peak_traffic() {
 void test_mesh_tables_stay_inside_their_budget() {
   // Build 36 ran a V3 out of internal RAM. The roster, dedupe table and held
   // forwards together, pinned so growing them is a decision and not drift.
+  // Build 38's fix identity: 12 bytes a rider, 12 a position forward slot,
+  // 5500 to 5944 bytes lean and 7424 to 7760 roomy.
 #if TOUGE_LEAN_RAM
-  TEST_ASSERT_TRUE(sizeof(Mesh) <= 5600);
+  TEST_ASSERT_TRUE(sizeof(Mesh) <= 5950);
 #else
-  TEST_ASSERT_TRUE(sizeof(Mesh) <= 7500);
+  TEST_ASSERT_TRUE(sizeof(Mesh) <= 7800);
 #endif
+  TEST_ASSERT_EQUAL(12, sizeof(FixId));
   // Still a whole ride, lean or not.
   TEST_ASSERT_TRUE(MAX_RIDERS >= 25);
 }
@@ -1208,6 +1353,15 @@ int main(int, char**) {
   RUN_TEST(test_position_heading_quantises_to_two_degrees);
   RUN_TEST(test_position_truncates_a_long_name);
   RUN_TEST(test_position_rejects_a_short_payload);
+  RUN_TEST(test_within_a_session_the_sequence_decides);
+  RUN_TEST(test_a_long_drive_does_not_wrap_into_looking_older);
+  RUN_TEST(test_a_rebooted_radio_is_a_new_session);
+  RUN_TEST(test_the_same_millisecond_is_not_newer);
+  RUN_TEST(test_each_new_fix_takes_the_next_sequence);
+  RUN_TEST(test_no_coordinates_is_no_fix_until_one_comes_back);
+  RUN_TEST(test_a_session_is_never_zero);
+  RUN_TEST(test_the_fix_time_comes_from_the_solution_then_the_write);
+  RUN_TEST(test_measured_after_needs_both_times);
   RUN_TEST(test_dedupe_forwards_a_packet_once);
   RUN_TEST(test_dedupe_forgets_after_the_window);
   RUN_TEST(test_dedupe_survives_more_traffic_than_it_has_slots);

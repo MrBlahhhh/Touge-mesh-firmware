@@ -17,7 +17,7 @@ namespace touge {
 
 // How many cars the roster can hold. Rides run to twenty-eight, so this stays
 // at 28 on every board; it is not the slot count (see MAX_SLOTS). A Rider is
-// 96 bytes, 2.7 KB for the lot.
+// 108 bytes, 3.0 KB for the lot.
 static const size_t MAX_RIDERS = 28;
 
 // Distinct frames a second with the ride full: up to 32 slotted beacons, the
@@ -95,14 +95,14 @@ static_assert(SEEN_TTL_MS >= 4 * (FORWARD_JITTER_MAX_MS + FORWARD_TIE_MS),
 static const size_t FORWARD_SLOTS = 12;
 
 // The longest position frame on the air: header, body with a full name, tag.
-// 93 bytes, against the 250 a voice or text frame may need.
+// 105 bytes, against the 250 a voice or text frame may need.
 static const size_t POSITION_FRAME_MAX = FRAME_HEADER + POSITION_MIN + sizeof(Position::name) + TAG_LEN;
 
 // How many of the slots hold a whole frame; the rest hold a position frame.
 // A full-size slot is 250 bytes and nearly everything forwarded is a position,
 // so a lean board keeps three for voice and text: one talker's frames are 60 ms
 // apart and wait at most FORWARD_JITTER_MAX_MS, so about two are ever held.
-// 1.6 KB of frame storage instead of 3 KB.
+// 1.7 KB of frame storage instead of 3 KB.
 #if TOUGE_LEAN_RAM
 static const size_t FORWARD_FULL_SLOTS = 3;
 #else

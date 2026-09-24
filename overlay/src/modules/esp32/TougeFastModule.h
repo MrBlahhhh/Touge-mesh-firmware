@@ -35,6 +35,7 @@
 #include "touge/frame.h"
 #include "touge/gnssfix.h"
 #include "touge/mesh.h"
+#include "touge/ownfix.h"
 #include "touge/phonebatch.h"
 #include "touge/ride.h"
 #include "touge/hop.h"
@@ -52,6 +53,8 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     virtual int32_t runOnce() override;
     virtual bool wantPacket(const meshtastic_MeshPacket *p) override;
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
+    // Stamps our phone's LoRa position with our fix identity on its way out.
+    virtual void alterReceived(meshtastic_MeshPacket &mp) override;
 
   private:
     // Re-derives the fast network when the primary channel's key changes, and
@@ -75,6 +78,13 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     bool sendExtraBeacon(uint32_t nowMs);
     // Everything a beacon carries except the name, lease beacon or extra.
     void fillBeacon(touge::Position &p, uint32_t nowMs);
+
+    // Our own fix and the identity both lanes send it under (SCALE-PLAN 5a).
+    // noteOwnFix reads it from localPosition; see touge/ownfix.h.
+    void noteOwnFix();
+    static touge::Fix fixOf(const meshtastic_Position &pos);
+    meshtastic_Position ownLoraPosition() const;
+    touge::OwnFix ownFix_;
 
     // The receiver's own fix to the phone, about 1 Hz, so a tablet with no GPS
     // can navigate on it. See touge/gnssfix.h.
