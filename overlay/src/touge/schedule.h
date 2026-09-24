@@ -21,9 +21,36 @@
 //   | s0 s4 s8 ... s28 | shared | s1 s5 ... s29 | shared | s2 ... | s3 ... |
 //      0             216   250
 //
-// Slot numbers interleave across blocks (slot s is in block s % 4), so the
-// lowest free slots, which fill first, are spread over the second instead of
-// piling into its first quarter.
+// Slot s is in block s % 4 at row s / 4, so the four slots of a row sit at
+// the same offset in each block, exactly 250 ms apart. Leases fill block 0
+// first (slots 0, 4, 8 ... 28), then block 1, 2, 3: the first eight cars get
+// a row each.
+//
+// ## Extra beacons in slots nobody holds
+//
+// A car may also transmit in the unleased slots of its own row, so with few
+// cars each beacons up to four times a second, evenly spaced, and drops back
+// to once a second as the rows fill. Which car gets a free slot depends only
+// on which blocks of that row are leased, so every car that can hear the row
+// derives the same answer; see Schedule::extraSlots. Every car's extras put
+// together can never use more than the 32 slots, so the total is min(32, 4N)
+// frames a second, and the shared window is untouched:
+//
+//   cars   per car (Hz)                          frames/s
+//   1      1 (alone: nobody to send extras to)   1
+//   2-8    4                                     4N
+//   10     4 x 6, 2 x 4 (two rows hold two)      32
+//   16     2                                     32
+//   20     2 x 12, 1 x 8                         32
+//   25     2 x 7, 1 x 18                         32
+//   32     1                                     32
+//
+// Extras are sent with no hops left, so nobody forwards them, and flagged, so
+// they never set a clock and never enter a slot map (clash detection sees
+// lease beacons only). Extras stop everywhere as soon as any car in earshot
+// needs a slot, so a joiner always finds the free slots silent, and while
+// the roster is full (MAX_RIDERS others), since it may be hiding a lease.
+// The 32-car row above therefore assumes a roster bigger than today's 28.
 //
 // The shared window is for cars without a lease: a car still listening before
 // its first claim, and anything beyond MAX_SLOTS. It is also the room step 5 of
@@ -168,8 +195,9 @@ class Schedule {
    * When rosters differ that can still put two cars on one slot, and they
    * never hear each other. So a holder also reads its own slot in its
    * neighbours' slot maps: if they hear somebody else there more than us, or
-   * nobody at all, it moves, to a free slot picked by its own hash rather
-   * than the queue, which would send both cars to the same place again.
+   * nobody at all, it gives the slot up and listens again as a joiner. Its
+   * unleased beacons stop everybody's extras and put it back in the queue,
+   * where the cars it clashed with now see it and rank it.
    */
   void rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders,
                uint32_t nowMs);
@@ -182,6 +210,27 @@ class Schedule {
 
   /** Who we heard in each slot within HEARD_WINDOW_MS, as slot tags. */
   void fillSlotMap(uint32_t nowMs, uint8_t map[SLOT_MAP_LEN]) const;
+
+  /**
+   * The unleased slots of our row that are ours to send extra beacons in, one
+   * bit per slot. Empty unless we hold a lease, have company, are not in a
+   * clash, and no car in earshot is waiting for a slot.
+   *
+   * A free block f of the row goes to the lease in the block opposite it,
+   * (f + 2) % 4, if that is held; otherwise to the nearest lease before it in
+   * time. One lease takes all three free blocks (4 Hz). Two leases in
+   * adjacent blocks take one each, 500 ms after their own (2 Hz, evenly
+   * spaced). Three leases leave one block, which goes to the middle one. The
+   * rule only reads which blocks are leased, from the roster and the
+   * neighbours' slot maps, so cars that can collide agree on it.
+   */
+  uint32_t extraSlots() const { return extraMask_; }
+
+  /** Whether the phase is inside one of our extra slots with room to finish. */
+  bool inExtraSlotAtPhase(uint32_t phaseMs) const;
+
+  /** The same on the beacon-recovered clock. False without an epoch. */
+  bool inExtraSlot(uint32_t nowMs) const;
 
   // SLOT_NONE while listening, or when there are more cars than slots.
   uint8_t slot() const { return slot_; }
@@ -265,6 +314,7 @@ class Schedule {
   void electReference(bool selfLocked, const Rider* riders, size_t maxRiders, uint32_t nowMs);
   void settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs);
   void chooseParent(const Rider* riders, size_t maxRiders, uint32_t nowMs);
+  void planExtras(const Rider* riders, size_t maxRiders, uint32_t nowMs);
 
   uint32_t selfId_ = 0;
   uint32_t referenceId_ = 0;
@@ -290,6 +340,10 @@ class Schedule {
 
   uint32_t slotHeardMs_[MAX_SLOTS] = {};
   uint8_t slotHeardTag_[MAX_SLOTS] = {}; // 0 until somebody is heard there
+
+  // Some car in earshot is unleased or has lost its slot. Set by settleLease.
+  bool someoneWaiting_ = false;
+  uint32_t extraMask_ = 0;
 
   uint8_t sharedBlock_ = 0;
   uint32_t sharedOffsetMs_ = 0;

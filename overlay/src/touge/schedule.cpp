@@ -48,6 +48,7 @@ void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, si
   settleLease(riders, maxRiders, nowMs);
   electReference(selfLocked, riders, maxRiders, nowMs);
   chooseParent(riders, maxRiders, nowMs);
+  planExtras(riders, maxRiders, nowMs);
 }
 
 void Schedule::electReference(bool selfLocked, const Rider* riders, size_t maxRiders,
@@ -139,6 +140,13 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
   }
   known_ = (uint8_t)(1 + live);
 
+  someoneWaiting_ = false;
+  for (size_t i = 0; i < maxRiders; i++) {
+    const Rider& r = riders[i];
+    if (!liveLease(r, selfId_, nowMs)) continue;
+    if (r.pos.slot >= MAX_SLOTS || holder[r.pos.slot] != r.id) someoneWaiting_ = true;
+  }
+
   // Nobody heard for a whole lease. Everyone else has let our slot go by now,
   // so we let it go too and rejoin as a newcomer when the ride comes back,
   // rather than walking back in and taking a slot that has been reissued.
@@ -181,7 +189,6 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
     }
   }
 
-  bool drowned = false;
   if (claimed()) {
     const bool outranked =
         held[slot_] && !claimBeats(leaseGen_, selfId_, holderGen[slot_], holder[slot_]);
@@ -195,41 +202,48 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
     if (clash && !clashing_) clashSinceMs_ = nowMs;
     clashing_ = clash;
     const bool established = (uint32_t)(nowMs - leasedAtMs_) >= ESTABLISHED_LEASE_MS;
-    drowned = clash && (!established || (uint32_t)(nowMs - clashSinceMs_) >= CLASH_PATIENCE_MS);
+    const bool drowned =
+        clash && (!established || (uint32_t)(nowMs - clashSinceMs_) >= CLASH_PATIENCE_MS);
     if (!outranked && !drowned) return;
     clashing_ = false;
-    // We already know the ride, so move now without listening again.
+    if (drowned) {
+      // Give the slot up and listen again as a joiner. Our unleased beacons
+      // stop everybody's extras and show the cars we clashed with that we
+      // need a slot, so the queue ranks us instead of both of us picking the
+      // same free slot again. Moving straight to another slot landed in some
+      // car's extras, where the clash hid again.
+      slot_ = SLOT_NONE;
+      firstHeardMs_ = nowMs;
+      return;
+    }
+    // Outranked: the cars that outrank us already know we need a slot, so
+    // move now without listening again.
   } else if ((uint32_t)(nowMs - firstHeardMs_) < JOIN_LISTEN_MS) {
     return; // still learning who holds what
   }
-  // After a clash, not back onto the slot that clashed: it looks free, since
-  // nobody could read who was on it.
-  const uint8_t avoid = drowned ? slot_ : SLOT_NONE;
   slot_ = SLOT_NONE;
 
+  // Free slots in lease order: block 0 first, row by row, then block 1, 2, 3,
+  // so the first eight cars each get a row of their own for extras.
   uint8_t freeSlots[MAX_SLOTS];
   uint8_t freeCount = 0;
-  for (uint8_t s = 0; s < MAX_SLOTS; s++)
-    if (!held[s] && !(reportedBusy & (1u << s)) && s != avoid) freeSlots[freeCount++] = s;
-
-  uint8_t pick;
-  if (drowned) {
-    // Whoever we clashed with saw the same ride we did, so the queue below
-    // would send us both to the same slot again. Each car starts from a place
-    // of its own instead, new with every generation.
-    pick = (uint8_t)(((selfId_ ^ schedGen_) * 2654435761u >> 16) % (freeCount ? freeCount : 1));
-  } else {
-    // Cars ahead of us in the queue: unleased, or on a slot somebody else has
-    // won, and with a lower node number. We take the free slot after theirs,
-    // so everyone with the same roster lands on a different slot without
-    // first colliding.
-    pick = 0;
-    for (size_t i = 0; i < maxRiders; i++) {
-      const Rider& r = riders[i];
-      if (!liveLease(r, selfId_, nowMs)) continue;
-      const bool needsSlot = r.pos.slot >= MAX_SLOTS || holder[r.pos.slot] != r.id;
-      if (needsSlot && r.id < selfId_) pick++;
+  for (uint8_t block = 0; block < BLOCKS; block++) {
+    for (uint8_t row = 0; row < SLOTS_PER_BLOCK; row++) {
+      const uint8_t s = (uint8_t)(row * BLOCKS + block);
+      if (!held[s] && !(reportedBusy & (1u << s))) freeSlots[freeCount++] = s;
     }
+  }
+
+  // Cars ahead of us in the queue: unleased, or on a slot somebody else has
+  // won, and with a lower node number. We take the free slot after theirs, so
+  // everyone with the same roster lands on a different slot without first
+  // colliding.
+  uint8_t pick = 0;
+  for (size_t i = 0; i < maxRiders; i++) {
+    const Rider& r = riders[i];
+    if (!liveLease(r, selfId_, nowMs)) continue;
+    const bool needsSlot = r.pos.slot >= MAX_SLOTS || holder[r.pos.slot] != r.id;
+    if (needsSlot && r.id < selfId_) pick++;
   }
   // No free slot for us. Never double up on a held one: stay unleased and
   // transmit in the shared window.
@@ -289,6 +303,59 @@ void Schedule::chooseParent(const Rider* riders, size_t maxRiders, uint32_t nowM
     }
   }
   if (parentId_ != 0) refHops_ = (uint8_t)(bestVia + 1);
+}
+
+void Schedule::planExtras(const Rider* riders, size_t maxRiders, uint32_t nowMs) {
+  extraMask_ = 0;
+  // A joiner or a car that lost its slot is about to claim one of the free
+  // slots, and it has to find it silent. Nothing to gain alone, and nothing
+  // safe to add while our own slot looks clashed.
+  if (!claimed() || known_ <= 1 || someoneWaiting_ || clashing_) return;
+  // A full roster may be missing a car, whose lease an extra could land on.
+  if (known_ - 1 >= MAX_RIDERS) return;
+
+  const uint8_t row = (uint8_t)(slot_ / BLOCKS);
+  const uint8_t ourBlock = (uint8_t)(slot_ % BLOCKS);
+  // Blocks of our row leased by anyone: cars we hear, directly or relayed,
+  // and cars only our neighbours hear, from their slot maps.
+  uint8_t leased = (uint8_t)(1u << ourBlock);
+  for (size_t i = 0; i < maxRiders; i++) {
+    const Rider& r = riders[i];
+    if (!liveLease(r, selfId_, nowMs)) continue;
+    if (r.pos.slot < MAX_SLOTS && r.pos.slot / BLOCKS == row) leased |= (uint8_t)(1u << (r.pos.slot % BLOCKS));
+    if (r.hopsAway != 0 || (uint32_t)(nowMs - r.atMs) >= HEARD_WINDOW_MS) continue;
+    for (uint8_t b = 0; b < BLOCKS; b++)
+      if (r.pos.slotMap[row * BLOCKS + b] != 0) leased |= (uint8_t)(1u << b);
+  }
+
+  for (uint8_t free = 0; free < BLOCKS; free++) {
+    if (leased & (1u << free)) continue;
+    // Opposite first: with two leases in adjacent blocks each gets the block
+    // 500 ms after its own, so both beacon evenly at 2 Hz.
+    uint8_t owner = (uint8_t)((free + 2) % BLOCKS);
+    if (!(leased & (1u << owner))) {
+      for (uint8_t back = 1; back < BLOCKS; back++) {
+        owner = (uint8_t)((free + BLOCKS - back) % BLOCKS);
+        if (leased & (1u << owner)) break;
+      }
+    }
+    if (owner == ourBlock) extraMask_ |= 1u << (row * BLOCKS + free);
+  }
+}
+
+bool Schedule::inExtraSlotAtPhase(uint32_t phaseMs) const {
+  phaseMs %= SCHEDULE_MS;
+  for (uint8_t s = 0; s < MAX_SLOTS; s++) {
+    if (!(extraMask_ & (1u << s))) continue;
+    const uint32_t start = slotStartMs(s);
+    if (phaseMs >= start && phaseMs + SLOT_GUARD_MS <= start + SLOT_MS) return true;
+  }
+  return false;
+}
+
+bool Schedule::inExtraSlot(uint32_t nowMs) const {
+  if (!haveEpoch_ || extraMask_ == 0) return false;
+  return inExtraSlotAtPhase((uint32_t)(nowMs - epochMs_) % SCHEDULE_MS);
 }
 
 void Schedule::heardSlot(uint8_t slot, uint32_t senderId, uint32_t nowMs) {

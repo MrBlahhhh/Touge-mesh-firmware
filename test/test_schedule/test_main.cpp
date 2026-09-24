@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <vector>
+#include <initializer_list>
 #include "frame.h"
 #include "mesh.h"
 #include "rideclock.h"
@@ -125,7 +126,8 @@ void test_a_newcomer_listens_before_claiming() {
   touch(r, 1000 + JOIN_LISTEN_MS);
   s.rebuild(300, false, r, ROSTER, 1000 + JOIN_LISTEN_MS);
   TEST_ASSERT_TRUE(s.claimed());
-  TEST_ASSERT_EQUAL_UINT8(2, s.slot()); // lowest free, nobody ahead of us
+  // First free in lease order, block 0 row by row: 0 is held, so row 1.
+  TEST_ASSERT_EQUAL_UINT8(4, s.slot());
   TEST_ASSERT_EQUAL_UINT16(2, s.leaseGeneration()); // one past the ride's
   TEST_ASSERT_EQUAL_UINT16(2, s.generation());
 }
@@ -229,7 +231,7 @@ void test_a_newcomer_never_takes_an_incumbents_slot() {
   Schedule s;
   join(s, 100, r);
   TEST_ASSERT_TRUE(s.weAreReference());
-  TEST_ASSERT_EQUAL_UINT8(2, s.slot());
+  TEST_ASSERT_EQUAL_UINT8(4, s.slot());
   TEST_ASSERT_EQUAL_UINT16(8, s.leaseGeneration());
 }
 
@@ -294,7 +296,7 @@ void test_a_lapsed_lease_frees_its_slot() {
   q[1].atMs = JOIN_LISTEN_MS + 1;
   q[0].atMs = JOIN_LISTEN_MS + 1;
   t.rebuild(300, false, q, ROSTER, LEASE_MS + JOIN_LISTEN_MS);
-  TEST_ASSERT_EQUAL_UINT8(2, t.slot());
+  TEST_ASSERT_EQUAL_UINT8(4, t.slot());
 }
 
 void test_a_car_alone_for_a_lease_lets_its_slot_go_and_listens_again() {
@@ -604,6 +606,11 @@ void test_a_convoy_strung_out_converges_on_one_reference() {
       s[me].rebuild(id[me], false, roster, ROSTER, now);
     }
     for (int me = 0; me < 4; me++) {
+      // Each hears its neighbours' lease beacons, so its slot map says so.
+      memset(belief[me].slotMap, 0, sizeof(belief[me].slotMap));
+      for (int other = me - 1; other <= me + 1; other += 2)
+        if (other >= 0 && other < 4 && s[other].claimed())
+          belief[me].slotMap[s[other].slot()] = slotTag(id[other]);
       belief[me].slot = s[me].slot();
       belief[me].leaseGen = s[me].leaseGeneration();
       belief[me].schedGen = s[me].generation();
@@ -797,6 +804,218 @@ void test_a_version_1_frame_is_refused() {
   TEST_ASSERT_FALSE(decodeFrame(wire, n, got));
 }
 
+// ---- Extra beacons ----------------------------------------------------------
+
+static uint32_t bits(std::initializer_list<uint8_t> slots) {
+  uint32_t mask = 0;
+  for (uint8_t s : slots) mask |= 1u << s;
+  return mask;
+}
+
+// Leased riders on every block-0 slot except the one in `exceptRow`, so a
+// joiner lands in block 1 once block 0 is full.
+static size_t fillBlockZero(Rider* r, size_t n, uint8_t exceptRow) {
+  for (uint8_t row = 0; row < SLOTS_PER_BLOCK; row++)
+    if (row != exceptRow) addLeased(r, n++, 5000u + row, (uint8_t)(row * BLOCKS), 1);
+  return n;
+}
+
+void test_a_car_alone_in_its_row_gets_the_other_three() {
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  Schedule s;
+  join(s, 300, r);
+  TEST_ASSERT_EQUAL_UINT8(4, s.slot());
+  TEST_ASSERT_EQUAL_HEX32(bits({5, 6, 7}), s.extraSlots());
+}
+
+void test_two_in_a_row_each_get_the_block_opposite() {
+  // Block 0 full, so we land on row 0 block 1 beside the car on slot 0. Free
+  // blocks 2 and 3 go one each, 500 ms after each lease: 2 Hz, evenly spaced.
+  Rider r[ROSTER] = {};
+  size_t n = fillBlockZero(r, 0, 0);
+  addLeased(r, n++, 100, 0, 1);
+  Schedule s;
+  join(s, 300, r);
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+  TEST_ASSERT_EQUAL_HEX32(bits({3}), s.extraSlots());
+
+  // And the car on slot 0, seeing us on slot 1, takes block 2.
+  Rider q[ROSTER] = {};
+  n = fillBlockZero(q, 0, 0);
+  addLeased(q, n++, 300, 1, 1);
+  Schedule t;
+  join(t, 100, q);
+  TEST_ASSERT_EQUAL_UINT8(0, t.slot());
+  TEST_ASSERT_EQUAL_HEX32(bits({2}), t.extraSlots());
+}
+
+void test_three_in_a_row_leave_the_last_block_to_the_middle_one() {
+  Rider r[ROSTER] = {};
+  size_t n = fillBlockZero(r, 0, 0);
+  addLeased(r, n++, 100, 0, 1);
+  addLeased(r, n++, 200, 2, 1);
+  Schedule s;
+  uint32_t now = join(s, 300, r);
+  TEST_ASSERT_EQUAL_UINT8(1, s.slot());
+  TEST_ASSERT_EQUAL_HEX32(bits({3}), s.extraSlots());
+
+  // A full row has nothing left.
+  addLeased(r, n++, 400, 3, 1, now);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_EQUAL_HEX32(0, s.extraSlots());
+}
+
+void test_a_neighbours_slot_map_counts_as_a_lease_in_the_row() {
+  // Somebody we cannot hear holds slot 6 (row 1, block 2) and a neighbour
+  // hears them. Slot 7 then goes to block 2 by the preceding rule, not to us.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  Schedule s;
+  uint32_t now = join(s, 300, r);
+  TEST_ASSERT_EQUAL_UINT8(4, s.slot());
+  r[0].pos.slotMap[6] = slotTag(777);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_EQUAL_HEX32(bits({5}), s.extraSlots());
+}
+
+void test_extras_stop_while_a_car_waits_for_a_slot() {
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  Schedule s;
+  uint32_t now = join(s, 300, r);
+  TEST_ASSERT_NOT_EQUAL(0, s.extraSlots());
+
+  // A joiner, still listening: its first claim must find the free slots quiet.
+  addRider(r, 1, 900, now);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_EQUAL_HEX32(0, s.extraSlots());
+
+  // A car that has lost a contested slot is waiting too.
+  r[1].pos.slot = 0;
+  r[1].pos.leaseGen = 7;
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_EQUAL_HEX32(0, s.extraSlots());
+
+  // Once it holds a slot of its own, extras come back, recomputed.
+  r[1].pos.slot = 8;
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_EQUAL_HEX32(bits({5, 6, 7}), s.extraSlots());
+}
+
+void test_no_extras_alone_or_unleased() {
+  Schedule alone;
+  Rider none[ROSTER] = {};
+  alone.rebuild(300, false, none, ROSTER, 0);
+  TEST_ASSERT_EQUAL_HEX32(0, alone.extraSlots());
+  TEST_ASSERT_FALSE(alone.inExtraSlot(0));
+
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1, 1000);
+  Schedule listening;
+  listening.rebuild(300, false, r, ROSTER, 1000);
+  TEST_ASSERT_EQUAL_HEX32(0, listening.extraSlots());
+}
+
+void test_an_extra_slot_opens_only_in_its_own_window() {
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  Schedule s;
+  join(s, 300, r);
+  const uint32_t five = slotStartMs(5);
+  TEST_ASSERT_TRUE(s.inExtraSlotAtPhase(five));
+  TEST_ASSERT_TRUE(s.inExtraSlotAtPhase(five + SLOT_MS - SLOT_GUARD_MS));
+  TEST_ASSERT_FALSE(s.inExtraSlotAtPhase(five + SLOT_MS - SLOT_GUARD_MS + 1));
+  // Never in our lease slot, nor anybody else's.
+  TEST_ASSERT_FALSE(s.inExtraSlotAtPhase(slotStartMs(4)));
+  TEST_ASSERT_FALSE(s.inExtraSlotAtPhase(slotStartMs(0)));
+  // Without an epoch there is no knowing where slot 5 is.
+  TEST_ASSERT_FALSE(s.inExtraSlot(12345));
+  s.syncTo(10000, 0);
+  TEST_ASSERT_TRUE(s.inExtraSlot(10000 + five));
+}
+
+void test_extras_are_disjoint_and_fill_every_occupied_row() {
+  // Every ride size from 2 to 32, in the lease order cars fall into. Each car
+  // computes its extras from the same roster; together they never overlap
+  // each other or a lease, never pass 4 Hz, and leave no slot of an occupied
+  // row idle. Past a full roster (MAX_RIDERS others) a car may be missing
+  // somebody, so extras stop altogether.
+  uint8_t order[MAX_SLOTS];
+  uint8_t k = 0;
+  for (uint8_t block = 0; block < BLOCKS; block++)
+    for (uint8_t row = 0; row < SLOTS_PER_BLOCK; row++) order[k++] = (uint8_t)(row * BLOCKS + block);
+
+  for (uint8_t cars = 2; cars <= MAX_SLOTS; cars++) {
+    uint32_t used = 0;
+    for (uint8_t i = 0; i < cars; i++) used |= 1u << order[i];
+    uint32_t extras = 0;
+    for (uint8_t me = 0; me < cars; me++) {
+      // Everyone else leased, so our own slot is the first free one in lease
+      // order and the join lands where this car sits.
+      Rider r[ROSTER] = {};
+      size_t n = 0;
+      for (uint8_t other = 0; other < cars; other++)
+        if (other != me) addLeased(r, n++, 1000u + other, order[other], 1);
+      Schedule s;
+      join(s, 1000u + me, r);
+      TEST_ASSERT_EQUAL_UINT8(order[me], s.slot());
+      const uint32_t mine = s.extraSlots();
+      if (cars > MAX_RIDERS) {
+        TEST_ASSERT_EQUAL_HEX32(0, mine);
+        continue;
+      }
+      TEST_ASSERT_EQUAL_HEX32(0, mine & used);
+      TEST_ASSERT_EQUAL_HEX32(0, mine & extras);
+      TEST_ASSERT_TRUE(__builtin_popcount(mine) <= 3);
+      extras |= mine;
+    }
+    if (cars > MAX_RIDERS) continue;
+    uint32_t occupiedRows = 0;
+    for (uint8_t i = 0; i < cars; i++) occupiedRows |= 0xFu << (order[i] / BLOCKS * BLOCKS);
+    TEST_ASSERT_EQUAL_HEX32(occupiedRows, used | extras);
+  }
+}
+
+void test_a_drowned_lease_listens_again_before_reclaiming() {
+  // Two neighbours whose maps show nobody on our slot for a whole window: a
+  // clash. We drop the lease, stop extras, and queue again as a joiner.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  addLeased(r, 1, 900, 8, 1);
+  Schedule s;
+  uint32_t now = join(s, 300, r);
+  TEST_ASSERT_TRUE(s.claimed());
+  now += HEARD_WINDOW_MS + 100;
+  touch(r, now);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_FALSE(s.claimed());
+  TEST_ASSERT_EQUAL_HEX32(0, s.extraSlots());
+
+  touch(r, now + 1000);
+  s.rebuild(300, false, r, ROSTER, now + 1000);
+  TEST_ASSERT_FALSE(s.claimed());
+  touch(r, now + JOIN_LISTEN_MS);
+  s.rebuild(300, false, r, ROSTER, now + JOIN_LISTEN_MS);
+  TEST_ASSERT_TRUE(s.claimed());
+}
+
+void test_the_extra_flag_round_trips() {
+  Position p{};
+  p.extra = true;
+  p.slot = 4;
+  uint8_t wire[POSITION_MIN];
+  size_t n = encodePosition(p, wire, sizeof(wire));
+  Position got{};
+  TEST_ASSERT_TRUE(decodePosition(wire, n, got));
+  TEST_ASSERT_TRUE(got.extra);
+  TEST_ASSERT_FALSE(got.clockLocked);
+  p.extra = false;
+  n = encodePosition(p, wire, sizeof(wire));
+  TEST_ASSERT_TRUE(decodePosition(wire, n, got));
+  TEST_ASSERT_FALSE(got.extra);
+}
+
 // ---- The simulator ----------------------------------------------------------
 //
 // Millisecond steps. Each car runs the module's beacon logic against its own
@@ -831,6 +1050,7 @@ struct Tx {
   uint32_t id;
   uint32_t start, end;
   Position pos;
+  uint32_t fixAt; // when the position it carries was measured
 };
 
 struct Delivery {
@@ -861,6 +1081,13 @@ struct Car {
   uint32_t sent = 0;
   uint32_t slotChanges = 0;
   uint8_t lastSlot = SLOT_NONE;
+  // How often the phone hands the radio a new fix. An extra beacon only goes
+  // out when there is one it has not sent.
+  uint32_t fixEveryMs = 250;
+  uint32_t sentFix = 0;
+  uint32_t lastSendAt = 0;
+  uint32_t extrasSent = 0;
+  uint8_t announced = SLOT_NONE;
 };
 
 struct World {
@@ -879,10 +1106,19 @@ struct World {
   uint32_t lastUnsettled = 0;
   // Print every leased-slot collision, for chasing one down by hand.
   bool verbose = false;
+  // Direct receptions of each sender's frames since mark(), summed over all
+  // receivers. And the age of each fix the first time a receiver hears it,
+  // which is what a faster rate is for: repeats of an old fix do not count.
+  std::vector<uint32_t> heardFrom;
+  std::vector<std::vector<uint32_t>> newestFixHeard;
+  uint64_t ageSumMs = 0;
+  uint32_t ageCount = 0;
 
   explicit World(size_t n, uint32_t seed) {
     rng = seed;
     cars.resize(n);
+    heardFrom.assign(n, 0);
+    newestFixHeard.assign(n, std::vector<uint32_t>(n, 0));
     link.assign(n, std::vector<bool>(n, true));
     for (size_t i = 0; i < n; i++) {
       // Hash-like node numbers, as Meshtastic's are.
@@ -918,6 +1154,8 @@ struct World {
     for (size_t k = 0; k < ROSTER; k++) c.roster[k] = Rider{};
     std::fill(c.seen.begin(), c.seen.end(), 0);
     c.want = c.sentOnce = false;
+    c.lastSendAt = now;
+    c.announced = SLOT_NONE;
     c.nextBeacon = 0;
     c.lastSyncSrc = SIZE_MAX;
     c.lastSlot = SLOT_NONE;
@@ -957,7 +1195,7 @@ struct World {
     const uint32_t at = local(c, now);
     const uint32_t srcId = cars[d.src].id;
 
-    if (d.hopsAway == 0 && c.sched.takesClockFrom(srcId) &&
+    if (d.hopsAway == 0 && !d.pos.extra && c.sched.takesClockFrom(srcId) &&
         !(d.src == c.lastSyncSrc && d.id == c.lastSyncId)) {
       c.lastSyncSrc = d.src;
       c.lastSyncId = d.id;
@@ -967,42 +1205,26 @@ struct World {
     if (d.id <= c.seen[d.src]) return;
     c.seen[d.src] = d.id;
     note(c, srcId, d.pos, d.hopsAway, at);
-    if (d.hopsAway == 0) c.sched.heardSlot(d.pos.slot, srcId, at);
+    if (d.hopsAway == 0 && !d.pos.extra) c.sched.heardSlot(d.pos.slot, srcId, at);
     c.sched.rebuild(c.id, c.gps, c.roster, ROSTER, at);
 
-    if (d.hopsAway < RELAY_HOPS)
+    // Extras are never forwarded.
+    if (d.hopsAway < RELAY_HOPS && !d.pos.extra)
       for (size_t k = 0; k < cars.size(); k++)
         if (link[d.to][k] && k != d.src)
           pending.push_back({now + RELAY_MS, k, d.src, d.id, d.pos, (uint8_t)(d.hopsAway + 1)});
   }
 
-  void tick(size_t i) {
+  uint32_t fixNow(const Car& c) const { return now / c.fixEveryMs; }
+
+  Tx beaconFrom(size_t i, uint32_t at) {
     Car& c = cars[i];
-    const uint32_t at = local(c, now);
-    if (!c.want) {
-      if (!c.sentOnce || (int32_t)(at - c.nextBeacon) >= 0) {
-        c.want = true;
-        c.sched.rebuild(c.id, c.gps, c.roster, ROSTER, at);
-        c.sched.drawSharedTurn(rand32());
-      }
-    }
-    if (!c.want) return;
-    if (c.sched.weAreReference()) c.sched.startEpoch(at);
-    // A PPS edge on the true second, whatever the crystal thinks.
-    const bool mine = c.gps ? c.sched.inSlotAtPhase(now % SCHEDULE_MS) : c.sched.inSlot(at);
-    if (!mine) return;
-
-    c.want = false;
-    if (c.nextBeacon == 0) c.nextBeacon = at;
-    c.nextBeacon = nextOnGrid(c.nextBeacon, 1000, at);
-    c.sentOnce = true;
-    c.sent++;
-
     Tx tx;
     tx.src = i;
     tx.id = ++c.frameId;
     tx.start = now;
     tx.end = now + AIR_MS;
+    tx.fixAt = fixNow(c) * c.fixEveryMs;
     tx.pos.slot = c.sched.slot();
     tx.pos.leaseGen = c.sched.leaseGeneration();
     tx.pos.schedGen = c.sched.generation();
@@ -1011,7 +1233,51 @@ struct World {
     tx.pos.refId = c.sched.referenceId();
     tx.pos.refHops = c.sched.hopsToReference();
     tx.pos.refLocked = c.sched.referenceLocked();
+    c.sentFix = fixNow(c);
+    c.lastSendAt = now;
+    return tx;
+  }
+
+  // TougeFastModule::sendExtraBeacon: a fix not yet sent, in an extra slot.
+  bool extraTick(size_t i, uint32_t at) {
+    Car& c = cars[i];
+    if (!c.sentOnce || fixNow(c) == c.sentFix || now - c.lastSendAt < 100) return false;
+    const bool mine =
+        c.gps ? c.sched.inExtraSlotAtPhase(now % SCHEDULE_MS) : c.sched.inExtraSlot(at);
+    if (!mine) return false;
+    Tx tx = beaconFrom(i, at);
+    tx.pos.extra = true;
     air.push_back(tx);
+    c.extrasSent++;
+    return true;
+  }
+
+  void tick(size_t i) {
+    Car& c = cars[i];
+    const uint32_t at = local(c, now);
+    if (extraTick(i, at)) return;
+    if (!c.want) {
+      if (!c.sentOnce || (int32_t)(at - c.nextBeacon) >= 0) {
+        c.want = true;
+        c.sched.rebuild(c.id, c.gps, c.roster, ROSTER, at);
+        c.sched.drawSharedTurn(rand32());
+      }
+    }
+    // As the module: a new lease is announced in its first slot.
+    if (c.sched.claimed() && c.sched.slot() != c.announced) c.want = true;
+    if (!c.want) return;
+    if (c.sched.weAreReference()) c.sched.startEpoch(at);
+    // A PPS edge on the true second, whatever the crystal thinks.
+    const bool mine = c.gps ? c.sched.inSlotAtPhase(now % SCHEDULE_MS) : c.sched.inSlot(at);
+    if (!mine) return;
+
+    c.want = false;
+    c.announced = c.sched.slot();
+    if (c.nextBeacon == 0) c.nextBeacon = at;
+    c.nextBeacon = nextOnGrid(c.nextBeacon, 1000, at);
+    c.sentOnce = true;
+    c.sent++;
+    air.push_back(beaconFrom(i, at));
   }
 
   void endTransmissions() {
@@ -1027,6 +1293,15 @@ struct World {
           if (overlaps && (other.src == j || link[j][other.src])) clash = &other;
         }
         if (clash == nullptr) {
+          if (now >= statsFrom) {
+            heardFrom[tx.src]++;
+            uint32_t& newest = newestFixHeard[j][tx.src];
+            if (tx.fixAt > newest) {
+              newest = tx.fixAt;
+              ageSumMs += now - tx.fixAt;
+              ageCount++;
+            }
+          }
           receive({now, j, tx.src, tx.id, tx.pos, 0});
         } else if (now >= statsFrom) {
           const bool bothLeased = tx.pos.slot < MAX_SLOTS && clash->pos.slot < MAX_SLOTS;
@@ -1103,7 +1378,24 @@ struct World {
     for (Car& c : cars) {
       c.slotChanges = 0;
       c.sent = 0;
+      c.extrasSent = 0;
     }
+    std::fill(heardFrom.begin(), heardFrom.end(), 0);
+    // Ages count only fixes taken after this point, so the first one heard
+    // from each car is not a stale one from before the mark.
+    for (auto& row : newestFixHeard) std::fill(row.begin(), row.end(), now);
+    ageSumMs = 0;
+    ageCount = 0;
+  }
+
+  // How many times a second car i was heard directly by one of the cars in
+  // range of it, averaged over those cars, since mark().
+  double rateHeard(size_t i) const {
+    size_t hearers = 0;
+    for (size_t j = 0; j < cars.size(); j++)
+      if (j != i && cars[j].on && link[i][j]) hearers++;
+    if (hearers == 0 || now == statsFrom) return 0;
+    return heardFrom[i] * 1000.0 / hearers / (double)(now - statsFrom);
   }
 
   size_t references() const {
@@ -1131,6 +1423,20 @@ void bootAll(World& w, size_t first, size_t last) {
       if (at[i - first] == t) w.boot(i);
     w.run(1);
   }
+}
+
+uint32_t extrasSent(const World& w) {
+  uint32_t n = 0;
+  for (const Car& c : w.cars) n += c.extrasSent;
+  return n;
+}
+
+// Every car's frames a second as its neighbours hear them, summed.
+double framesPerSecond(const World& w) {
+  double total = 0;
+  for (size_t i = 0; i < w.cars.size(); i++)
+    if (w.cars[i].on) total += w.rateHeard(i);
+  return total;
 }
 
 } // namespace sim
@@ -1356,6 +1662,12 @@ void test_sim_two_groups_merge_into_one_schedule() {
       if (w.cars[a].sched.slot() == w.cars[b].sched.slot()) clashes++;
   TEST_ASSERT_TRUE(clashes >= 10);
 
+  // Each side is sending extras in the slots it thinks are free, which are
+  // the other side's leases.
+  w.mark();
+  w.run(3000);
+  TEST_ASSERT_TRUE(sim::extrasSent(w) > 0);
+
   w.mark();
   const uint32_t met = w.now;
   for (size_t a = 0; a < 13; a++)
@@ -1366,11 +1678,12 @@ void test_sim_two_groups_merge_into_one_schedule() {
   TEST_ASSERT_TRUE(w.lastUnsettled + 100 <= met + SETTLE_BOUND_MS);
   sim::report("merge", w, met);
 
-  // And it stays merged.
+  // And it stays merged, with the second filled again: 25 cars use all 32.
   w.mark();
   w.run(30000);
   TEST_ASSERT_EQUAL_UINT32(0, w.leasedCollisions);
   for (const sim::Car& c : w.cars) TEST_ASSERT_EQUAL_UINT32(0, c.slotChanges);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, 32.0f, (float)sim::framesPerSecond(w));
 }
 
 void test_sim_a_strung_out_convoy_keeps_its_slots_apart() {
@@ -1405,6 +1718,116 @@ void test_sim_some_cars_on_gps() {
   w.mark();
   w.run(30000);
   TEST_ASSERT_EQUAL_UINT32(0, w.leasedCollisions);
+}
+
+// ---- Extra beacons, simulated -----------------------------------------------
+
+// Settle `cars`, then measure 20 s. Every car must be heard at 1 + its extra
+// slots a second, the ride must use min(32, 4N) frames a second, and the
+// number of cars at 4, 2 and 1 Hz must match the row arithmetic in
+// schedule.h. No collision between scheduled frames, extras included.
+static void ratesFor(size_t cars, uint32_t seed, size_t seats, int at4, int at2, int at1) {
+  World w(cars, seed);
+  for (sim::Car& c : w.cars) c.rosterSeats = seats;
+  sim::bootAll(w, 0, cars);
+  w.run(15000);
+  TEST_ASSERT_TRUE(w.settled());
+  w.mark();
+  w.run(20000);
+
+  int count[5] = {};
+  double slowest = 99, fastest = 0;
+  for (size_t i = 0; i < cars; i++) {
+    const int expected = 1 + __builtin_popcount(w.cars[i].sched.extraSlots());
+    const double heard = w.rateHeard(i);
+    TEST_ASSERT_FLOAT_WITHIN(0.25f, (float)expected, (float)heard);
+    count[expected]++;
+    if (heard < slowest) slowest = heard;
+    if (heard > fastest) fastest = heard;
+  }
+  TEST_ASSERT_EQUAL_INT(at4, count[4]);
+  TEST_ASSERT_EQUAL_INT(at2, count[2]);
+  TEST_ASSERT_EQUAL_INT(at1, count[1]);
+  const double expectedTotal = cars * 4.0 < MAX_SLOTS ? cars * 4.0 : (double)MAX_SLOTS;
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, (float)expectedTotal, (float)sim::framesPerSecond(w));
+  TEST_ASSERT_EQUAL_UINT32(0, w.leasedCollisions);
+
+  char line[160];
+  snprintf(line, sizeof(line),
+           "%u cars: %d at 4 Hz, %d at 2, %d at 1; heard %.2f-%.2f Hz; %.1f frames/s; "
+           "new fix %u ms old when first heard",
+           (unsigned)cars, at4, at2, at1, slowest, fastest, sim::framesPerSecond(w),
+           (unsigned)(w.ageCount ? w.ageSumMs / w.ageCount : 0));
+  TEST_MESSAGE(line);
+}
+
+void test_sim_rates_3_cars() { ratesFor(3, 31, MAX_RIDERS, 3, 0, 0); }
+void test_sim_rates_10_cars() { ratesFor(10, 32, MAX_RIDERS, 6, 4, 0); }
+void test_sim_rates_25_cars() { ratesFor(25, 33, MAX_RIDERS, 0, 7, 18); }
+// 32 cars need 31 roster seats; the firmware has MAX_RIDERS = 28.
+void test_sim_rates_32_cars() { ratesFor(32, 34, MAX_SLOTS - 1, 0, 0, 32); }
+
+void test_sim_joins_take_a_slot_while_extras_run() {
+  // Ten cars with every free slot in use as an extra. Three more arrive two
+  // seconds apart; extras give way while each listens, so it claims into
+  // silence, and nobody already leased moves.
+  World w(13, 21);
+  sim::bootAll(w, 0, 10);
+  w.run(15000);
+  TEST_ASSERT_TRUE(w.settled());
+  w.mark();
+  w.run(3000);
+  TEST_ASSERT_TRUE(sim::extrasSent(w) > 0);
+
+  w.mark();
+  const uint32_t firstJoin = w.now;
+  for (size_t i = 10; i < 13; i++) {
+    w.boot(i);
+    w.run(2000);
+  }
+  const uint32_t lastJoin = w.now - 2000;
+  w.run(15000);
+  TEST_ASSERT_TRUE(w.settled());
+  TEST_ASSERT_TRUE(w.lastUnsettled + 100 <= lastJoin + SETTLE_BOUND_MS);
+  for (size_t i = 0; i < 10; i++) TEST_ASSERT_EQUAL_UINT32(0, w.cars[i].slotChanges);
+  sim::report("joins with extras", w, firstJoin);
+
+  // Extras come back for the new layout: 13 cars fill the second again.
+  w.mark();
+  w.run(20000);
+  TEST_ASSERT_EQUAL_UINT32(0, w.leasedCollisions);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, 32.0f, (float)sim::framesPerSecond(w));
+}
+
+void test_sim_extras_cut_the_age_of_a_1hz_phone_fix() {
+  // Most phones give one GPS fix a second, so extras carry no more fixes than
+  // the lease beacon would. What they buy is the wait: a new fix goes out in
+  // the next of four slots instead of the next one.
+  World few(3, 41);
+  for (sim::Car& c : few.cars) c.fixEveryMs = 1000;
+  sim::bootAll(few, 0, 3);
+  few.run(15000);
+  few.mark();
+  few.run(30000);
+  const uint32_t fewAge = (uint32_t)(few.ageSumMs / few.ageCount);
+
+  World full(32, 42);
+  for (sim::Car& c : full.cars) {
+    c.fixEveryMs = 1000;
+    c.rosterSeats = MAX_SLOTS - 1;
+  }
+  sim::bootAll(full, 0, 32);
+  full.run(15000);
+  full.mark();
+  full.run(30000);
+  const uint32_t fullAge = (uint32_t)(full.ageSumMs / full.ageCount);
+
+  char line[120];
+  snprintf(line, sizeof(line), "1 Hz phone fix, age when first heard: 3 cars %u ms, 32 cars %u ms",
+           (unsigned)fewAge, (unsigned)fullAge);
+  TEST_MESSAGE(line);
+  TEST_ASSERT_TRUE(fewAge < 250);
+  TEST_ASSERT_TRUE(fullAge > 400);
 }
 
 void setUp() {}
@@ -1468,5 +1891,21 @@ int main(int, char**) {
   RUN_TEST(test_sim_two_groups_merge_into_one_schedule);
   RUN_TEST(test_sim_a_strung_out_convoy_keeps_its_slots_apart);
   RUN_TEST(test_sim_some_cars_on_gps);
+  RUN_TEST(test_a_car_alone_in_its_row_gets_the_other_three);
+  RUN_TEST(test_two_in_a_row_each_get_the_block_opposite);
+  RUN_TEST(test_three_in_a_row_leave_the_last_block_to_the_middle_one);
+  RUN_TEST(test_a_neighbours_slot_map_counts_as_a_lease_in_the_row);
+  RUN_TEST(test_extras_stop_while_a_car_waits_for_a_slot);
+  RUN_TEST(test_no_extras_alone_or_unleased);
+  RUN_TEST(test_an_extra_slot_opens_only_in_its_own_window);
+  RUN_TEST(test_extras_are_disjoint_and_fill_every_occupied_row);
+  RUN_TEST(test_a_drowned_lease_listens_again_before_reclaiming);
+  RUN_TEST(test_the_extra_flag_round_trips);
+  RUN_TEST(test_sim_rates_3_cars);
+  RUN_TEST(test_sim_rates_10_cars);
+  RUN_TEST(test_sim_rates_25_cars);
+  RUN_TEST(test_sim_rates_32_cars);
+  RUN_TEST(test_sim_joins_take_a_slot_while_extras_run);
+  RUN_TEST(test_sim_extras_cut_the_age_of_a_1hz_phone_fix);
   return UNITY_END();
 }

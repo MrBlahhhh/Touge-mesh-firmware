@@ -69,6 +69,10 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // it is visible anywhere else.
     void status(uint32_t nowMs);
     void beacon(uint32_t nowMs);
+    // A new fix in one of our extra slots (Schedule::extraSlots). True if sent.
+    bool sendExtraBeacon(uint32_t nowMs);
+    // Everything a beacon carries except the name, lease beacon or extra.
+    void fillBeacon(touge::Position &p, uint32_t nowMs);
 
     // The receiver's own fix to the phone, about 1 Hz, so a tablet with no GPS
     // can navigate on it. See touge/gnssfix.h.
@@ -136,6 +140,9 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     uint32_t lastSyncId_ = 0;
     // The gate has opened and we are waiting for our slot.
     bool wantBeacon_ = false;
+    // The lease slot our last lease beacon went out in. A new lease is
+    // announced in its first slot rather than at the next 1 s deadline.
+    uint8_t announcedSlot_ = touge::SLOT_NONE;
     // Where we were when we last transmitted, for the distance gate.
     int32_t sentLat_ = 0;
     int32_t sentLon_ = 0;

@@ -38,6 +38,13 @@ namespace {
 // slot comes round once a cycle, which caps a car at one beacon a second.
 const uint32_t CYCLE_MS = SCHEDULE_MS;
 
+// Least time between any two of our beacons. Extra slots are 250 ms apart and
+// clear of the lease slot, so this only stops a second send in the same slot
+// on the next tick.
+const uint32_t EXTRA_MIN_GAP_MS = 100;
+static_assert(EXTRA_MIN_GAP_MS > SLOT_MS && EXTRA_MIN_GAP_MS < BLOCK_MS,
+              "longer than one slot, shorter than the gap between a row's slots");
+
 // The gate, borrowed from the Army's Blue Force Tracker, which reports every
 // 30 seconds or every 50 metres of travel and lets whichever comes first win.
 //
@@ -162,7 +169,9 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // 30: 1 s 32-slot leased schedule (frame v2); positions to the phone in newest-wins batches
 //     (0xC1) once the app says hello, fs/fq link counters, core-patches/0005-0007.
 // 31: batch record ages clamp at zero instead of wrapping to 65.5 s.
-const uint32_t TOUGE_BUILD = 31;
+// 32: extra beacons in free slots of a car's own row, up to 4 Hz with few cars
+//     (frame flag 0x10, not forwarded); the phone sends each new fix at once.
+const uint32_t TOUGE_BUILD = 32;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -399,6 +408,7 @@ void TougeFastModule::syncChannel()
                       mesh_.riders(), MAX_RIDERS, millis());
     wantBeacon_ = false;
     sentOnce_ = false;
+    announcedSlot_ = SLOT_NONE;
     nextBeaconMs_ = 0;
     mesh_.seedIds(idCeiling_ ? idCeiling_ - ID_BLOCK : nodeDB->getNodeNum());
 
@@ -504,6 +514,10 @@ void TougeFastModule::beacon(uint32_t nowMs)
                           : 0;
     (void)fixAge;
 
+    // Extra beacons use free slots of our row, never the lease slot, so the two
+    // never compete for the same tick.
+    if (sendExtraBeacon(nowMs)) return;
+
     if (!wantBeacon_) {
         uint32_t moved = sentOnce_ ? distanceM(sentLat_, sentLon_, localPosition.latitude_i,
                                                localPosition.longitude_i)
@@ -525,6 +539,11 @@ void TougeFastModule::beacon(uint32_t nowMs)
             schedule_.drawSharedTurn(esp_random());
         }
     }
+    // A lease nobody has heard yet goes out in its first slot. Waiting for the
+    // 1 s deadline could leave it unsent for two seconds, long enough for the
+    // neighbours' slot maps to say nobody hears it and the clash check to give
+    // it up.
+    if (schedule_.claimed() && schedule_.slot() != announcedSlot_) wantBeacon_ = true;
     if (!wantBeacon_) return;
 
     // Our turn comes round once a cycle, so the wait is bounded by that and
@@ -550,6 +569,7 @@ void TougeFastModule::beacon(uint32_t nowMs)
 
     wantBeacon_ = false;
     lastBeaconMs_ = nowMs;
+    announcedSlot_ = schedule_.slot();
     // Move the 1 s deadline on only if it has passed. Advancing it on every
     // send let each movement-triggered beacon push it a second later, and a
     // run of them left a car that stopped silent for several seconds.
@@ -560,6 +580,67 @@ void TougeFastModule::beacon(uint32_t nowMs)
     sentOnce_ = true;
 
     Position p;
+    fillBeacon(p, nowMs);
+
+    if ((uint32_t)(nowMs - lastNameMs_) >= NAME_EVERY_MS) {
+        // The long name, because the frame has room for it.
+        //
+        // This sent short_name, which is four characters, and the receiving
+        // end wrote whatever arrived into long_name as well. So a car called
+        // "mattpixel" reached every other car on the fast lane as "matt", and
+        // the same node showed one name on the phone holding its own radio
+        // and a different one on everybody else's. The field is sixteen bytes
+        // and a long name is fifteen at most here, so the short one was never
+        // buying anything.
+        strncpy(p.name, owner.long_name[0] ? owner.long_name : owner.short_name,
+                sizeof(p.name) - 1);
+        p.name[sizeof(p.name) - 1] = 0;
+        lastNameMs_ = nowMs;
+    }
+
+    uint8_t body[POSITION_MIN + sizeof(p.name)];
+    size_t n = encodePosition(p, body, sizeof(body));
+    if (n > 0) transmit(FRAME_POSITION, body, n, FAST_HOPS);
+}
+
+bool TougeFastModule::sendExtraBeacon(uint32_t nowMs)
+{
+    // Only a fix the ride has not had yet. A parked car, or a phone whose GPS
+    // gives one fix a second, has nothing new between lease beacons, and a
+    // repeat is airtime for nothing.
+    if (!sentOnce_) return false;
+    if (localPosition.latitude_i == sentLat_ && localPosition.longitude_i == sentLon_) return false;
+    // Extras sit 250 ms apart in the row; this only stops a second send in the
+    // same slot on the next tick.
+    if ((uint32_t)(nowMs - lastBeaconMs_) < EXTRA_MIN_GAP_MS) return false;
+
+    uint32_t phase = 0;
+    bool mine;
+    if (rideClock.phaseMs((uint64_t)esp_timer_get_time(), CYCLE_MS, phase)) {
+        mine = schedule_.inExtraSlotAtPhase(phase);
+    } else {
+        mine = schedule_.inExtraSlot(nowMs);
+    }
+    if (!mine) return false;
+
+    lastBeaconMs_ = nowMs;
+    sentLat_ = localPosition.latitude_i;
+    sentLon_ = localPosition.longitude_i;
+
+    Position p;
+    fillBeacon(p, nowMs);
+    p.extra = true;
+    uint8_t body[POSITION_MIN];
+    size_t n = encodePosition(p, body, sizeof(body));
+    // No hops: an extra is for the cars that hear us directly. Forwarding it
+    // would multiply the flood by the extra rate; the tail still gets our
+    // lease beacon, forwarded, once a second.
+    if (n > 0) transmit(FRAME_POSITION, body, n, 0);
+    return true;
+}
+
+void TougeFastModule::fillBeacon(Position &p, uint32_t nowMs)
+{
     p.lat = localPosition.latitude_i;
     p.lon = localPosition.longitude_i;
     // Meshtastic's units, whoever wrote the fix: ground_track is degrees x 1e5
@@ -606,26 +687,6 @@ void TougeFastModule::beacon(uint32_t nowMs)
 
     uint8_t battery = powerStatus ? (uint8_t)powerStatus->getBatteryChargePercent() : 255;
     p.batteryPct = battery;
-
-    if ((uint32_t)(nowMs - lastNameMs_) >= NAME_EVERY_MS) {
-        // The long name, because the frame has room for it.
-        //
-        // This sent short_name, which is four characters, and the receiving
-        // end wrote whatever arrived into long_name as well. So a car called
-        // "mattpixel" reached every other car on the fast lane as "matt", and
-        // the same node showed one name on the phone holding its own radio
-        // and a different one on everybody else's. The field is sixteen bytes
-        // and a long name is fifteen at most here, so the short one was never
-        // buying anything.
-        strncpy(p.name, owner.long_name[0] ? owner.long_name : owner.short_name,
-                sizeof(p.name) - 1);
-        p.name[sizeof(p.name) - 1] = 0;
-        lastNameMs_ = nowMs;
-    }
-
-    uint8_t body[POSITION_MIN + sizeof(p.name)];
-    size_t n = encodePosition(p, body, sizeof(body));
-    if (n > 0) transmit(FRAME_POSITION, body, n, FAST_HOPS);
 }
 
 meshtastic_Position TougeFastModule::asMeshPosition(const Position &p)
@@ -872,7 +933,7 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         Position syncBeacon;
         if (schedule_.takesClockFrom(f.src) && f.hops == FAST_HOPS && f.type == FRAME_POSITION &&
             !(f.src == lastSyncSrc_ && f.id == lastSyncId_) &&
-            decodePosition(body, bodyLen, syncBeacon)) {
+            decodePosition(body, bodyLen, syncBeacon) && !syncBeacon.extra) {
             lastSyncSrc_ = f.src;
             lastSyncId_ = f.id;
             schedule_.syncTo(rx.rxMs, syncBeacon.slot, SYNC_BIAS_MS);
@@ -897,10 +958,15 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
                 // the new channel, and countOn then read those as cars that
                 // had already moved - the hop counting its own backlog as
                 // proof it had succeeded.
-                mesh_.note(f.src, p, HEARD_FAST, rx.rssi, FAST_HOPS - f.hops, nowMs, rx.chan);
-                // Direct copies only: the slot map says who got through to us
-                // in which slot, and a forward says nothing about that.
-                if (f.hops == FAST_HOPS) schedule_.heardSlot(p.slot, f.src, nowMs);
+                // An extra beacon is sent with no hops left but comes straight
+                // from its sender, so it counts as direct for the roster.
+                const uint8_t hopsAway = p.extra ? 0 : (uint8_t)(FAST_HOPS - f.hops);
+                mesh_.note(f.src, p, HEARD_FAST, rx.rssi, hopsAway, nowMs, rx.chan);
+                // Lease beacons heard directly only: the slot map says who got
+                // through in which slot. A forward says nothing about that, and
+                // an extra was not sent in the slot it names, so counting it
+                // could make a clashed lease look heard.
+                if (f.hops == FAST_HOPS && !p.extra) schedule_.heardSlot(p.slot, f.src, nowMs);
                 // A newer belief about the channel wins, wherever it comes
                 // from. Only acted on after the tag has already passed, so a
                 // stranger cannot walk the ride off its channel.
@@ -1165,8 +1231,10 @@ void TougeFastModule::status(uint32_t nowMs)
     // The lease generation rides along so a log shows who would win a clash.
     char slotText[24];
     if (schedule_.claimed()) {
-        snprintf(slotText, sizeof(slotText), "%u@g%u", (unsigned)schedule_.slot(),
-                 (unsigned)schedule_.leaseGeneration());
+        // And how many extra slots it has this second, 0 to 3.
+        snprintf(slotText, sizeof(slotText), "%u@g%u+%u", (unsigned)schedule_.slot(),
+                 (unsigned)schedule_.leaseGeneration(),
+                 (unsigned)__builtin_popcount(schedule_.extraSlots()));
     } else {
         snprintf(slotText, sizeof(slotText), "none@g%u", (unsigned)schedule_.generation());
     }
@@ -1450,7 +1518,7 @@ PhoneRecord TougeFastModule::phoneRecordFor(const Frame &f, const Position &p, i
     r.rssi = rssi;
     r.external = p.phoneAttached;
     r.lane = LANE_FAST;
-    r.hopsAway = f.hops <= FAST_HOPS ? (uint8_t)(FAST_HOPS - f.hops) : 0;
+    r.hopsAway = (p.extra || f.hops > FAST_HOPS) ? 0 : (uint8_t)(FAST_HOPS - f.hops);
     r.heardMs = millis();
     return r;
 }

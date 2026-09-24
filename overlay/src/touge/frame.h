@@ -113,6 +113,11 @@ struct Position {
   // know, because the reference car has to be one of the locked ones or the
   // cars with GPS and the cars without end up on two different cycles.
   bool clockLocked = false;
+  // An extra beacon, sent in a free slot of the sender's row rather than its
+  // lease. Receivers never forward it, sync to it, or put it in a slot map.
+  // Rides in a flag bit that build 30 and 31 left zero; they read it as a
+  // copy that has already used up its hops. See schedule.h.
+  bool extra = false;
   // Which transmit slot this car leases, or SLOT_NONE. A whole byte since
   // version 2; the old nibble capped the schedule at fifteen.
   uint8_t slot = SLOT_NONE;
