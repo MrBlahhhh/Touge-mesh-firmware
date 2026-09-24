@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Touge radio flasher</title>
+  <meta name="description" content="Put the Touge build on a Heltec V3 or V4 radio from the browser. Based on Meshtastic.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23ff9a3c'/%3E%3Cpath d='M10 46 C22 46 20 18 32 18 S42 46 54 46' fill='none' stroke='%231a0d00' stroke-width='6' stroke-linecap='round'/%3E%3C/svg%3E">
+</head>
+<body>
+  <div id="no-serial" class="banner banner-warn" hidden>
+    This browser can't talk to a USB serial port. Use Chrome or Edge on a Windows, Mac or Linux computer.
+  </div>
+  <div id="bench-banner" class="banner banner-danger" hidden>
+    Bench build: its source isn't published yet. For testing on our own radios only, not for riders.
+  </div>
+
+  <main class="page">
+    <header class="header">
+      <svg class="mark" viewBox="0 0 64 64" aria-hidden="true">
+        <rect width="64" height="64" rx="14" fill="#ff9a3c"/>
+        <path d="M10 46 C22 46 20 18 32 18 S42 46 54 46" fill="none" stroke="#1a0d00" stroke-width="6" stroke-linecap="round"/>
+      </svg>
+      <div>
+        <h1>Touge radio flasher</h1>
+        <p class="subtitle">The Touge build for Heltec V3 and V4 radios, based on Meshtastic.</p>
+      </div>
+    </header>
+
+    <section class="steps" aria-label="Flashing steps">
+      <article class="step" id="step-device">
+        <div class="step-head"><span class="step-num">1</span><h2>Device</h2></div>
+        <div class="step-body">
+          <p id="device-hint">Plug the radio in with a USB data cable and press Connect. The page reads the chip and works out which board it is.</p>
+          <div class="picked" id="device-picked" hidden>
+            <span id="device-picked-art"></span>
+            <div>
+              <div class="name" id="device-picked-name"></div>
+              <div class="how" id="device-picked-how"></div>
+            </div>
+          </div>
+          <p class="chip-line" id="chip-line" hidden></p>
+          <p class="note note-bad" id="device-error" hidden></p>
+        </div>
+        <div class="step-actions">
+          <button class="btn btn-primary btn-wide" id="btn-connect" type="button">Connect</button>
+        </div>
+        <button class="btn-link" id="btn-manual" type="button">I know what this is</button>
+      </article>
+
+      <article class="step" id="step-firmware">
+        <div class="step-head"><span class="step-num">2</span><h2>Firmware</h2></div>
+        <div class="step-body">
+          <label for="release-select" class="note">Touge build</label>
+          <select class="select" id="release-select" disabled>
+            <option>Loading builds...</option>
+          </select>
+          <p class="note" id="release-detail"></p>
+          <p class="note" id="release-source"></p>
+        </div>
+      </article>
+
+      <article class="step" id="step-flash">
+        <div class="step-head"><span class="step-num">3</span><h2>Flash</h2></div>
+        <div class="step-body">
+          <p id="flash-hint">Pick a device and a build first.</p>
+        </div>
+        <div class="step-actions">
+          <button class="btn btn-primary btn-big" id="btn-flash" type="button" disabled>Flash</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="info">
+      <div class="card">
+        <h3>Which radio to buy</h3>
+        <p><strong>Heltec WiFi LoRa 32 V4, the 28 dBm high-power version.</strong> Six decibels over the 22 dBm one is roughly double the LoRa range, and it's the biggest hardware lever there is. Listings that don't say which they ship are usually the 22.</p>
+        <p>The V4 also has a u.FL <code>2.4G ANT</code> connector, so the 2.4 GHz fast lane (position and push-to-talk between nearby cars) can get a proper antenna.</p>
+        <p><strong>A Heltec V3 works too.</strong> Its 2.4 GHz side is on a fixed spring antenna with no connector, so the fast lane gets whatever that gives you. LoRa is the same.</p>
+        <p>GNSS isn't on the bare V4. It comes on the V4 expansion kit. Without it the radio uses the phone's position.</p>
+      </div>
+
+      <div class="card">
+        <h3>After flashing</h3>
+        <ol>
+          <li>Open the Touge app and pick the radio. After a fresh install the phone has to forget the old pairing and pair again, PIN <code>123456</code>.</li>
+          <li>Join the ride in the app. That puts the ride key on the radio, which sets up both LoRa and the 2.4 GHz lane.</li>
+          <li>An update keeps the pairing and the ride, so after an update there's nothing to do.</li>
+        </ol>
+      </div>
+
+      <div class="card">
+        <h3>If it won't connect</h3>
+        <ul>
+          <li>Use a USB <strong>data</strong> cable. A lot of cables are charge-only and the radio never shows up.</li>
+          <li>Close anything else holding the port: the Meshtastic app on this computer, a serial monitor, another flasher tab.</li>
+          <li>Force bootloader mode: hold the <strong>BOOT</strong> button (labelled PRG on some boards), tap <strong>RST</strong>, let go of BOOT, then press Connect again.</li>
+          <li>A V3 talks through a Silicon Labs CP210x USB bridge. Windows 10 and 11 normally install the driver on their own; if no port shows up, install the <a href="https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers" target="_blank" rel="noopener">CP210x VCP driver</a>. A V4 uses the chip's own USB and needs no driver.</li>
+          <li>Chrome and Edge on a computer support this. Firefox and Safari don't. Chrome on Android hasn't been tested.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>Source</h3>
+        <p>The firmware is Meshtastic plus the Touge fast-mesh module. Source, build steps and issues: <a href="https://github.com/MrBlahhhh/Touge-mesh-firmware" target="_blank" rel="noopener">github.com/MrBlahhhh/Touge-mesh-firmware</a>.</p>
+        <p id="source-exact">The exact source for each build is linked under Firmware once a build is selected.</p>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <p>Touge radio flasher. The firmware is based on <a href="https://github.com/meshtastic/firmware" target="_blank" rel="noopener">Meshtastic</a> and, like it, is licensed GPL-3.0-or-later. You're entitled to the source for the binary you flash; each build links the exact commit it was built from.</p>
+      <p>Meshtastic&reg; is a registered trademark of Meshtastic LLC. This page and these builds aren't made or endorsed by the Meshtastic project.</p>
+      <p>Flashing uses Espressif's <a href="https://github.com/espressif/esptool-js" target="_blank" rel="noopener">esptool-js</a> (Apache-2.0).</p>
+    </footer>
+  </main>
+
+  <dialog id="device-dialog" aria-labelledby="device-dialog-title">
+    <div class="modal-head">
+      <h2 id="device-dialog-title">Pick the board</h2>
+      <button class="modal-close" type="button" data-close aria-label="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p class="note">Only do this if the automatic check got it wrong or couldn't run. The page still checks it's an ESP32-S3 with enough flash before writing anything.</p>
+      <div class="device-grid" id="device-grid"></div>
+    </div>
+  </dialog>
+
+  <dialog id="flash-dialog" aria-labelledby="flash-dialog-title">
+    <div class="modal-head">
+      <h2 id="flash-dialog-title">Flash</h2>
+      <button class="modal-close" type="button" data-close aria-label="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="flash-summary">
+        <span id="flash-art"></span>
+        <div id="flash-what"></div>
+      </div>
+
+      <div class="choices" id="flash-choices">
+        <label class="choice">
+          <input type="radio" name="mode" value="update" checked>
+          <span>
+            <span class="title">Update</span>
+            <span class="desc">Writes the new firmware only. Settings, the ride and the Bluetooth pairing stay as they are.</span>
+          </span>
+        </label>
+        <label class="choice choice-danger">
+          <input type="radio" name="mode" value="fresh">
+          <span>
+            <span class="title">Fresh install: erases the radio</span>
+            <span class="desc">Wipes every setting and the Bluetooth pairing. The phone has to pair again (PIN 123456) and the radio has to be set up for the ride again.</span>
+          </span>
+        </label>
+      </div>
+
+      <div class="flash-go">
+        <button class="btn btn-primary btn-big" id="btn-start" type="button">Update now</button>
+      </div>
+
+      <div class="progress-wrap" id="progress-wrap" hidden>
+        <div class="progress-label"><span id="progress-stage">Starting</span><span id="progress-pct"></span></div>
+        <div class="progress" id="progress"><div class="progress-bar" id="progress-bar"></div></div>
+      </div>
+
+      <div class="result" id="result" hidden></div>
+
+      <details class="log" id="log-details">
+        <summary>Serial log</summary>
+        <pre id="log"></pre>
+      </details>
+    </div>
+  </dialog>
+
+  <script type="module" src="flasher.js"></script>
+</body>
+</html>
