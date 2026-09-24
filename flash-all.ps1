@@ -1,11 +1,16 @@
 # Flash every Heltec radio plugged into this PC with the build that is already made.
 #
 # Building is the slow part - a V4's first build compiles all of Meshtastic -
-# and `pio run -t upload` checks and relinks before every flash. The same image
-# goes on every board of a type, so build once and then flash the finished
-# file to each board with `-t nobuild`, which is exactly pio's own upload (same
-# offsets, same bootloader, NVS left alone so settings and Bluetooth pairing
-# survive) minus the compiler.
+# and `pio run -t upload` rescans the whole tree before every flash. The same
+# image goes on every board of a type, so build once and then write the
+# finished file to each board with esptool. `-t nobuild` would be the pio way,
+# but Meshtastic's bin/platformio-custom.py fails without a build ("Import of
+# non-existent variable 'projenv'").
+#
+# What is written is what pio's upload writes for an update: the app at app0's
+# offset (read from the build's partitions.bin) and boot_app0.bin over otadata,
+# so the board boots app0 even after an OTA left it pointing at app1. NVS is
+# left alone, so settings and Bluetooth pairing survive.
 #
 # Which build a port gets is decided by asking the chip, not by the USB ID. A
 # USB vendor ID only says Silicon Labs or Espressif made the USB bridge, and
@@ -34,8 +39,36 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$python = Join-Path $env:USERPROFILE ".platformio\penv\Scripts\python.exe"
-$esptool = Join-Path $env:USERPROFILE ".platformio\packages\tool-esptoolpy\esptool.py"
+# The builds use C:\Projects\pio-clean, not ~/.platformio; take the tools from
+# the same core so a flash never wakes the other one up.
+if (-not $env:PLATFORMIO_CORE_DIR) { $env:PLATFORMIO_CORE_DIR = "C:\Projects\pio-clean" }
+$core = $env:PLATFORMIO_CORE_DIR
+$python = Join-Path $core "penv\Scripts\python.exe"
+$esptool = Join-Path $core "packages\tool-esptoolpy\esptool.py"
+$bootApp0 = Join-Path $core "packages\framework-arduinoespressif32\tools\partitions\boot_app0.bin"
+
+# The finished image of one env and where it goes, from the build folder.
+function Image-For([string]$envName) {
+    $dir = Join-Path $Checkout ".pio\build\$envName"
+    $app = Get-ChildItem (Join-Path $dir "firmware-*.bin") -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch '\.factory\.bin$' } | Select-Object -First 1
+    $table = Join-Path $dir "partitions.bin"
+    if (-not $app -or -not (Test-Path $table)) { throw "no finished $envName build in $dir" }
+
+    # 32-byte entries: magic AA 50, type, subtype, offset, size, name. Type 0 is
+    # an app, subtype 0x10 is ota_0 (app0), 0x00 a plain factory app; 1/0 is otadata.
+    $bytes = [IO.File]::ReadAllBytes($table)
+    $appOffset = $null; $otaOffset = $null
+    for ($i = 0; $i + 32 -le $bytes.Length; $i += 32) {
+        if ($bytes[$i] -ne 0xAA -or $bytes[$i + 1] -ne 0x50) { break }
+        $type = $bytes[$i + 2]; $sub = $bytes[$i + 3]
+        $offset = [BitConverter]::ToUInt32($bytes, $i + 4)
+        if ($type -eq 0 -and ($sub -eq 0x10 -or $sub -eq 0x00) -and $null -eq $appOffset) { $appOffset = $offset }
+        if ($type -eq 1 -and $sub -eq 0x00) { $otaOffset = $offset }
+    }
+    if ($null -eq $appOffset) { throw "no app partition in $table" }
+    return [pscustomobject]@{ App = $app.FullName; Built = $app.LastWriteTime; AppOffset = $appOffset; OtaOffset = $otaOffset }
+}
 
 $manual = @{}
 foreach ($m in $Map) {
@@ -96,10 +129,22 @@ try {
         }
     }
 
+    $images = @{}
+    foreach ($envName in ($boards.Env | Sort-Object -Unique)) {
+        $images[$envName] = Image-For $envName
+        Write-Host "== $envName image: $(Split-Path -Leaf $images[$envName].App), built $($images[$envName].Built)"
+    }
+
+    # esptool prints warnings on stderr, which Windows PowerShell would turn
+    # into a terminating error under Stop; its exit code is what counts.
+    $ErrorActionPreference = "Continue"
     $failed = @()
     foreach ($b in $boards) {
+        $img = $images[$b.Env]
         Write-Host "== flashing $($b.Env) on $($b.Port)"
-        pio run -e $b.Env -t nobuild -t upload --upload-port $b.Port
+        $writes = @(('0x{0:X}' -f $img.AppOffset), $img.App)
+        if ($null -ne $img.OtaOffset) { $writes += @(('0x{0:X}' -f $img.OtaOffset), $bootApp0) }
+        & $python $esptool --chip esp32s3 --port $b.Port --baud 921600 write_flash @writes
         if ($LASTEXITCODE -ne 0) { $failed += $b.Port }
     }
 } finally {
