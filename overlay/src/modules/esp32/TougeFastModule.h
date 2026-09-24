@@ -78,6 +78,9 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // had come off the LoRa radio, so NodeDB, the OLED and the phone all see
     // it without any of them needing to know this module exists.
     void inject(const touge::Frame &f, const uint8_t *body, size_t len, int8_t rssi);
+    void sendPositionToPhone(uint32_t src, uint32_t packetId, const meshtastic_Position &mp, int8_t rssi);
+    // Sends positions that arrived early for the phone gate once they are due.
+    void sendHeldPhonePositions(uint32_t nowMs);
 
     bool transmit(uint8_t type, const uint8_t *body, size_t len, uint8_t hops);
 

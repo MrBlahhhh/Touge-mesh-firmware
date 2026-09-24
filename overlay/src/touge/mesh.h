@@ -149,6 +149,16 @@ uint32_t forwardSpreadMs(size_t neighbours);
  */
 uint32_t forwardDelayMs(int16_t rssi, uint32_t spreadMs, uint32_t tieBreak);
 
+/**
+ * A deadline on a fixed [periodMs] grid, moved on only once it has passed.
+ *
+ * A deadline still ahead of [nowMs] comes back unchanged, so an extra send
+ * before it (a movement-triggered beacon) cannot push the next one later. A
+ * passed one moves to the first grid point after [nowMs]. Signed compare, so
+ * the millis() wrap is harmless.
+ */
+uint32_t nextOnGrid(uint32_t deadlineMs, uint32_t periodMs, uint32_t nowMs);
+
 enum Heard : uint8_t {
   HEARD_NONE = 0,
   HEARD_LORA = 1,
@@ -169,8 +179,12 @@ struct Rider {
   uint32_t id = 0;
   Position pos;
   uint32_t atMs = 0;
-  // When this car's position was last handed to the phone. Zero means never.
+  // When this car's position is next due to the phone. Zero means never sent.
   uint32_t phoneMs = 0;
+  // A position arrived before phoneMs and is waiting for it. pos holds the
+  // newest one, phoneFrameId the frame it came in.
+  bool phonePending = false;
+  uint32_t phoneFrameId = 0;
   uint8_t via = HEARD_NONE;
   int16_t rssi = 0;
   uint8_t hopsAway = 0;
@@ -255,8 +269,15 @@ class Mesh {
    * being kept at full rate underneath, so this is purely about what crosses
    * the wire. A car whose frames are being dropped for want of queue space is
    * worse off at four a second than at one.
+   *
+   * A position that is not due yet is held rather than dropped (see
+   * nextPhonePending), so an arrival a millisecond early goes out at the
+   * deadline instead of waiting a whole beacon for the next one.
    */
-  bool phoneDue(uint32_t id, uint32_t everyMs, uint32_t nowMs);
+  bool phoneDue(uint32_t id, uint32_t frameId, uint32_t everyMs, uint32_t nowMs);
+
+  // A car whose held position has come due, stamped as sent. Null when none.
+  const Rider* nextPhonePending(uint32_t everyMs, uint32_t nowMs);
   const Rider* find(uint32_t id) const;
 
   // Packet ids must never be reused under one channel key, because the id is

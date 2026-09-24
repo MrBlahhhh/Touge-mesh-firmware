@@ -153,7 +153,8 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // 26: core-patches/0003, the BLE advertising restart a disconnect could lose.
 // 27: the receiver's own fix to the phone ("gf"), and GNSS speed read as km/h.
 // 28: core-patches/0004, a board that never found a GNSS stops probing for one.
-const uint32_t TOUGE_BUILD = 28;
+// 29: early beacons keep the 1 s deadline, early phone positions are held, and km/h + track e5 both ways.
+const uint32_t TOUGE_BUILD = 29;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -540,13 +541,11 @@ void TougeFastModule::beacon(uint32_t nowMs)
 
     wantBeacon_ = false;
     lastBeaconMs_ = nowMs;
-    // Advance the beacon deadline on the 1 s grid, catching up if a long slot
-    // wait or a distance-triggered send put us past it, so the next time-beacon
-    // lands on the second rather than a slot-wait later.
+    // Move the 1 s deadline on only if it has passed. Advancing it on every
+    // send let each movement-triggered beacon push it a second later, and a
+    // run of them left a car that stopped silent for several seconds.
     if (nextBeaconMs_ == 0) nextBeaconMs_ = nowMs;
-    do {
-        nextBeaconMs_ += GATE_IDLE_MS;
-    } while ((int32_t)(nowMs - nextBeaconMs_) >= 0);
+    nextBeaconMs_ = nextOnGrid(nextBeaconMs_, GATE_IDLE_MS, nowMs);
     sentLat_ = localPosition.latitude_i;
     sentLon_ = localPosition.longitude_i;
     sentOnce_ = true;
@@ -554,15 +553,12 @@ void TougeFastModule::beacon(uint32_t nowMs)
     Position p;
     p.lat = localPosition.latitude_i;
     p.lon = localPosition.longitude_i;
-    p.headingDeg = (uint16_t)(localPosition.ground_track / 1e5);
-    // The app's LOC_EXTERNAL fix carries m/s. The board's own GNSS fix carries
-    // whole km/h (GPS.cpp, TinyGPS kmph()), which read as m/s put a car on its
-    // own receiver at 3.6 times its real speed.
-    const bool fromReceiver =
-        localPosition.location_source == meshtastic_Position_LocSource_LOC_INTERNAL;
-    const float speedMps =
-        fromReceiver ? (float)localPosition.ground_speed / 3.6f : (float)localPosition.ground_speed;
-    p.speedMph = speedToMph(speedMps);
+    // Meshtastic's units, whoever wrote the fix: ground_track is degrees x 1e5
+    // (GPS.cpp) and ground_speed whole km/h (the proto comment, and GPS.cpp via
+    // TinyGPS kmph()). From build 29 the app sends the same, so one conversion
+    // covers the phone's LOC_EXTERNAL fix and the board's own receiver.
+    p.headingDeg = (uint16_t)(localPosition.ground_track / 100000);
+    p.speedMph = speedToMph((float)localPosition.ground_speed / 3.6f);
     p.hasFix = true;
     // Whose fix this is, honestly.
     //
@@ -627,8 +623,13 @@ meshtastic_Position TougeFastModule::asMeshPosition(const Position &p)
     mp.longitude_i = p.lon;
     mp.has_latitude_i = true;
     mp.has_longitude_i = true;
+    // Same units as the beacon reads. Both fields are proto3 optional, so
+    // without the has_ flags the encoder drops them and the phone sees a car
+    // with no speed and no heading.
     mp.ground_track = (uint32_t)p.headingDeg * 100000;
-    mp.ground_speed = (uint32_t)(p.speedMph / 2.23694f);
+    mp.has_ground_track = true;
+    mp.ground_speed = (uint32_t)(p.speedMph * 1.609344f + 0.5f);
+    mp.has_ground_speed = true;
     // What the sender said it was, not what we wish it were.
     mp.location_source = p.phoneAttached ? meshtastic_Position_LocSource_LOC_EXTERNAL
                                          : meshtastic_Position_LocSource_LOC_INTERNAL;
@@ -684,50 +685,14 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
         // RoutingModule, which owns the only live handleFromRadio call. So
         // the app went blind to precisely the cars the fast lane was working
         // for, while the OLED two feet away looked perfect.
-        // One per car per second, not one per beacon.
-        //
-        // The lane carries four positions a second per car and each was
-        // becoming its own MeshPacket on the phone queue. Twenty-eight cars is
-        // a hundred and twelve packets a second down a BLE link that manages
-        // about thirty even at the fast connection interval, so the queue
-        // filled at its thirty-two packet ceiling and sendToPhone began
-        // dropping the newest non-text packets - positions, the fast-lane
-        // status, and voice. The app then reported a dead lane on a saturated
-        // healthy one, which is the worst of both: the traffic was lost and
-        // the diagnosis pointed away from the cause.
-        //
-        // The roster above is still kept at full rate; this is only about what
-        // crosses the wire, and a screen cannot use more than a few a second.
-        if (!mesh_.phoneDue(f.src, PHONE_POSITION_MS, millis())) return;
-
-        meshtastic_MeshPacket *pp = router->allocForSending();
-        if (pp) {
-            pp->from = f.src;
-            pp->to = NODENUM_BROADCAST;
-            pp->id = f.id;
-            pp->channel = channels.getPrimaryIndex();
-            pp->hop_limit = 0;
-            pp->hop_start = 0;
-            // rx_rssi has explicit presence in this Meshtastic: without the
-            // has_ flag the number is dropped on the way to the phone, and the
-            // app showed the fast lane with no signal strength at all while
-            // LoRa, set by Meshtastic's own receive path, had one. Zero is what
-            // an old core gives when it cannot see the RSSI; leave that absent.
-            pp->rx_rssi = rssi;
-            pp->has_rx_rssi = rssi != 0;
-            pp->rx_time = mp.time;
-            pp->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
-            pp->decoded.portnum = meshtastic_PortNum_POSITION_APP;
-            size_t n = pb_encode_to_bytes(pp->decoded.payload.bytes, sizeof(pp->decoded.payload.bytes),
-                                          &meshtastic_Position_msg, &mp);
-            if (n > 0) {
-                pp->decoded.payload.size = (uint16_t)n;
-                service->sendToPhone(pp);
-            } else {
-                // An oversized encode is silent and returns 0. Shipping the
-                // empty packet would look like a position of nowhere.
-                packetPool.release(pp);
-            }
+        // One per car per second, not one per beacon. Four a second per car
+        // from twenty-eight cars is 112 packets a second down a BLE link that
+        // manages about thirty, so the phone queue filled and dropped the newest
+        // of everything: positions, fast-lane status and voice. The roster above
+        // still runs at full rate. An early arrival is held rather than dropped
+        // and goes out at its deadline from sendHeldPhonePositions.
+        if (mesh_.phoneDue(f.src, f.id, PHONE_POSITION_MS, millis())) {
+            sendPositionToPhone(f.src, f.id, mp, rssi);
         }
 
         if (p.name[0] != 0) {
@@ -790,6 +755,49 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
     memcpy(p->decoded.payload.bytes, body, len);
     p->decoded.payload.size = (uint16_t)len;
     service->sendToPhone(p);
+}
+
+void TougeFastModule::sendPositionToPhone(uint32_t src, uint32_t packetId, const meshtastic_Position &mp,
+                                          int8_t rssi)
+{
+    meshtastic_MeshPacket *pp = router->allocForSending();
+    if (!pp) return;
+    pp->from = src;
+    pp->to = NODENUM_BROADCAST;
+    pp->id = packetId;
+    pp->channel = channels.getPrimaryIndex();
+    pp->hop_limit = 0;
+    pp->hop_start = 0;
+    // rx_rssi has explicit presence in this Meshtastic: without the has_ flag
+    // the number never reaches the phone. Zero is what an old core gives when
+    // it cannot see the RSSI; leave that absent.
+    pp->rx_rssi = rssi;
+    pp->has_rx_rssi = rssi != 0;
+    pp->rx_time = mp.time;
+    pp->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    pp->decoded.portnum = meshtastic_PortNum_POSITION_APP;
+    size_t n = pb_encode_to_bytes(pp->decoded.payload.bytes, sizeof(pp->decoded.payload.bytes),
+                                  &meshtastic_Position_msg, &mp);
+    if (n == 0) {
+        // An oversized encode is silent and returns 0. Shipping the empty
+        // packet would look like a position of nowhere.
+        packetPool.release(pp);
+        return;
+    }
+    pp->decoded.payload.size = (uint16_t)n;
+    service->sendToPhone(pp);
+}
+
+void TougeFastModule::sendHeldPhonePositions(uint32_t nowMs)
+{
+    // Positions inject() held back for arriving before their car's deadline.
+    // The roster slot carries the newest one heard. Bounded like sendDeferred;
+    // anything left over is due again on the next tick.
+    for (int budget = 0; budget < 4; budget++) {
+        const Rider *r = mesh_.nextPhonePending(PHONE_POSITION_MS, nowMs);
+        if (r == nullptr) return;
+        sendPositionToPhone(r->id, r->phoneFrameId, asMeshPosition(r->pos), (int8_t)r->rssi);
+    }
 }
 
 uint32_t TougeFastModule::syncSource() const
@@ -1057,6 +1065,7 @@ int32_t TougeFastModule::runOnce()
     // other with one.
     const bool lost = (uint32_t)(now - lastHeardMs_) >= LOST_MS;
     if (!lost) sendDeferred(now);
+    sendHeldPhonePositions(now);
     beacon(now);
     mesh_.age(now);
     hopKeeping(now);
