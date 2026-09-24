@@ -1,0 +1,32 @@
+--- a/src/mesh/PhoneAPI.h
++++ b/src/mesh/PhoneAPI.h
+@@ -340,3 +340,8 @@
+     static LocalAdminGate classifyLocalAdminPacket(const meshtastic_MeshPacket &p, bool adminAuthorized,
+                                                    meshtastic_AdminMessage &outAdmin);
+ };
++
++/// Touge (core-patches/0006): called on the main task with each mesh packet as getFromRadio hands
++/// it to a phone transport. Over BLE that only happens when the phone is reading, so it counts
++/// what the phone actually got. Null unless the Touge module sets it.
++extern void (*phonePacketDeliveredHook)(const meshtastic_MeshPacket &p);
+--- a/src/mesh/PhoneAPI.cpp
++++ b/src/mesh/PhoneAPI.cpp
+@@ -55,6 +55,9 @@
+ // Flag to indicate a heartbeat was received and we should send queue status
+ bool heartbeatReceived = false;
+ 
++// Touge (core-patches/0006): see PhoneAPI.h.
++void (*phonePacketDeliveredHook)(const meshtastic_MeshPacket &p) = nullptr;
++
+ #ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
+ // Auth-slot table and status-slot table are both sized to the typical
+ // SerialConsole + BluetoothPhoneAPI footprint plus room for WiFi/TCP
+@@ -1081,6 +1084,8 @@
+                 // Encapsulate as a FromRadio packet
+                 fromRadioScratch.which_payload_variant = meshtastic_FromRadio_packet_tag;
+                 fromRadioScratch.packet = *packetForPhone;
++                if (phonePacketDeliveredHook)
++                    phonePacketDeliveredHook(fromRadioScratch.packet);
+                 releasePhonePacket();
+             }
+         } else if (replayPending()) {

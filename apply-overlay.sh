@@ -92,7 +92,10 @@ rm -f "$MODULES.bak"
 # in core-patches/ so a fresh checkout gets them too - the rate limit that lets
 # the fast lane's 1 Hz feed through (PhoneAPI.cpp) and the BLE params that stop
 # the radio throttling itself after setup, and the advertising restart a
-# disconnect could lose (both NimbleBluetooth.cpp). Without these
+# disconnect could lose (both NimbleBluetooth.cpp), and from build 30 the phone
+# queue's newest-wins positions (MeshService.cpp), the delivered hook
+# (PhoneAPI.cpp) and the pre-encoded batch path (NimbleBluetooth.cpp), which
+# TougeFastModule links against. Without these
 # the fast lane builds but does not carry. Idempotent: a patch that already
 # reverse-applies is in, and is skipped.
 if ls "$HERE"/core-patches/*.patch >/dev/null 2>&1; then

@@ -35,6 +35,7 @@
 #include "touge/frame.h"
 #include "touge/gnssfix.h"
 #include "touge/mesh.h"
+#include "touge/phonebatch.h"
 #include "touge/ride.h"
 #include "touge/hop.h"
 #include "touge/rideclock.h"
@@ -91,9 +92,6 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // See handleReceived for why the LoRa copy is now allowed through at all.
     void reassertFastPositions();
 
-    // The car whose beacon sets our clock. See Schedule::parentId.
-    uint32_t syncSource() const;
-
     // Packet ids are half the AES-CTR nonce, so they must never repeat under
     // one channel key. NVS holds a value safely ahead of anything already
     // sent, and it is re-armed in blocks rather than written every packet.
@@ -142,6 +140,36 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     int32_t sentLat_ = 0;
     int32_t sentLon_ = 0;
     bool sentOnce_ = false;
+
+    // ---- Positions to the phone in batches, and the link counters ----------
+    // SCALE-PLAN steps 1 and 3; the pure parts are in touge/phonebatch.h.
+
+    bool batchingToPhone() const { return helloSeen_ && (hello_.flags & touge::HELLO_BATCHES) != 0; }
+    touge::PhoneRecord phoneRecordFor(const touge::Frame &f, const touge::Position &p, int8_t rssi) const;
+    void offerToPhone(const touge::PhoneRecord &r);
+    void flushPhoneBatch(uint32_t nowMs);
+    // Hands one encoded batch toward the phone: pre-encoded for the next read
+    // when allowed, the ordinary phone queue otherwise. False if neither took it.
+    bool handPhoneBatch(const uint8_t *payload, size_t len, uint16_t seq);
+    // Once a tick: queue depth, a phone that went away, a pre-encoded batch read.
+    void trackPhoneLink(uint32_t nowMs);
+    void notePhoneRead(uint16_t seq);
+    void reportLinkStats(uint32_t nowMs, uint32_t windowMs);
+    void queueJsonToPhone(const char *json, size_t len);
+    void notePhoneDelivered(const meshtastic_MeshPacket &p);
+    static void onPhoneDelivered(const meshtastic_MeshPacket &p);
+
+    touge::PhoneStore phoneStore_;
+    touge::BatchesInFlight batchesInFlight_;
+    touge::LinkStats stats_;
+    touge::LinkStats statsAtLastReport_;
+    touge::PhoneHello hello_;
+    bool helloSeen_ = false;
+    uint16_t batchSeq_ = 0;
+    // The batch sitting pre-encoded in NimBLE's read queue, -1 for none.
+    int32_t preloadedSeq_ = -1;
+    uint32_t preloadReadSeen_ = 0;
+    uint32_t preloadLostSeen_ = 0;
 };
 
 extern TougeFastModule *tougeFastModule;

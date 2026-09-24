@@ -81,16 +81,19 @@ size_t encodePosition(const Position& p, uint8_t* out, size_t cap) {
   out[8] = (uint8_t)((p.headingDeg % 360) / 2);
   out[9] = p.speedMph;
   out[10] = p.batteryPct;
-  // Flags in the low nibble, slot in the high one. Nine slots fit in four
-  // bits with room to spare, and a whole byte for a number that small would be
-  // a byte on every ping forever.
+  // Flags in the low nibble. The high nibble was the slot in version 1 and is
+  // zero now; the slot has its own byte below.
   out[11] = (uint8_t)((p.hasFix ? 0x01 : 0) | (p.phoneAttached ? 0x02 : 0) |
-                      (p.clockLocked ? 0x04 : 0) | ((p.slot & 0x0F) << 4));
+                      (p.clockLocked ? 0x04 : 0));
   out[12] = p.hop;
   put32(out + 13, p.refId);
   // The hop count in the low nibble, whether that reference is GPS-locked in
   // the next bit up. Both are about the same claim, so they travel together.
   out[17] = (uint8_t)((p.refHops & 0x0F) | (p.refLocked ? 0x10 : 0));
+  out[18] = p.slot;
+  put16(out + 19, p.leaseGen);
+  put16(out + 21, p.schedGen);
+  memcpy(out + 23, p.slotMap, SLOT_MAP_LEN);
   if (nameLen > 0) memcpy(out + POSITION_MIN, p.name, nameLen);
   return POSITION_MIN + nameLen;
 }
@@ -106,11 +109,14 @@ bool decodePosition(const uint8_t* in, size_t len, Position& out) {
   out.hasFix = (in[11] & 0x01) != 0;
   out.phoneAttached = (in[11] & 0x02) != 0;
   out.clockLocked = (in[11] & 0x04) != 0;
-  out.slot = (uint8_t)((in[11] >> 4) & 0x0F);
   out.hop = in[12];
   out.refId = get32(in + 13);
   out.refHops = (uint8_t)(in[17] & 0x0F);
   out.refLocked = (in[17] & 0x10) != 0;
+  out.slot = in[18];
+  out.leaseGen = get16(in + 19);
+  out.schedGen = get16(in + 21);
+  memcpy(out.slotMap, in + 23, SLOT_MAP_LEN);
 
   size_t nameLen = len - POSITION_MIN;
   // A sender on a newer build may carry a longer name than this build knows

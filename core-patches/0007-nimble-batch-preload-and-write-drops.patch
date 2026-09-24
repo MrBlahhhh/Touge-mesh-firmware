@@ -1,0 +1,164 @@
+--- a/src/nimble/NimbleBluetooth.h
++++ b/src/nimble/NimbleBluetooth.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ #include "BluetoothCommon.h"
++#include <stddef.h>
++#include <stdint.h>
+ 
+ class NimbleBluetooth : BluetoothApi
+ {
+@@ -19,4 +21,21 @@
+     void setupService();
+ };
+ 
+-void setBluetoothEnable(bool enable);
+\ No newline at end of file
++void setBluetoothEnable(bool enable);
++
++// Touge (core-patches/0007). Counters for the Touge fast lane's delivery stats.
++struct NimbleTougeCounters {
++    uint32_t writeDropped = 0;   // phone writes lost to a full fromPhoneQueue after the ATT write succeeded
++    uint32_t writeDuplicate = 0; // writes identical to the previous one, discarded
++    uint32_t offered = 0;        // pre-encoded batches put in front of the phone
++    uint32_t offeredRead = 0;    // and read by it
++    uint32_t offerRefused = 0;   // not taken: no link, not streaming, or one already waiting
++    uint32_t offeredLost = 0;    // still queued when the link went
++};
++void nimbleTougeCounters(NimbleTougeCounters &out);
++
++// Touge (core-patches/0007): puts an already-encoded FromRadio where the next BLE read is answered
++// from, so the read does not wait on the main task to run getFromRadio. Stock turns preloading off
++// while streaming because a preloaded packet dies with the link; this is only for position batches,
++// which the next batch supersedes anyway. Everything else keeps the stock path. False when not taken.
++bool nimbleOfferToPhone(const uint8_t *fromRadio, size_t len);
+\ No newline at end of file
+--- a/src/nimble/NimbleBluetooth.cpp
++++ b/src/nimble/NimbleBluetooth.cpp
+@@ -92,7 +92,10 @@
+ // #define DEBUG_NIMBLE_NOTIFY          // uncomment to enable notify logging
+ 
+ #define NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE 3
+-#define NIMBLE_BLUETOOTH_FROM_PHONE_QUEUE_SIZE 3
++// Touge (core-patches/0007): 6, not 3. onWrite runs after the ATT write has already been acknowledged,
++// so a full queue loses the packet with the phone believing it was delivered. The phone's 1 Hz fix,
++// its 5 s broadcast and a chat or config write land together often enough to overflow three.
++#define NIMBLE_BLUETOOTH_FROM_PHONE_QUEUE_SIZE 6
+ 
+ BLECharacteristic *fromNumCharacteristic;
+ BLECharacteristic *BatteryCharacteristic;
+@@ -508,6 +511,18 @@
+ };
+ 
+ static BluetoothPhoneAPI *bluetoothPhoneAPI;
++
++// Touge (core-patches/0007): counters for NimbleTougeCounters, and the one pre-encoded FromRadio
++// that nimbleOfferToPhone may have put in toPhoneQueue. tougeOfferedIndex is its place in that
++// queue, -1 for none; it moves under toPhoneMutex with the queue itself.
++static std::atomic<uint32_t> tougeWriteDropped{0};
++static std::atomic<uint32_t> tougeWriteDuplicate{0};
++static std::atomic<uint32_t> tougeOffered{0};
++static std::atomic<uint32_t> tougeOfferedRead{0};
++static std::atomic<uint32_t> tougeOfferRefused{0};
++static std::atomic<uint32_t> tougeOfferedLost{0};
++static std::atomic<int> tougeOfferedIndex{-1};
++static uint32_t tougeOfferNotifyNum = 0;
+ /**
+  * Subclasses can use this as a hook to provide custom notifications for their transport (i.e. bluetooth notifies)
+  */
+@@ -556,10 +571,12 @@
+                           finishMillis - startMillis, val.getLength());
+ #endif
+             } else {
++                tougeWriteDropped++;
+                 LOG_WARN("BLE onWrite(%d): Drop ToRadio packet, fromPhoneQueue full (%u bytes)", currentWriteCount,
+                          val.getLength());
+             }
+         } else {
++            tougeWriteDuplicate++;
+             LOG_DEBUG("BLE onWrite(%d): Drop duplicate ToRadio packet (%u bytes)", currentWriteCount, val.getLength());
+         }
+     }
+@@ -655,6 +672,15 @@
+                 // Safe decrement due to onDisconnect
+                 if (bluetoothPhoneAPI->toPhoneQueueSize > 0)
+                     bluetoothPhoneAPI->toPhoneQueueSize--;
++
++                // Touge (core-patches/0007): the offered batch moved up one, or was the one just read.
++                const int offered = tougeOfferedIndex.load();
++                if (offered == 0) {
++                    tougeOfferedRead++;
++                    tougeOfferedIndex = -1;
++                } else if (offered > 0) {
++                    tougeOfferedIndex = offered - 1;
++                }
+             } else {
+                 // nothing in the toPhoneQueue; that's fine, and we'll just have numBytes=0.
+             }
+@@ -676,6 +702,55 @@
+     }
+ };
+ 
++// Touge (core-patches/0007): see NimbleBluetooth.h. Main task only.
++bool nimbleOfferToPhone(const uint8_t *fromRadio, size_t len)
++{
++#ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
++    // This path skips PhoneAPI's per-connection authorisation, so it stays shut where that exists.
++    (void)fromRadio;
++    (void)len;
++    tougeOfferRefused++;
++    return false;
++#else
++    if (!bluetoothPhoneAPI || !fromNumCharacteristic || fromRadio == nullptr || len == 0 || len > meshtastic_FromRadio_size ||
++        nimbleBluetoothConnHandle.load() == BLE_HS_CONN_HANDLE_NONE || !bluetoothPhoneAPI->isSendingPackets()) {
++        tougeOfferRefused++;
++        return false;
++    }
++    {
++        std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->toPhoneMutex);
++        const size_t size = bluetoothPhoneAPI->toPhoneQueueSize.load();
++        // One offered batch at a time, and never the last free place: the main task's own
++        // getFromRadio answer for a waiting onRead needs somewhere to go.
++        if (tougeOfferedIndex.load() >= 0 || size + 1 >= NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE) {
++            tougeOfferRefused++;
++            return false;
++        }
++        memcpy(bluetoothPhoneAPI->toPhoneQueue[size].data(), fromRadio, len);
++        bluetoothPhoneAPI->toPhoneQueueByteSizes[size] = len;
++        tougeOfferedIndex = (int)size;
++        bluetoothPhoneAPI->toPhoneQueueSize++;
++    }
++    tougeOffered++;
++    // The phone reads on a fromNum notify; the value is only a counter.
++    uint8_t val[4];
++    put_le32(val, ++tougeOfferNotifyNum);
++    fromNumCharacteristic->setValue(val, sizeof(val));
++    fromNumCharacteristic->notify();
++    return true;
++#endif
++}
++
++void nimbleTougeCounters(NimbleTougeCounters &out)
++{
++    out.writeDropped = tougeWriteDropped.load();
++    out.writeDuplicate = tougeWriteDuplicate.load();
++    out.offered = tougeOffered.load();
++    out.offeredRead = tougeOfferedRead.load();
++    out.offerRefused = tougeOfferRefused.load();
++    out.offeredLost = tougeOfferedLost.load();
++}
++
+ // One log notify per log line shares the msys_1 mbuf pool with the fromNum doorbell and ATT
+ // responses, so a logging burst starves them; back off on rejection until the pool refills.
+ static constexpr uint32_t LOG_NOTIFY_BACKOFF_MS = 250;
+@@ -767,6 +842,10 @@
+         { // scope for toPhoneMutex mutex
+             std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->toPhoneMutex);
+             bluetoothPhoneAPI->toPhoneQueueSize = 0;
++            // Touge (core-patches/0007): an offered batch still queued is lost with the link.
++            if (tougeOfferedIndex.load() >= 0)
++                tougeOfferedLost++;
++            tougeOfferedIndex = -1;
+         }
+ 
+         bluetoothPhoneAPI->readCount = 0;

@@ -25,7 +25,11 @@ enum FrameType : uint8_t {
 };
 
 static const uint8_t FRAME_MAGIC = 0x54; // 'T', same as the app's VoicePacket
-static const uint8_t FRAME_VERSION = 1;
+// 2 from build 30: the position carries a whole-byte slot and two lease
+// generations for the 32-slot schedule. A version-1 board drops every
+// version-2 frame and the other way round, so a mixed ride only sees each
+// other over LoRa.
+static const uint8_t FRAME_VERSION = 2;
 static const size_t FRAME_HEADER = 14;
 
 // ESP-NOW tops out at 250 bytes and is the tightest of the two radios, so it
@@ -92,6 +96,11 @@ static const uint8_t REF_UNREACHABLE = 0x0F;
 
 static_assert(MAX_REF_HOPS < REF_UNREACHABLE, "the cap has to fit under the sentinel");
 
+// No lease held: still listening, or more cars than slots. See schedule.h.
+static const uint8_t SLOT_NONE = 0xFF;
+// One entry per slot in Position::slotMap. schedule.h asserts it matches.
+static const size_t SLOT_MAP_LEN = 32;
+
 struct Position {
   int32_t lat = 0; // degrees * 1e7
   int32_t lon = 0;
@@ -104,10 +113,23 @@ struct Position {
   // know, because the reference car has to be one of the locked ones or the
   // cars with GPS and the cars without end up on two different cycles.
   bool clockLocked = false;
-  // Which transmit slot this car holds, or SLOT_NONE if it has not claimed one
-  // yet. Free on the wire: it rides in the spare half of the flags byte, since
-  // there are nine slots and four bits to put them in.
-  uint8_t slot = 0x0F;
+  // Which transmit slot this car leases, or SLOT_NONE. A whole byte since
+  // version 2; the old nibble capped the schedule at fifteen.
+  uint8_t slot = SLOT_NONE;
+  // The generation the lease was issued at, which decides who keeps a slot
+  // two cars claim, and the newest generation this car has heard of, which is
+  // what a newcomer stamps its own lease past. See Schedule::rebuild.
+  uint16_t leaseGen = 0;
+  uint16_t schedGen = 0;
+  // Who this car heard directly in each slot over the last 1.5 s, as a
+  // one-byte tag of the sender's node number (slotTag), 0 for nobody.
+  //
+  // Two cars on one slot transmit together and never hear each other, so
+  // only a third car can tell them. A bare heard/not-heard bit was not
+  // enough: when one of the pair gets through on timing or capture, both
+  // read "heard" and both stay. The tag says which one. It also marks slots
+  // held by cars out of our own range.
+  uint8_t slotMap[SLOT_MAP_LEN] = {0};
   // Which channel this car believes the ride is on, and how recent that belief
   // is: two bits of index, six of generation. Carried by every car rather than
   // announced by one, so a car that missed a hop hears about it from whoever
@@ -150,7 +172,7 @@ struct Position {
   char name[16] = {0};
 };
 
-static const size_t POSITION_MIN = 18;
+static const size_t POSITION_MIN = 23 + SLOT_MAP_LEN;
 
 size_t encodePosition(const Position& p, uint8_t* out, size_t cap);
 bool decodePosition(const uint8_t* in, size_t len, Position& out);
