@@ -179,12 +179,6 @@ struct Rider {
   uint32_t id = 0;
   Position pos;
   uint32_t atMs = 0;
-  // When this car's position is next due to the phone. Zero means never sent.
-  uint32_t phoneMs = 0;
-  // A position arrived before phoneMs and is waiting for it. pos holds the
-  // newest one, phoneFrameId the frame it came in.
-  bool phonePending = false;
-  uint32_t phoneFrameId = 0;
   uint8_t via = HEARD_NONE;
   int16_t rssi = 0;
   uint8_t hopsAway = 0;
@@ -255,29 +249,6 @@ class Mesh {
    * channel that was working.
    */
   size_t countOn(uint8_t chan, uint32_t windowMs, uint32_t nowMs) const;
-
-  /**
-   * Whether this car's position is due to go to the phone, stamping it if so.
-   *
-   * The 2.4 GHz lane carries a position per car four times a second, and each
-   * one was becoming its own MeshPacket on the BLE queue. Twenty-eight cars is
-   * a hundred and twelve packets a second down a link that does about thirty,
-   * so the queue backed up at its thirty-two packet ceiling and the radio
-   * started dropping the newest - positions, fast-lane status and voice alike.
-   *
-   * The screen cannot use more than a few a second and the roster is already
-   * being kept at full rate underneath, so this is purely about what crosses
-   * the wire. A car whose frames are being dropped for want of queue space is
-   * worse off at four a second than at one.
-   *
-   * A position that is not due yet is held rather than dropped (see
-   * nextPhonePending), so an arrival a millisecond early goes out at the
-   * deadline instead of waiting a whole beacon for the next one.
-   */
-  bool phoneDue(uint32_t id, uint32_t frameId, uint32_t everyMs, uint32_t nowMs);
-
-  // A car whose held position has come due, stamped as sent. Null when none.
-  const Rider* nextPhonePending(uint32_t everyMs, uint32_t nowMs);
   const Rider* find(uint32_t id) const;
 
   // Packet ids must never be reused under one channel key, because the id is

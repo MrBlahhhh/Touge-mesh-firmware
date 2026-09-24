@@ -729,7 +729,7 @@ void test_a_batch_the_full_queue_refuses_frees_its_place() {
 
 void test_hello_round_trips_and_refuses_junk() {
   PhoneHello h;
-  h.flags = HELLO_BATCHES | HELLO_PRELOAD;
+  h.flags = HELLO_PRELOAD;
   h.mtu = 517;
   uint8_t buf[8];
   TEST_ASSERT_EQUAL(HELLO_LEN, encodeHello(h, buf, sizeof(buf)));
@@ -761,8 +761,10 @@ void test_stats_fit_a_payload_at_their_worst() {
   LinkStats s = maxed();
   TEST_ASSERT_TRUE(formatLaneStats(s, buf, sizeof(buf)) > 0);
   TEST_ASSERT_TRUE(formatQueueStats(s, buf, sizeof(buf)) > 0);
+  TEST_ASSERT_TRUE(formatDropStats(s, buf, sizeof(buf)) > 0);
 }
 
+// Named keys, pinned: the app's RadioCounters reads exactly these.
 void test_stats_format_as_the_app_reads_them() {
   LinkStats s;
   s.fast.tx = 1;
@@ -776,32 +778,69 @@ void test_stats_format_as_the_app_reads_them() {
   s.batchesRead = 9;
   s.replaced = 10;
   s.fastTxFail = 11;
+  s.queueDepth = 3;
+  s.queueDepthMax = 31;
+  s.storePending = 2;
+  s.oldestQueuedMs = 140;
+  s.minFreeHeap = 40000;
+  s.preloadOffered = 12;
+  s.preloadRead = 13;
+  s.preloadRefused = 14;
+  s.dropStoreFull = 21;
+  s.dropAlloc = 22;
+  s.dropLost = 23;
+  s.dropDisconnect = 24;
+  s.dropStale = 25;
+  s.coreReplaced = 26;
+  s.coreDropped = 27;
+  s.coreEvicted = 28;
+  s.dropExpired = 29;
+  s.writeDropped = 30;
+  s.writeDuplicate = 31;
   char buf[BATCH_MAX_PAYLOAD];
   formatLaneStats(s, buf, sizeof(buf));
-  TEST_ASSERT_EQUAL_STRING("{\"fs\":[1,1,2,3,4,5,6,7,8,9,10,11]}", buf);
+  TEST_ASSERT_EQUAL_STRING(
+      "{\"fs\":{\"tx\":1,\"rx\":2,\"sp\":3,\"q\":4,\"d\":5,\"lr\":6,\"ld\":7,\"b\":8,\"br\":9,\"rp\":10,\"tf\":11}}", buf);
+  formatQueueStats(s, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING(
+      "{\"fq\":{\"qd\":3,\"qm\":31,\"pe\":2,\"ol\":140,\"hp\":40000,\"po\":12,\"pr\":13,\"pf\":14}}", buf);
+  formatDropStats(s, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING(
+      "{\"fd\":{\"sf\":21,\"al\":22,\"lo\":23,\"dc\":24,\"st\":25,\"cr\":26,\"cd\":27,\"ce\":28,\"ex\":29,\"wl\":30,"
+      "\"wr\":31}}",
+      buf);
+}
 
-  LinkStats q;
-  q.queueDepth = 3;
-  q.queueDepthMax = 31;
-  q.storePending = 2;
-  q.oldestQueuedMs = 140;
-  q.dropStoreFull = 1;
-  q.dropAlloc = 2;
-  q.dropLost = 3;
-  q.dropDisconnect = 4;
-  q.dropStale = 5;
-  q.coreReplaced = 6;
-  q.coreDropped = 7;
-  q.writeDropped = 8;
-  q.writeDuplicate = 9;
-  q.preloadOffered = 10;
-  q.preloadRead = 11;
-  q.preloadRefused = 12;
-  q.minFreeHeap = 40000;
-  q.coreEvicted = 13;
-  q.dropExpired = 14;
-  formatQueueStats(q, buf, sizeof(buf));
-  TEST_ASSERT_EQUAL_STRING("{\"fq\":[1,3,31,2,140,1,2,3,4,5,6,7,8,9,10,11,12,40000,13,14]}", buf);
+// A Touge radio says its build even with the lane down, and why it is down.
+void test_the_lane_report_goes_out_when_the_lane_is_down() {
+  char buf[64];
+  TEST_ASSERT_TRUE(formatLaneDown(36, LaneDown::NO_KEY, buf, sizeof(buf)) > 0);
+  TEST_ASSERT_EQUAL_STRING("{\"fl\":{\"fw\":36,\"up\":0,\"why\":\"key\"}}", buf);
+  formatLaneDown(36, LaneDown::RADIO, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING("{\"fl\":{\"fw\":36,\"up\":0,\"why\":\"radio\"}}", buf);
+  formatLaneDown(36, LaneDown::STARTING, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING("{\"fl\":{\"fw\":36,\"up\":0,\"why\":\"boot\"}}", buf);
+  TEST_ASSERT_EQUAL(0, formatLaneDown(36, LaneDown::NO_KEY, buf, 10));
+}
+
+// Ages are a plain clamp now: a slightly negative one is 0, and a record past
+// RECORD_EXPIRE_MS never reaches the phone as a position.
+void test_ages_are_clamped_and_old_records_expire() {
+  PhoneRecord in[2] = {car(1, 1, 1005), car(2, 1, 0)};
+  uint8_t buf[BATCH_MAX_PAYLOAD];
+  size_t n = encodeBatch(in, 2, 1, 1000, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_HEX8(0, buf[BATCH_HEADER + 20]);
+  TEST_ASSERT_EQUAL_HEX8(0, buf[BATCH_HEADER + 21]);
+  uint32_t expired = 0;
+  // Read at 61 s: car 2 is 61 s old and flagged; car 1 is 60 s, still exact.
+  TEST_ASSERT_EQUAL(n, deliverBatch(buf, n, 61000, false, expired));
+  TEST_ASSERT_EQUAL(1, expired);
+  BatchHeader h;
+  PhoneRecord out[2];
+  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 2));
+  TEST_ASSERT_FALSE(out[0].expired);
+  TEST_ASSERT_EQUAL(60000, h.radioMs - out[0].heardMs);
+  TEST_ASSERT_TRUE(out[1].expired);
 }
 
 void test_baseline_reports_rates_over_the_window() {
@@ -963,6 +1002,8 @@ int main(int, char**) {
   RUN_TEST(test_hello_round_trips_and_refuses_junk);
   RUN_TEST(test_stats_fit_a_payload_at_their_worst);
   RUN_TEST(test_stats_format_as_the_app_reads_them);
+  RUN_TEST(test_the_lane_report_goes_out_when_the_lane_is_down);
+  RUN_TEST(test_ages_are_clamped_and_old_records_expire);
   RUN_TEST(test_baseline_reports_rates_over_the_window);
   RUN_TEST(test_eight_peers_at_1hz_for_ten_minutes);
   RUN_TEST(test_twenty_four_peers_share_reads);

@@ -243,41 +243,6 @@ size_t Mesh::countOn(uint8_t chan, uint32_t windowMs, uint32_t nowMs) const {
   return n;
 }
 
-bool Mesh::phoneDue(uint32_t id, uint32_t frameId, uint32_t everyMs, uint32_t nowMs) {
-  for (size_t i = 0; i < MAX_RIDERS; i++) {
-    Rider& rider = riders_[i];
-    if (!rider.used || rider.id != id) continue;
-    // phoneMs is a deadline on a fixed everyMs grid, not the last send time,
-    // so the cadence holds on the second whatever the arrival jitter.
-    if (rider.phoneMs != 0 && (int32_t)(nowMs - rider.phoneMs) < 0) {
-      // Early. Dropping it left the phone a two-second gap at 1 Hz traffic
-      // (sent at 1000, 1999 dropped, next at ~3000), so hold the newest and
-      // let nextPhonePending send it at the deadline.
-      rider.phonePending = true;
-      rider.phoneFrameId = frameId;
-      return false;
-    }
-    rider.phoneMs = nextOnGrid(rider.phoneMs == 0 ? nowMs : rider.phoneMs, everyMs, nowMs);
-    rider.phonePending = false;
-    return true;
-  }
-  // Not on the roster at all, so there is nothing to throttle against and no
-  // reason to withhold it.
-  return true;
-}
-
-const Rider* Mesh::nextPhonePending(uint32_t everyMs, uint32_t nowMs) {
-  for (size_t i = 0; i < MAX_RIDERS; i++) {
-    Rider& rider = riders_[i];
-    if (!rider.used || !rider.phonePending) continue;
-    if ((int32_t)(nowMs - rider.phoneMs) < 0) continue;
-    rider.phoneMs = nextOnGrid(rider.phoneMs, everyMs, nowMs);
-    rider.phonePending = false;
-    return &rider;
-  }
-  return nullptr;
-}
-
 const Rider* Mesh::find(uint32_t id) const {
   for (size_t i = 0; i < MAX_RIDERS; i++)
     if (riders_[i].used && riders_[i].id == id) return &riders_[i];

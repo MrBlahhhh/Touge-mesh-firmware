@@ -37,17 +37,17 @@ static const size_t BATCH_HEADER = 12;
 // Record, version 1:
 //   0-3 node | 4-7 lat e7 | 8-11 lon e7 | 12-15 sender frame id
 //   16-17 heading, centidegrees | 18-19 speed, 0.1 km/h
-//   20-21 ms since the radio heard it (saturates) | 22 rssi dBm, 0 unknown
+//   20-21 ms since the radio heard it, at most RECORD_EXPIRE_MS | 22 rssi dBm, 0 unknown
 //   23 flags: bit 0 phone fix, bits 1-2 lane (0 = 2.4 GHz), bit 3 expired,
 //      bits 4-7 hops away
 static const size_t BATCH_RECORD = 24;
 
-// Header flag (byte 5, zero before build 35): the header time is when the phone
+// Header flag (byte 5): the header time is when the phone
 // got the batch and every age runs to then, so the phone takes "arrival minus
 // age" as the heard time with no clock to estimate. Set by deliverBatch.
 static const uint8_t BATCH_AGES_AT_DELIVERY = 0x01;
 
-// Record flag (build 35): held too long to be a position; the phone must not use
+// Record flag: held too long to be a position; the phone must not use
 // it. Set where a record cannot be taken out: a pre-encoded batch.
 static const uint8_t RECORD_EXPIRED = 0x08;
 
@@ -55,10 +55,6 @@ static const uint8_t RECORD_EXPIRED = 0x08;
 // field's 65.5 s range, so an age the phone does get is always exact; well
 // past the 1 Hz beacon, so only a stall or a disconnect gets a record here.
 static const uint32_t RECORD_EXPIRE_MS = 60000;
-
-// The largest age a record carries. 0xFFFF itself is left alone: build 30 radios
-// wrote it for a slightly negative age, and the app reads it as "just heard".
-static const uint16_t AGE_MAX = 0xFFFE;
 
 // Meshtastic's Data payload ceiling (meshtastic_Constants_DATA_PAYLOAD_LEN).
 // The batch rides in one, so this is the most a batch can be whatever the MTU.
@@ -260,13 +256,15 @@ size_t formatDroppedWrites(const uint32_t* ids, size_t n, char* out, size_t cap)
 
 // ---- Phone hello ------------------------------------------------------------
 //
-// The phone tells its radio it reads batches. Until it does, positions go out
-// one packet each as in build 29, so an older app keeps working on this build.
+// The phone tells its radio it is there to read batches, and how. Positions go
+// to the phone only in batches, and only after a hello; before one the
+// 2.4 GHz lane sends the phone no positions at all (LoRa ones still arrive as
+// ordinary Meshtastic packets).
 //   0 magic 0xC2 | 1 version | 2 flags | 3-4 ATT MTU, big-endian
+// Flag bit 0 is retired (it asked for batches, which are now unconditional).
 static const uint8_t HELLO_MAGIC = 0xC2;
 static const uint8_t HELLO_VERSION = 1;
 static const size_t HELLO_LEN = 5;
-static const uint8_t HELLO_BATCHES = 0x01;
 // Let the radio answer reads from a pre-encoded batch (core-patches/0007).
 static const uint8_t HELLO_PRELOAD = 0x02;
 
@@ -298,7 +296,7 @@ struct LinkStats {
   // Drops by reason.
   uint32_t dropStoreFull = 0;
   uint32_t dropAlloc = 0;       // packet pool empty
-  uint32_t dropLost = 0;        // records in batches never read (expired)
+  uint32_t dropLost = 0;        // records in batches that left the queues unread
   uint32_t dropDisconnect = 0;  // records pending or in flight at a disconnect
   uint32_t dropStale = 0;       // older than what was already pending
   uint32_t coreReplaced = 0;    // MeshService queue, newest-wins (patch 0005)
@@ -311,24 +309,40 @@ struct LinkStats {
   uint32_t preloadRead = 0;
   uint32_t preloadRefused = 0;
   uint16_t queueDepth = 0;      // MeshService to-phone queue now
-  uint16_t queueDepthMax = 0;   // and its high-water mark
+  uint16_t queueDepthMax = 0;   // and its high-water mark since the previous report
   uint16_t storePending = 0;
   uint32_t oldestQueuedMs = 0;  // oldest position waiting in our store or in flight
   uint32_t minFreeHeap = 0;
 };
 
-// {"fs":[1, fast tx, rx, suppressed, queued, delivered, lora rx, lora delivered,
-//        batches, batches read, replaced, fast tx fail]}
-// Positional, so the worst case (every counter at 2^32 - 1) still fits one
-// Meshtastic payload. New fields are appended; the first element is the version.
+// The counters go to the phone every five seconds as three JSON objects with
+// named keys, split so each fits one Meshtastic payload with every counter at
+// 2^32 - 1:
+//   {"fs":{"tx","rx","sp","q","d","lr","ld","b","br","rp","tf"}}
+//     2.4 GHz sent, heard, suppressed, queued, delivered; LoRa heard,
+//     delivered; batches, batches read, replaced, send failures
+//   {"fq":{"qd","qm","pe","ol","hp","po","pr","pf"}}
+//     phone queue depth and max, store pending, oldest waiting ms, min free
+//     heap; pre-encoded batches offered, read, refused
+//   {"fd":{"sf","al","lo","dc","st","cr","cd","ce","ex","wl","wr"}}
+//     drops: store full, alloc, lost, disconnect, stale, core replaced, core
+//     dropped, core evicted, expired; phone writes lost, repeated
 size_t formatLaneStats(const LinkStats& s, char* out, size_t cap);
-
-// {"fq":[1, queue depth, depth max, store pending, oldest queued ms,
-//        drop store full, alloc, lost, disconnect, stale, core replaced,
-//        core dropped, write dropped, write duplicate, preload offered,
-//        preload read, preload refused, min free heap, core evicted, expired]}
-// Depth max is the high-water mark since the previous report.
 size_t formatQueueStats(const LinkStats& s, char* out, size_t cap);
+size_t formatDropStats(const LinkStats& s, char* out, size_t cap);
+
+// Why the 2.4 GHz lane is not running, for the report the radio sends every
+// five seconds whether the lane runs or not. A Touge radio always says its
+// build; a stock Meshtastic radio says nothing, which is how the phone tells
+// the two apart.
+enum class LaneDown : uint8_t {
+  STARTING,  // waiting for Bluetooth to settle after boot
+  NO_KEY,    // the primary channel has no ride key
+  RADIO,     // ESP-NOW would not start (usually no heap left beside BLE)
+};
+
+// {"fl":{"fw":build,"up":0,"why":"boot"|"key"|"radio"}}
+size_t formatLaneDown(uint32_t build, LaneDown why, char* out, size_t cap);
 
 // The line both ends print every few seconds, as rates over [windowMs] from
 // the difference between two snapshots. Grep for "BASELINE".

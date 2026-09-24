@@ -490,101 +490,6 @@ void test_an_empty_neighbourhood_still_waits() {
   TEST_ASSERT_EQUAL_UINT32(FORWARD_JITTER_MS, forwardSpreadMs(0));
 }
 
-void test_a_position_reaches_the_phone_once_per_interval() {
-  // The lane carries four positions a second per car, and each one became its
-  // own packet on a BLE link that manages about thirty a second in total. At
-  // twenty-eight cars that is a hundred and twelve, so the radio's queue filled
-  // and it dropped the newest of everything - positions, status and voice.
-  Mesh m;
-  Position p{};
-  m.note(7, p, HEARD_FAST, -60, 0, 1000, 1);
-
-  // First sight of a car always goes: there is nothing to throttle against.
-  TEST_ASSERT_TRUE(m.phoneDue(7, 1, 1000, 1000));
-  // The next three beacons of that second do not.
-  TEST_ASSERT_FALSE(m.phoneDue(7, 1, 1000, 1250));
-  TEST_ASSERT_FALSE(m.phoneDue(7, 1, 1000, 1500));
-  TEST_ASSERT_FALSE(m.phoneDue(7, 1, 1000, 1999));
-  // And the next second does.
-  TEST_ASSERT_TRUE(m.phoneDue(7, 1, 1000, 2000));
-  TEST_ASSERT_FALSE(m.phoneDue(7, 1, 1000, 2250));
-}
-
-void test_each_car_is_throttled_on_its_own_clock() {
-  // Twenty-eight cars at one a second is twenty-eight packets a second, not
-  // one: the budget is per car, so the roster does not starve behind whichever
-  // car happened to be heard first.
-  Mesh m;
-  Position p{};
-  m.note(7, p, HEARD_FAST, -60, 0, 1000, 1);
-  m.note(9, p, HEARD_FAST, -60, 0, 1000, 1);
-
-  TEST_ASSERT_TRUE(m.phoneDue(7, 1, 1000, 1000));
-  TEST_ASSERT_TRUE(m.phoneDue(9, 1, 1000, 1000));
-  TEST_ASSERT_FALSE(m.phoneDue(7, 1, 1000, 1500));
-  TEST_ASSERT_FALSE(m.phoneDue(9, 1, 1000, 1500));
-}
-
-void test_a_car_not_on_the_roster_is_not_withheld() {
-  // Nothing to throttle against, and withholding a position because we have
-  // nowhere to record having sent it would be the wrong way round.
-  Mesh m;
-  TEST_ASSERT_TRUE(m.phoneDue(12345, 1, 1000, 5000));
-}
-
-void test_the_phone_throttle_survives_the_millis_wrap() {
-  Mesh m;
-  Position p{};
-  m.note(7, p, HEARD_FAST, -60, 0, 0xFFFFFF00, 1);
-  TEST_ASSERT_TRUE(m.phoneDue(7, 1, 1000, 0xFFFFFF00));
-  TEST_ASSERT_FALSE(m.phoneDue(7, 1, 1000, (uint32_t)(0xFFFFFF00 + 500)));
-  TEST_ASSERT_TRUE(m.phoneDue(7, 1, 1000, (uint32_t)(0xFFFFFF00 + 1000)));
-}
-
-void test_an_early_position_is_held_for_the_phone_not_dropped() {
-  // Sent at 1000, the next frame lands at 1999. Dropping it meant the phone
-  // waited for the one after, near 3000: a two-second gap at 1 Hz traffic.
-  Mesh m;
-  Position p{};
-  m.note(7, p, HEARD_FAST, -60, 0, 1000, 1);
-  TEST_ASSERT_TRUE(m.phoneDue(7, 10, 1000, 1000));
-
-  p.lat = 111;
-  m.note(7, p, HEARD_FAST, -60, 0, 1500, 1);
-  TEST_ASSERT_FALSE(m.phoneDue(7, 11, 1000, 1500));
-  p.lat = 222;
-  m.note(7, p, HEARD_FAST, -60, 0, 1999, 1);
-  TEST_ASSERT_FALSE(m.phoneDue(7, 12, 1000, 1999));
-
-  // Not before the deadline.
-  TEST_ASSERT_NULL(m.nextPhonePending(1000, 1999));
-  // At it, the newest of the held positions, once.
-  const Rider* held = m.nextPhonePending(1000, 2000);
-  TEST_ASSERT_NOT_NULL(held);
-  TEST_ASSERT_EQUAL_UINT32(7, held->id);
-  TEST_ASSERT_EQUAL_UINT32(12, held->phoneFrameId);
-  TEST_ASSERT_EQUAL_INT32(222, held->pos.lat);
-  TEST_ASSERT_NULL(m.nextPhonePending(1000, 2001));
-
-  // The flush took the 2000 slot, so the next frame waits for 3000.
-  TEST_ASSERT_FALSE(m.phoneDue(7, 13, 1000, 2010));
-  TEST_ASSERT_NULL(m.nextPhonePending(1000, 2999));
-  TEST_ASSERT_NOT_NULL(m.nextPhonePending(1000, 3000));
-}
-
-void test_a_due_position_supersedes_the_held_one() {
-  // A frame that arrives on time goes straight out, and the held one behind
-  // it is older, so it must not follow.
-  Mesh m;
-  Position p{};
-  m.note(7, p, HEARD_FAST, -60, 0, 1000, 1);
-  TEST_ASSERT_TRUE(m.phoneDue(7, 1, 1000, 1000));
-  TEST_ASSERT_FALSE(m.phoneDue(7, 2, 1000, 1999));
-  TEST_ASSERT_TRUE(m.phoneDue(7, 3, 1000, 2000));
-  TEST_ASSERT_NULL(m.nextPhonePending(1000, 2000));
-  TEST_ASSERT_NULL(m.nextPhonePending(1000, 5000));
-}
-
 void test_a_grid_deadline_ahead_of_now_is_left_alone() {
   // A movement-triggered beacon before the 1 s deadline must not move it.
   // Advancing it on every send pushed it a second per extra beacon, and a car
@@ -1198,12 +1103,6 @@ int main(int, char**) {
   RUN_TEST(test_the_forwarding_window_widens_with_the_neighbourhood);
   RUN_TEST(test_the_forwarding_window_is_bounded);
   RUN_TEST(test_an_empty_neighbourhood_still_waits);
-  RUN_TEST(test_a_position_reaches_the_phone_once_per_interval);
-  RUN_TEST(test_each_car_is_throttled_on_its_own_clock);
-  RUN_TEST(test_a_car_not_on_the_roster_is_not_withheld);
-  RUN_TEST(test_the_phone_throttle_survives_the_millis_wrap);
-  RUN_TEST(test_an_early_position_is_held_for_the_phone_not_dropped);
-  RUN_TEST(test_a_due_position_supersedes_the_held_one);
   RUN_TEST(test_a_grid_deadline_ahead_of_now_is_left_alone);
   RUN_TEST(test_a_passed_grid_deadline_moves_to_the_next_point);
   RUN_TEST(test_the_grid_survives_the_millis_wrap);

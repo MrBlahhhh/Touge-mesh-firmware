@@ -82,11 +82,6 @@ const uint32_t GATE_IDLE_MS = 1000;
 // clear two beacons; at 1 Hz the same safety costs three.
 const uint32_t FAST_PRECEDENCE_MS = 3000;
 
-// How often one car's position is handed to the phone. See inject().
-const uint32_t PHONE_POSITION_MS = 1000;
-
-static_assert(PHONE_POSITION_MS >= CYCLE_MS,
-              "throttling faster than the lane produces would do nothing");
 
 // The name rides along every half minute rather than on every ping. Everyone
 // who can hear you has it after one, and after that it is just bytes.
@@ -178,7 +173,10 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     records over 60 s dropped (or flagged expired) instead of capped; dropped phone
 //     writes named by packet id ("wd"); core-patches/0007 updated.
 // 35 also: the button hold that powers off is 4 s, not 3 (core-patches/0008).
-const uint32_t TOUGE_BUILD = 35;
+// 36: positions reach the phone only in batches, after a hello (no pre-hello per-packet path,
+//     hello bit 0 retired); plain age clamp; fs/fq/fd status with named keys; the lane
+//     report ("fl" with "up") goes out even when the lane is down, with the reason.
+const uint32_t TOUGE_BUILD = 36;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -400,6 +398,7 @@ void TougeFastModule::syncChannel()
     // straight through, which is the same hole with a longer name. A ride key
     // derives a 32 byte PSK, so anything shorter than a real key is not one.
     if (key.length < MIN_PSK_BYTES) {
+        laneDown_ = LaneDown::NO_KEY;
         if (started_) {
             LOG_INFO("touge: primary channel has no real key, fast lane down");
             fastRadio.end();
@@ -412,7 +411,10 @@ void TougeFastModule::syncChannel()
     if (len > PSK_LEN) len = PSK_LEN;
     if (started_ && len == keySeenLen_ && memcmp(key.bytes, keySeen_, len) == 0) return;
 
-    if (!deriveFast(key.bytes, len, net_)) return;
+    if (!deriveFast(key.bytes, len, net_)) {
+        laneDown_ = LaneDown::NO_KEY;
+        return;
+    }
     memcpy(keySeen_, key.bytes, len);
     keySeenLen_ = len;
 
@@ -437,6 +439,7 @@ void TougeFastModule::syncChannel()
     heardInWindow_ = 0;
 
     if (!fastRadio.begin(net_)) {
+        laneDown_ = LaneDown::RADIO;
         LOG_WARN("touge: ESP-NOW would not start (%s, heap %u free, %u largest), LoRa only",
                  esp_err_to_name((esp_err_t)fastRadio.beginError()),
                  (unsigned)fastRadio.beginFreeHeap(), (unsigned)fastRadio.beginLargestBlock());
@@ -762,18 +765,10 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
         meshtastic_NodeInfoLite *heard = nodeDB->getMeshNode(f.src);
         if (heard) heard->last_heard = mp.time;
 
-        // And to the phone, which learns positions from packets, never from
-        // NodeDB outside a config dump.
-        //
-        // An app that has said hello gets the newest position per car in
-        // batches (SCALE-PLAN step 3). Anything else, including build 29
-        // apps, gets build 29's one packet per car per second, with an early
-        // arrival held for its deadline by sendHeldPhonePositions.
-        if (batchingToPhone()) {
-            offerToPhone(phoneRecordFor(f, p, rssi));
-        } else if (mesh_.phoneDue(f.src, f.id, PHONE_POSITION_MS, millis())) {
-            sendPositionToPhone(f.src, f.id, mp, rssi);
-        }
+        // And to the phone, in batches of the newest position per car, once it
+        // has said hello (SCALE-PLAN step 3). Before that it gets none from this
+        // lane; LoRa positions reach it the ordinary Meshtastic way regardless.
+        if (helloSeen_) offerToPhone(phoneRecordFor(f, p, rssi));
 
         if (p.name[0] != 0) {
             meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(f.src);
@@ -835,53 +830,6 @@ void TougeFastModule::inject(const Frame &f, const uint8_t *body, size_t len, in
     memcpy(p->decoded.payload.bytes, body, len);
     p->decoded.payload.size = (uint16_t)len;
     service->sendToPhone(p);
-}
-
-void TougeFastModule::sendPositionToPhone(uint32_t src, uint32_t packetId, const meshtastic_Position &mp,
-                                          int8_t rssi)
-{
-    meshtastic_MeshPacket *pp = router->allocForSending();
-    if (!pp) {
-        stats_.dropAlloc++;
-        return;
-    }
-    stats_.fast.queued++;
-    pp->from = src;
-    pp->to = NODENUM_BROADCAST;
-    pp->id = packetId;
-    pp->channel = channels.getPrimaryIndex();
-    pp->hop_limit = 0;
-    pp->hop_start = 0;
-    // rx_rssi has explicit presence in this Meshtastic: without the has_ flag
-    // the number never reaches the phone. Zero is what an old core gives when
-    // it cannot see the RSSI; leave that absent.
-    pp->rx_rssi = rssi;
-    pp->has_rx_rssi = rssi != 0;
-    pp->rx_time = mp.time;
-    pp->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
-    pp->decoded.portnum = meshtastic_PortNum_POSITION_APP;
-    size_t n = pb_encode_to_bytes(pp->decoded.payload.bytes, sizeof(pp->decoded.payload.bytes),
-                                  &meshtastic_Position_msg, &mp);
-    if (n == 0) {
-        // An oversized encode is silent and returns 0. Shipping the empty
-        // packet would look like a position of nowhere.
-        packetPool.release(pp);
-        return;
-    }
-    pp->decoded.payload.size = (uint16_t)n;
-    service->sendToPhone(pp);
-}
-
-void TougeFastModule::sendHeldPhonePositions(uint32_t nowMs)
-{
-    // Positions inject() held back for arriving before their car's deadline.
-    // The roster slot carries the newest one heard. Bounded like sendDeferred;
-    // anything left over is due again on the next tick.
-    for (int budget = 0; budget < 4; budget++) {
-        const Rider *r = mesh_.nextPhonePending(PHONE_POSITION_MS, nowMs);
-        if (r == nullptr) return;
-        sendPositionToPhone(r->id, r->phoneFrameId, asMeshPosition(r->pos), (int8_t)r->rssi);
-    }
 }
 
 void TougeFastModule::drainRadio(uint32_t nowMs)
@@ -1119,7 +1067,10 @@ int32_t TougeFastModule::runOnce()
     // find. Once open, the gate stays open.
     static bool gateOpen = false;
     if (!gateOpen) {
-        if (!bleSettled(now)) return 250;
+        if (!bleSettled(now)) {
+            reportLaneDown(now, LaneDown::STARTING);
+            return 250;
+        }
         gateOpen = true;
         LOG_INFO("touge: bluetooth settled at %u ms, starting fast lane", (unsigned)now);
     }
@@ -1143,7 +1094,11 @@ int32_t TougeFastModule::runOnce()
     // Before the channel check: a tablet with no GPS needs the radio's fix
     // whether or not a ride is set up.
     forwardGnssFix(now);
-    if (!started_) return IDLE_PASS_MS; // nothing else to do until there is a channel
+    if (!started_) {
+        // Nothing else to do until there is a channel, but say so: see reportLaneDown.
+        reportLaneDown(now, laneDown_);
+        return IDLE_PASS_MS;
+    }
 
     drainRadio(now);
     // Nothing held goes out while we are lost.
@@ -1156,7 +1111,6 @@ int32_t TougeFastModule::runOnce()
     // other with one.
     const bool lost = (uint32_t)(now - lastHeardMs_) >= LOST_MS;
     if (!lost) sendDeferred(now);
-    sendHeldPhonePositions(now);
     trackPhoneLink(now);
     flushPhoneBatch(now);
     beacon(now);
@@ -1280,10 +1234,10 @@ void TougeFastModule::status(uint32_t nowMs)
     // rather than breaking. sendToPhone only queues for BLE; none of this
     // touches the air.
     {
-        char js[224];
+        char js[meshtastic_Constants_DATA_PAYLOAD_LEN];
         int n = snprintf(
             js, sizeof(js),
-            "{\"fl\":{\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u,\"gi\":%u,\"gg\":%u,\"tf\":%u}}",
+            "{\"fl\":{\"up\":1,\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u,\"gi\":%u,\"gg\":%u,\"tf\":%u}}",
             (unsigned)fastRadio.channel(), schedule_.claimed() ? (int)schedule_.slot() : -1,
             (unsigned)schedule_.known(), (unsigned)fastNeighbours(nowMs), clock,
             (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
@@ -1500,8 +1454,8 @@ ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
     PhoneHello hello;
     if (decodeHello(mp.decoded.payload.bytes, mp.decoded.payload.size, hello)) {
         if (!helloSeen_ || hello.flags != hello_.flags || hello.mtu != hello_.mtu) {
-            LOG_INFO("touge: phone hello, batches=%u preload=%u mtu=%u", (unsigned)((hello.flags & HELLO_BATCHES) != 0),
-                     (unsigned)((hello.flags & HELLO_PRELOAD) != 0), (unsigned)hello.mtu);
+            LOG_INFO("touge: phone hello, preload=%u mtu=%u", (unsigned)((hello.flags & HELLO_PRELOAD) != 0),
+                     (unsigned)hello.mtu);
         }
         hello_ = hello;
         helloSeen_ = true;
@@ -1590,7 +1544,7 @@ void TougeFastModule::offerToPhone(const PhoneRecord &r)
 
 void TougeFastModule::flushPhoneBatch(uint32_t nowMs)
 {
-    if (!batchingToPhone()) return;
+    if (!helloSeen_) return;
     // Backpressure: with two batches unread, positions wait here, where a newer
     // one replaces an older one, rather than in a queue in front of the phone.
     // A batch frees its place only by being read or leaving the queues
@@ -1753,14 +1707,10 @@ void TougeFastModule::onPhoneDelivered(meshtastic_MeshPacket &p)
 void TougeFastModule::notePhoneDelivered(meshtastic_MeshPacket &p)
 {
     if (p.which_payload_variant != meshtastic_MeshPacket_decoded_tag) return;
+    // The 2.4 GHz lane only reaches the phone in batches, so every position
+    // packet the phone reads came over LoRa.
     if (p.decoded.portnum == meshtastic_PortNum_POSITION_APP) {
-        if (isFromUs(&p)) return;
-        // The fast lane's one-per-packet positions carry no hop budget; LoRa ones do.
-        if (p.hop_start == 0 && p.hop_limit == 0) {
-            stats_.fast.delivered++;
-        } else {
-            stats_.lora.delivered++;
-        }
+        if (!isFromUs(&p)) stats_.lora.delivered++;
         return;
     }
     if (p.decoded.portnum != meshtastic_PortNum_PRIVATE_APP || p.from != nodeId_) return;
@@ -1815,7 +1765,7 @@ void TougeFastModule::reportLinkStats(uint32_t nowMs, uint32_t windowMs)
 
     char line[320];
     if (formatBaseline(stats_, statsAtLastReport_, windowMs, line, sizeof(line)) > 0) {
-        LOG_INFO("touge: %s batching=%u", line, (unsigned)batchingToPhone());
+        LOG_INFO("touge: %s hello=%u", line, (unsigned)helloSeen_);
     }
 
     // Nobody to read them, and 32 unread reports would fill the phone queue.
@@ -1823,10 +1773,24 @@ void TougeFastModule::reportLinkStats(uint32_t nowMs, uint32_t windowMs)
         char js[BATCH_MAX_PAYLOAD];
         queueJsonToPhone(js, formatLaneStats(stats_, js, sizeof(js)));
         queueJsonToPhone(js, formatQueueStats(stats_, js, sizeof(js)));
+        queueJsonToPhone(js, formatDropStats(stats_, js, sizeof(js)));
     }
     statsAtLastReport_ = stats_;
     // The high-water mark is per report, so a burst shows in the report after it.
     stats_.queueDepthMax = stats_.queueDepth;
+}
+
+void TougeFastModule::reportLaneDown(uint32_t nowMs, LaneDown why)
+{
+    // The lane report goes out whether or not the lane runs. A Touge radio
+    // always says its build this way; a stock Meshtastic radio never does,
+    // which is how the phone tells the two apart, and why a Touge radio whose
+    // lane is down no longer looks like stock.
+    if ((uint32_t)(nowMs - lastStatusMs_) < STATUS_EVERY_MS) return;
+    lastStatusMs_ = nowMs;
+    if (service == nullptr || router == nullptr || service->api_state == MeshService::STATE_DISCONNECTED) return;
+    char js[BATCH_MAX_PAYLOAD];
+    queueJsonToPhone(js, formatLaneDown(TOUGE_BUILD, why, js, sizeof(js)));
 }
 
 #endif

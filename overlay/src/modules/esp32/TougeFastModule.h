@@ -83,9 +83,6 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // had come off the LoRa radio, so NodeDB, the OLED and the phone all see
     // it without any of them needing to know this module exists.
     void inject(const touge::Frame &f, const uint8_t *body, size_t len, int8_t rssi);
-    void sendPositionToPhone(uint32_t src, uint32_t packetId, const meshtastic_Position &mp, int8_t rssi);
-    // Sends positions that arrived early for the phone gate once they are due.
-    void sendHeldPhonePositions(uint32_t nowMs);
 
     bool transmit(uint8_t type, const uint8_t *body, size_t len, uint8_t hops);
 
@@ -151,7 +148,6 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // ---- Positions to the phone in batches, and the link counters ----------
     // SCALE-PLAN steps 1 and 3; the pure parts are in touge/phonebatch.h.
 
-    bool batchingToPhone() const { return helloSeen_ && (hello_.flags & touge::HELLO_BATCHES) != 0; }
     touge::PhoneRecord phoneRecordFor(const touge::Frame &f, const touge::Position &p, int8_t rssi) const;
     void offerToPhone(const touge::PhoneRecord &r);
     void flushPhoneBatch(uint32_t nowMs);
@@ -166,6 +162,9 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     void notePhoneRead(uint8_t records, uint32_t expired);
     // Sends the phone the ids of its writes the radio dropped (core-patches/0007).
     void reportDroppedWrites();
+    // The lane report while the lane is not running: build and reason, every
+    // STATUS_EVERY_MS, so the phone can tell this radio from stock Meshtastic.
+    void reportLaneDown(uint32_t nowMs, touge::LaneDown why);
     void reportLinkStats(uint32_t nowMs, uint32_t windowMs);
     void queueJsonToPhone(const char *json, size_t len);
     // Not const: a batch is restamped on its way out (core-patches/0006).
@@ -179,6 +178,8 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     touge::LinkStats statsAtLastReport_;
     touge::PhoneHello hello_;
     bool helloSeen_ = false;
+    // Why the lane is down while !started_; reported by reportLaneDown.
+    touge::LaneDown laneDown_ = touge::LaneDown::NO_KEY;
     uint16_t batchSeq_ = 0;
     // NimBLE counters last seen, to notice the pre-encoded batch being read or lost.
     uint32_t preloadReadSeen_ = 0;

@@ -32,13 +32,10 @@ void encodeRecord(const PhoneRecord& r, uint32_t nowMs, uint8_t* b) {
   put16(b + 16, r.headingCdeg);
   put16(b + 18, r.speedDkmh);
   // Signed: nowMs is the loop's timestamp, taken before a receive callback in
-  // the same pass can stamp heardMs a few ms later. Unsigned, that negative
-  // age wrapped and saturated to 65.5 s, and the phone threw away every fresh
-  // 2.4 GHz position as older than LoRa.
+  // the same pass can stamp heardMs a few ms later, so an age can be slightly
+  // negative. A plain clamp: records past RECORD_EXPIRE_MS never get here.
   const int32_t age = (int32_t)(nowMs - r.heardMs);
-  // Saturates at 0xFFFE: build 31+ apps read 0xFFFF as a build 30 radio's wrapped
-  // negative age, i.e. "just heard", so a genuinely old position must not say it.
-  put16(b + 20, age <= 0 ? (uint16_t)0 : age > (int32_t)AGE_MAX ? AGE_MAX : (uint16_t)age);
+  put16(b + 20, age <= 0 ? (uint16_t)0 : age > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)age);
   b[22] = (uint8_t)r.rssi;
   b[23] = (uint8_t)((r.external ? 0x01 : 0) | ((r.lane & 0x03) << 1) | (r.expired ? RECORD_EXPIRED : 0) |
                     ((r.hopsAway & 0x0F) << 4));
@@ -295,7 +292,7 @@ size_t deliverBatch(uint8_t* payload, size_t len, uint32_t nowMs, bool canShrink
       expired++;
       if (canShrink) continue;
       rec[23] |= RECORD_EXPIRED;
-      put16(rec + 20, AGE_MAX);
+      put16(rec + 20, age > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)age);
     } else {
       put16(rec + 20, (uint16_t)age);
     }
@@ -446,7 +443,9 @@ size_t encodeHello(const PhoneHello& h, uint8_t* out, size_t cap) {
 
 size_t formatLaneStats(const LinkStats& s, char* out, size_t cap) {
   if (out == nullptr || cap == 0) return 0;
-  int n = snprintf(out, cap, "{\"fs\":[1,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu]}",
+  int n = snprintf(out, cap,
+                   "{\"fs\":{\"tx\":%lu,\"rx\":%lu,\"sp\":%lu,\"q\":%lu,\"d\":%lu,\"lr\":%lu,\"ld\":%lu,"
+                   "\"b\":%lu,\"br\":%lu,\"rp\":%lu,\"tf\":%lu}}",
                    (unsigned long)s.fast.tx, (unsigned long)s.fast.rx, (unsigned long)s.fast.suppressed,
                    (unsigned long)s.fast.queued, (unsigned long)s.fast.delivered, (unsigned long)s.lora.rx,
                    (unsigned long)s.lora.delivered, (unsigned long)s.batches, (unsigned long)s.batchesRead,
@@ -458,14 +457,31 @@ size_t formatLaneStats(const LinkStats& s, char* out, size_t cap) {
 size_t formatQueueStats(const LinkStats& s, char* out, size_t cap) {
   if (out == nullptr || cap == 0) return 0;
   int n = snprintf(out, cap,
-                   "{\"fq\":[1,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu]}",
+                   "{\"fq\":{\"qd\":%u,\"qm\":%u,\"pe\":%u,\"ol\":%lu,\"hp\":%lu,\"po\":%lu,\"pr\":%lu,\"pf\":%lu}}",
                    (unsigned)s.queueDepth, (unsigned)s.queueDepthMax, (unsigned)s.storePending,
-                   (unsigned long)s.oldestQueuedMs, (unsigned long)s.dropStoreFull, (unsigned long)s.dropAlloc,
-                   (unsigned long)s.dropLost, (unsigned long)s.dropDisconnect, (unsigned long)s.dropStale,
-                   (unsigned long)s.coreReplaced, (unsigned long)s.coreDropped, (unsigned long)s.writeDropped,
-                   (unsigned long)s.writeDuplicate, (unsigned long)s.preloadOffered,
-                   (unsigned long)s.preloadRead, (unsigned long)s.preloadRefused, (unsigned long)s.minFreeHeap,
-                   (unsigned long)s.coreEvicted, (unsigned long)s.dropExpired);
+                   (unsigned long)s.oldestQueuedMs, (unsigned long)s.minFreeHeap, (unsigned long)s.preloadOffered,
+                   (unsigned long)s.preloadRead, (unsigned long)s.preloadRefused);
+  if (n <= 0 || (size_t)n >= cap) return 0;
+  return (size_t)n;
+}
+
+size_t formatDropStats(const LinkStats& s, char* out, size_t cap) {
+  if (out == nullptr || cap == 0) return 0;
+  int n = snprintf(out, cap,
+                   "{\"fd\":{\"sf\":%lu,\"al\":%lu,\"lo\":%lu,\"dc\":%lu,\"st\":%lu,\"cr\":%lu,\"cd\":%lu,"
+                   "\"ce\":%lu,\"ex\":%lu,\"wl\":%lu,\"wr\":%lu}}",
+                   (unsigned long)s.dropStoreFull, (unsigned long)s.dropAlloc, (unsigned long)s.dropLost,
+                   (unsigned long)s.dropDisconnect, (unsigned long)s.dropStale, (unsigned long)s.coreReplaced,
+                   (unsigned long)s.coreDropped, (unsigned long)s.coreEvicted, (unsigned long)s.dropExpired,
+                   (unsigned long)s.writeDropped, (unsigned long)s.writeDuplicate);
+  if (n <= 0 || (size_t)n >= cap) return 0;
+  return (size_t)n;
+}
+
+size_t formatLaneDown(uint32_t build, LaneDown why, char* out, size_t cap) {
+  if (out == nullptr || cap == 0) return 0;
+  const char* reason = why == LaneDown::STARTING ? "boot" : why == LaneDown::NO_KEY ? "key" : "radio";
+  int n = snprintf(out, cap, "{\"fl\":{\"fw\":%lu,\"up\":0,\"why\":\"%s\"}}", (unsigned long)build, reason);
   if (n <= 0 || (size_t)n >= cap) return 0;
   return (size_t)n;
 }
