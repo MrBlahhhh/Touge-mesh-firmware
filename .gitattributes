@@ -1,0 +1,5 @@
+# Travels with the public repo (a subtree of this folder). Patches must stay
+# byte-exact for git apply, and scripts run on Linux after scp.
+*.patch -text
+*.sh text eol=lf
+*.py text eol=lf
