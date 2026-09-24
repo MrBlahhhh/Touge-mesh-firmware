@@ -22,10 +22,9 @@ Flash with `flash-all.ps1` (every V3/V4 on USB, chip identified with esptool,
 NVS kept) or the Web Serial page in `web-flasher/`.
 
 Every radio on a ride must run the same frame version (4, from build 40).
-Boards on different versions drop each other's frames. From build 43 every
-radio also needs build 43 or later: positions go unsigned, and an older radio
-that has seen one sign drops them. A stock Meshtastic radio on the ride needs
-its packet signature policy set to Compatible to see Touge cars.
+Boards on different versions drop each other's frames. From build 43
+positions go unsigned: every radio needs 43, and a stock one needs packet
+signature policy Compatible.
 
 ## What changes in Meshtastic
 
@@ -75,11 +74,8 @@ Needs a host C++ compiler on PATH.
   ESP-NOW key and a clear-text group byte. Payload is AES-256-CTR with an
   8-byte HMAC-SHA256 tag. The 32-bit packet id is half the nonce and its
   counter lives in NVS.
-- **Channel.** Wi-Fi channel 1 for every ride from build 42
-  (`FAST_HOME_INDEX`); the key's pick of 1, 6 or 11 landed on a channel a
-  Starlink router shared. Hopping is in the code and off (`FAST_LANE_HOP`). A
-  board that hears nobody for 6 s goes back to channel 1. Groups sharing it
-  ignore each other by the group byte and the tag.
+- **Channel.** Wi-Fi channel 1, fixed (build 42). Hopping is in the code and
+  off (`FAST_LANE_HOP`). A board that hears nobody for 6 s goes back to it.
 - **Frame.** 14-byte header, version 4. A position body is 67 bytes plus a
   16-byte name every 30 s: 89 bytes on air, 105 with the name. Layout in
   `frame.h`. Only position and voice frames are sent; text, pair and roster
@@ -116,36 +112,6 @@ Private-port payloads by first byte:
 | 0xC1 | radio to phone | position batch (`phonebatch.h`) |
 | 0xC2 | phone to its radio | hello (`phonebatch.h`) |
 | 0xC3 | radio to radio, LoRa | reach summary (`reach.h`) |
-
-## The LoRa lane
-
-- **Position.** The radio sends its car's LoRa position itself (build 39),
-  from the phone's latest fix, or its own GNSS once the phone has been quiet
-  3 s. Both lanes stop 15 s after the last fix. `PositionModule`'s broadcasts
-  stand down meanwhile (0011).
-- **Identity.** Each fix carries a session drawn per boot, a sequence and its
-  measured time in `sensor_id`, `seq_number`, `timestamp` and
-  `timestamp_millis_adjust`, so a fix heard on both lanes is one fix
-  (`rankFix`, `frame.h`).
-- **Interval.** 5 s while the channel is under a quarter busy by Meshtastic's
-  own one-minute measure; stretched to bring it back under, 20 s at most. Sends
-  are spread by the car's rank plus jitter (`loraload.h`).
-- **Queue.** One position per car in the TX queue, the newest (0010). From
-  build 43 our own goes ahead of relays, on its own contention delay (0014).
-- **Unsigned.** From build 43 our position goes without Meshtastic's 64-byte
-  XEdDSA signature: 67 bytes and 66 ms on SHORT_FAST instead of 133 and 114.
-  Touge radios let unsigned positions from signers in (0015). Texts, NodeInfo,
-  summaries, admin and routing stay signed.
-- **Reach summaries.** With every 12th position a radio says which origins
-  reach it, how old, over how many hops, and whether it hears each steadily
-  direct (0xC3, `reach.h`). It sends an early one when it loses an origin it
-  claimed.
-- **Relays.** Cars those summaries show carrying an origin further relay it
-  first (0012). A position every other car hears steadily direct is not relayed
-  at all (0013). No claim, a stale one, or a car that needs it keeps the stock
-  relay.
-- **Reports.** `ll`, `lt` and `le` every 5 s, on serial and to the phone, from
-  one key list (`kvline.h`).
 
 ## Constraints
 
