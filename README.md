@@ -79,8 +79,13 @@ pushes it over BLE, and the Meshtastic channel QR does the same for anyone
 joining without the app. The 2.4 GHz network derives from that PSK:
 
 ```
-ride key --(Invite.channelPsk, app)--> channel PSK --(deriveFast, here)--> Wi-Fi channel + ESP-NOW key
+ride key --(Invite.channelPsk, app)--> channel PSK --(deriveFast, here)--> ESP-NOW key + group byte
 ```
+
+Every ride's lane sits on Wi-Fi channel 1 (`FAST_HOME_INDEX`, from build 42);
+the key used to pick one of 1, 6 and 11, and picked a channel shared with a
+Starlink router on the bench. Groups sharing the channel ignore each other by
+the group byte and the tag.
 
 So whatever puts a board on the ride puts it on both radios. Change the channel
 and both follow within a few seconds; the roster and dedupe table are dropped

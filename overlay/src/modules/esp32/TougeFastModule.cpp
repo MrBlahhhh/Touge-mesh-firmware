@@ -199,7 +199,8 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // 41: the LoRa interval follows the channel's measured busy share, not cars x cars, on a send grid spread by
 //     rank; own-position TX accounting, queue waits and drops ("ll", "lt"); reach summaries (0xC3) say which
 //     origins reach each car and how old ("le"); relays chosen on that evidence go early (core-patches/0012).
-const uint32_t TOUGE_BUILD = 41;
+// 42: every ride's fast lane on Wi-Fi channel 1 instead of the ride key's pick of 1/6/11.
+const uint32_t TOUGE_BUILD = 42;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -218,6 +219,13 @@ const uint32_t HOME_AFTER_MS = 25000;
 // and can be turned back on once the scan is made phase-stable; until then a
 // fixed channel is what carries. This is what every helmet intercom does.
 const bool FAST_LANE_HOP = false;
+
+// The channel every ride sits on: 1, as HOP_CHANNELS[0], not the one the ride
+// key picks. On the 2026-09-24 bench the key's pick was 6, shared with a
+// Starlink router at -56 dBm, and a -55 dBm link between two radios delivered
+// only 50-70% of its beacons (ESP-NOW broadcasts are never retried). Two groups
+// on channel 1 still ignore each other's frames by chanByte and the tag.
+const uint8_t FAST_HOME_INDEX = 0;
 
 
 // How often runOnce is asked to look at the world.
@@ -490,9 +498,9 @@ void TougeFastModule::syncChannel()
     nextBeaconMs_ = 0;
     mesh_.seedIds(idCeiling_ ? idCeiling_ - ID_BLOCK : nodeDB->getNodeNum());
 
-    // Which of the three non-overlapping channels this ride starts on. Derived,
-    // so two groups in the same car park usually begin apart.
-    hop_.begin(net_.chanByte);
+    // Every ride starts on channel 1, and a lost board goes home there too
+    // (FAST_HOME_INDEX).
+    hop_.begin(FAST_HOME_INDEX);
     lastHeardMs_ = millis();
     lastScanMs_ = lastHeardMs_;
     lastHopCheckMs_ = lastHeardMs_;
