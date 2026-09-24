@@ -1,0 +1,16 @@
+--- a/src/mesh/mesh-pb-constants.h
++++ b/src/mesh/mesh-pb-constants.h
+@@ -25,6 +25,13 @@
+ /// max number of packets which can be waiting for delivery to android - note, this value comes from mesh.options protobuf
+ // FIXME - max_count is actually 32 but we save/load this as one long string of preencoded MeshPacket bytes - not a big array in
+ // RAM #define MAX_RX_TOPHONE (member_size(DeviceState, receive_queue) / member_size(DeviceState, receive_queue[0]))
++// Touge (core-patches/0009): an S3 without PSRAM (Heltec V3) runs Wi-Fi beside BLE for the fast lane,
++// which stock never does, and BLE fails when internal RAM runs out. Each slot is a 432 B MeshPacket in
++// the static pool, so 16 slots give back ~7 KB. The lane's positions reach the phone in batches, two
++// at most waiting, so 16 is room enough.
++#if !defined(MAX_RX_TOPHONE) && defined(CONFIG_IDF_TARGET_ESP32S3) && !defined(BOARD_HAS_PSRAM) && !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST)
++#define MAX_RX_TOPHONE 16
++#endif
+ #ifndef MAX_RX_TOPHONE
+ #if defined(ARCH_STM32WL) || (defined(ARCH_ESP32) && !(defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)))
+ #define MAX_RX_TOPHONE 8

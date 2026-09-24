@@ -1,4 +1,5 @@
 #include "espnow.h"
+#include "ram.h"
 
 #include <string.h>
 #include <esp_now.h>
@@ -39,6 +40,11 @@ volatile int lastSendErr = 0;
 
 // Read by the receive callback, which has no handle on the FastRadio.
 volatile uint8_t currentChannel = 0;
+
+// Internal, DMA-capable RAM: what BLE's controller allocates from (and failed
+// to on build 36 on a V3), shared with the Wi-Fi driver. Leaves out the 8 KB of
+// RTC memory that MALLOC_CAP_INTERNAL alone would count.
+const uint32_t DRAM_HEAP_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
 
 // Whether the radio accepted the transmit power we asked for.
 bool txPowerSet = false;
@@ -91,6 +97,9 @@ esp_err_t initErr = ESP_OK;
 uint32_t initFreeHeap = 0;
 uint32_t initLargestBlock = 0;
 
+// The Wi-Fi driver is initialised. Cleared only by FastRadio::shutdown.
+bool wifiUp = false;
+
 // The Wi-Fi driver, brought up for ESP-NOW and nothing else.
 //
 // This used to be WiFi.mode(WIFI_STA), which initialises the driver with the
@@ -115,11 +124,11 @@ uint32_t initLargestBlock = 0;
 // buffers (the rest are allocated per frame as they arrive), no NVS and no
 // encrypted ESP-NOW peers - encryption happens above this, under the ride key.
 bool startWifi() {
-  static bool up = false;
-  if (up) return true;
+  if (wifiUp) return true;
 
-  initFreeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-  initLargestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  const DramHeap before = dramHeap();
+  initFreeHeap = before.freeBytes;
+  initLargestBlock = before.largestBlock;
 
   // The driver posts its events to the default loop. The core usually has one
   // already; if it does, this says so and nothing changes.
@@ -138,6 +147,19 @@ bool startWifi() {
   cfg.amsdu_tx_enable = 0;
   cfg.nvs_enable = 0;
   cfg.espnow_max_encrypt_num = 0;
+#if TOUGE_LEAN_RAM
+  // Transmit buffers allocated per frame at the frame's size, a few hundred
+  // bytes for ESP-NOW, instead of the Arduino core's eight static ones at
+  // 1.6 KB each: 12.8 KB held from init whether anything is sent or not. The
+  // IDF's own advice without PSRAM (Kconfig ESP_WIFI_TX_BUFFER); the Arduino
+  // libs are built once for boards with and without it. Eight in flight covers
+  // a few frames a second; past that esp_now_send says NO_MEM and it counts as
+  // txfail. CSI is never used.
+  cfg.tx_buf_type = 1;
+  cfg.static_tx_buf_num = 0;
+  cfg.dynamic_tx_buf_num = 8;
+  cfg.csi_enable = 0;
+#endif
 
   err = esp_wifi_init(&cfg);
   if (err != ESP_OK) {
@@ -155,11 +177,19 @@ bool startWifi() {
     return false;
   }
   initErr = ESP_OK;
-  up = true;
+  wifiUp = true;
   return true;
 }
 
 } // namespace
+
+DramHeap dramHeap() {
+  DramHeap h;
+  h.freeBytes = (uint32_t)heap_caps_get_free_size(DRAM_HEAP_CAPS);
+  h.minFreeBytes = (uint32_t)heap_caps_get_minimum_free_size(DRAM_HEAP_CAPS);
+  h.largestBlock = (uint32_t)heap_caps_get_largest_free_block(DRAM_HEAP_CAPS);
+  return h;
+}
 
 bool FastRadio::begin(const FastNet& net) {
   if (!net.valid) return false;
@@ -257,6 +287,22 @@ void FastRadio::end() {
   esp_now_deinit();
   ready_ = false;
   channel_ = 0;
+}
+
+bool FastRadio::driverUp() const { return wifiUp; }
+
+void FastRadio::shutdown() {
+  end();
+  if (wifiUp) {
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    wifiUp = false;
+  }
+  // After the driver is gone, so no receive callback can still be using it.
+  if (rxQueue != nullptr) {
+    vQueueDelete(rxQueue);
+    rxQueue = nullptr;
+  }
 }
 
 bool FastRadio::send(const uint8_t* buf, size_t len) {

@@ -68,6 +68,8 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // One periodic line saying what the fast lane thinks is going on. None of
     // it is visible anywhere else.
     void status(uint32_t nowMs);
+    // Free internal RAM now, its low-water mark and the largest block, to serial.
+    void logHeap();
     void beacon(uint32_t nowMs);
     // A new fix in one of our extra slots (Schedule::extraSlots). True if sent.
     bool sendExtraBeacon(uint32_t nowMs);
@@ -107,6 +109,8 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     uint8_t keySeen_[touge::PSK_LEN] = {0};
     uint8_t keySeenLen_ = 0;
     bool started_ = false;
+    // The lane left BLE under LANE_HEAP_FLOOR and was taken down for this boot.
+    bool heapRefused_ = false;
 
     // Cars whose NodeDB row a stale LoRa position is about to overwrite.
     //

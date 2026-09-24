@@ -42,7 +42,7 @@ uint32_t nextOnGrid(uint32_t deadlineMs, uint32_t periodMs, uint32_t nowMs) {
 void Mesh::reset() {
   memset(seen_, 0, sizeof(seen_));
   memset(riders_, 0, sizeof(riders_));
-  memset(forwards_, 0, sizeof(forwards_));
+  memset(held_, 0, sizeof(held_));
   lastId_ = 0;
   suppressed_ = 0;
 }
@@ -111,18 +111,37 @@ uint8_t Mesh::copies(uint32_t src, uint32_t id, uint32_t nowMs) const {
   return hit ? hit->count : 0;
 }
 
+size_t Mesh::slotCapacity(size_t i) {
+  return i < FORWARD_FULL_SLOTS ? FRAME_MAX : FORWARD_SMALL_BYTES;
+}
+
+uint8_t* Mesh::slotBytes(size_t i) {
+  if (i < FORWARD_FULL_SLOTS) return forwardBytes_ + i * FRAME_MAX;
+  return forwardBytes_ + FORWARD_FULL_SLOTS * FRAME_MAX + (i - FORWARD_FULL_SLOTS) * FORWARD_SMALL_BYTES;
+}
+
+bool Mesh::holdIn(size_t i, const uint8_t* wire, size_t len, uint32_t src, uint32_t id,
+                  uint32_t dueMs) {
+  if (held_[i].used || len > slotCapacity(i)) return false;
+  memcpy(slotBytes(i), wire, len);
+  held_[i].len = (uint16_t)len;
+  held_[i].src = src;
+  held_[i].id = id;
+  held_[i].dueMs = dueMs;
+  held_[i].used = true;
+  return true;
+}
+
 bool Mesh::defer(const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uint32_t dueMs) {
   if (wire == nullptr || len == 0 || len > FRAME_MAX) return false;
 
-  for (size_t i = 0; i < FORWARD_SLOTS; i++) {
-    if (forwards_[i].used) continue;
-    memcpy(forwards_[i].wire, wire, len);
-    forwards_[i].len = (uint16_t)len;
-    forwards_[i].src = src;
-    forwards_[i].id = id;
-    forwards_[i].dueMs = dueMs;
-    forwards_[i].used = true;
-    return true;
+  // Small slots first, so a burst of positions does not take the full-size
+  // slots a voice frame needs. They fall back to a full one when those run out.
+  for (size_t i = FORWARD_FULL_SLOTS; i < FORWARD_SLOTS; i++) {
+    if (holdIn(i, wire, len, src, id, dueMs)) return true;
+  }
+  for (size_t i = 0; i < FORWARD_FULL_SLOTS; i++) {
+    if (holdIn(i, wire, len, src, id, dueMs)) return true;
   }
   // No room. The frame is dropped rather than pushing an already-waiting one
   // out: a forward that arrives late is worth less than one that arrives, and
@@ -139,29 +158,34 @@ bool Mesh::nextDue(uint32_t nowMs, Forward& out) {
   // is chosen per frame, so under load the order the table happens to be in
   // has nothing to do with the order the air wanted them in.
   for (;;) {
-    Forward* best = nullptr;
+    int best = -1;
     for (size_t i = 0; i < FORWARD_SLOTS; i++) {
-      Forward& f = forwards_[i];
-      if (!f.used) continue;
+      const Held& h = held_[i];
+      if (!h.used) continue;
       // Unsigned, so a frame scheduled before a millis() wrap still comes due
       // rather than waiting out the next forty-nine days. The same signed
       // difference orders two due frames against each other.
-      if ((int32_t)(nowMs - f.dueMs) < 0) continue;
-      if (best == nullptr || (int32_t)(f.dueMs - best->dueMs) < 0) best = &f;
+      if ((int32_t)(nowMs - h.dueMs) < 0) continue;
+      if (best < 0 || (int32_t)(h.dueMs - held_[best].dueMs) < 0) best = (int)i;
     }
-    if (best == nullptr) return false;
+    if (best < 0) return false;
 
-    best->used = false;
+    Held& due = held_[best];
+    due.used = false;
     // Neighbours may have rebroadcast it while this one waited. If enough of
     // them did, everyone in earshot has it and this transmission would be
     // pure interference. Suppressing one does not excuse the rest, so this
     // goes round again rather than giving up for this tick; the slot has been
     // released either way, so the loop always shrinks.
-    if (copies(best->src, best->id, nowMs) >= SUPPRESS_AFTER) {
+    if (copies(due.src, due.id, nowMs) >= SUPPRESS_AFTER) {
       suppressed_++;
       continue;
     }
-    out = *best;
+    memcpy(out.wire, slotBytes((size_t)best), due.len);
+    out.len = due.len;
+    out.src = due.src;
+    out.id = due.id;
+    out.dueMs = due.dueMs;
     return true;
   }
 }

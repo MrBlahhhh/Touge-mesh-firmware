@@ -293,6 +293,16 @@ void test_a_full_store_evicts_the_longest_waiting() {
   TEST_ASSERT_EQUAL_HEX32(2, out[0].node);
 }
 
+void test_the_store_holds_every_car_on_the_roster() {
+  // Lean on a V3 it is only as big as the roster, so a full ride must still
+  // fit without anyone's position being pushed out.
+  PhoneStore s;
+  s.clear();
+  for (uint32_t i = 0; i < MAX_RIDERS; i++)
+    TEST_ASSERT_EQUAL(PhoneStore::ADDED, s.offer(car(i + 1, 1, i), i));
+  TEST_ASSERT_EQUAL(MAX_RIDERS, s.pending());
+}
+
 static bool neverQueued(uint32_t, void*) { return false; }
 static bool alwaysQueued(uint32_t, void*) { return true; }
 
@@ -988,6 +998,7 @@ int main(int, char**) {
   RUN_TEST(test_an_empty_store_is_never_due_and_takes_nothing);
   RUN_TEST(test_the_longest_waiting_cars_go_first);
   RUN_TEST(test_a_full_store_evicts_the_longest_waiting);
+  RUN_TEST(test_the_store_holds_every_car_on_the_roster);
   RUN_TEST(test_in_flight_batches_are_bounded_and_never_time_out);
   RUN_TEST(test_delivery_adds_the_queue_wait_to_every_age);
   RUN_TEST(test_a_pre_encoded_batch_read_5_s_late_says_so);

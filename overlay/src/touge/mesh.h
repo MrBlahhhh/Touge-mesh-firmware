@@ -10,52 +10,33 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "frame.h"
+#include "hmac.h"
+#include "ram.h"
 
 namespace touge {
 
-// Eight cars is more than any group ride that still works as a group ride.
-// How many cars the roster can hold.
-//
-// Rides run to twenty-eight cars. Eight was the bench group this was built
-// against, and a fixed array of eight silently drops the twenty-ninth car -
-// and the twelfth, and the ninth. A Rider is about fifty-six bytes, so
-// twenty-eight is under two kilobytes on an ESP32-S3, which is nothing.
-//
-// This is deliberately not the slot count any more. See MAX_SLOTS.
+// How many cars the roster can hold. Rides run to twenty-eight, so this stays
+// at 28 on every board; it is not the slot count (see MAX_SLOTS). A Rider is
+// 96 bytes, 2.7 KB for the lot.
 static const size_t MAX_RIDERS = 28;
 
-// How busy the air gets with the ride full.
-//
-// Twenty-eight cars beaconing, plus the forwards their neighbours make of
-// those beacons. Measured as distinct frames, since that is what the table
-// below stores one of each.
+// Distinct frames a second with the ride full: up to 32 slotted beacons, the
+// shared window, and one talker's voice. Forwards of a frame are the same
+// frame, so they add nothing here.
 static const size_t PEAK_FRAMES_PER_SEC = 55;
 
-// A packet is remembered long enough to outlive every echo of itself.
-//
-// Thirty seconds was the old figure and it was a fiction. Sixty-four entries
-// against fifty-odd distinct frames a second turns the whole table over in
-// about a second and a quarter, so nothing ever survived to be forgotten by
-// the TTL: eviction got there first, every time, and the number described a
-// window that did not exist whenever it mattered. No packet was mishandled
-// because of it - forwards settle inside about twenty milliseconds, which is
-// two orders of magnitude inside even the real window - but a constant that
-// cannot be true under load is one nobody can reason from, and the test that
-// pinned it was pinning the fiction.
-//
-// So: a window short enough to be honest, and a table large enough to hold
-// it. Three seconds is twelve cycles and a hundred and fifty times longer than
-// a forward takes to settle. The assert below is what keeps the two from
-// drifting apart again.
-// Shortened from three seconds to keep the table small enough that WiFi and
-// BLE both still fit in internal SRAM on a no-PSRAM V3. Forwards settle in about
-// twenty milliseconds, so 1.5 s is still seventy times the real window.
+// How long a packet is remembered, which has to outlive every echo of it. A
+// forward waits at most FORWARD_JITTER_MAX_MS a hop (asserted below), so even
+// the lean second is several times the real window. The table must hold the
+// whole window at peak, or eviction silently shortens it (assert below).
+// A Seen is 16 bytes: 1.5 KB roomy, 1 KB lean.
+#if TOUGE_LEAN_RAM
+static const uint32_t SEEN_TTL_MS = 1000;
+static const size_t SEEN_SLOTS = 64;
+#else
 static const uint32_t SEEN_TTL_MS = 1500;
-// 96 entries against the 1.5 s window above. Each Seen is ~16 bytes, so this
-// is ~1.5 KB rather than the 3 KB of 192, and the fast lane has to share the
-// heap with the WiFi driver (~45 KB) and NimBLE, which aborts the whole device
-// if its allocation fails. See the boot-loop fix.
 static const size_t SEEN_SLOTS = 96;
+#endif
 
 static_assert(SEEN_SLOTS >= PEAK_FRAMES_PER_SEC * SEEN_TTL_MS / 1000,
               "the dedupe table must be able to hold the window it claims, or "
@@ -106,19 +87,34 @@ static const uint32_t FORWARD_TIE_MS = 4;
 
 static_assert(FORWARD_JITTER_MAX_MS >= FORWARD_JITTER_MS,
               "the ceiling cannot be below the floor");
-// Frames waiting their turn to be forwarded.
-//
-// Eight, chosen when the roster was eight. Twenty-eight cars that all hear one
-// frame all try to defer it and twenty are refused - and the one refused may
-// be the only board that can reach the tail. The queue holds a frame each, so
-// thirty-two is about eight kilobytes of heap, which is affordable and a great
-// deal cheaper than a silently dropped relay.
-// Each Forward holds a full frame (~266 bytes), so this is the single biggest
-// heap cost in the module. Twelve is enough that a busy relay does not drop
-// forwards in normal use, and it is 5 KB rather than 8.5 KB. The whole reason
-// this matters is that BLE init calls an unguarded `new` that aborts the chip
-// on failure, so every kilobyte here is a kilobyte BLE might need.
+static_assert(SEEN_TTL_MS >= 4 * (FORWARD_JITTER_MAX_MS + FORWARD_TIE_MS),
+              "a packet must be remembered until well after its last forward could arrive");
+
+// Frames waiting their turn to be forwarded. Twelve is enough that a busy relay
+// does not drop forwards in normal use.
 static const size_t FORWARD_SLOTS = 12;
+
+// The longest position frame on the air: header, body with a full name, tag.
+// 93 bytes, against the 250 a voice or text frame may need.
+static const size_t POSITION_FRAME_MAX = FRAME_HEADER + POSITION_MIN + sizeof(Position::name) + TAG_LEN;
+
+// How many of the slots hold a whole frame; the rest hold a position frame.
+// A full-size slot is 250 bytes and nearly everything forwarded is a position,
+// so a lean board keeps three for voice and text: one talker's frames are 60 ms
+// apart and wait at most FORWARD_JITTER_MAX_MS, so about two are ever held.
+// 1.6 KB of frame storage instead of 3 KB.
+#if TOUGE_LEAN_RAM
+static const size_t FORWARD_FULL_SLOTS = 3;
+#else
+static const size_t FORWARD_FULL_SLOTS = FORWARD_SLOTS;
+#endif
+static const size_t FORWARD_SMALL_BYTES = POSITION_FRAME_MAX;
+static const size_t FORWARD_BYTES =
+    FORWARD_FULL_SLOTS * FRAME_MAX + (FORWARD_SLOTS - FORWARD_FULL_SLOTS) * FORWARD_SMALL_BYTES;
+
+static_assert(FORWARD_FULL_SLOTS >= 1 && FORWARD_FULL_SLOTS <= FORWARD_SLOTS,
+              "at least one slot must hold a whole frame");
+static_assert(FORWARD_SMALL_BYTES < FRAME_MAX, "a small slot that fits everything is a full one");
 
 // Having heard this many copies of a packet, everyone within earshot already
 // has it and adding another transmission helps nobody. In a four-car convoy
@@ -165,14 +161,13 @@ enum Heard : uint8_t {
   HEARD_FAST = 2, // ESP-NOW, so line of sight
 };
 
-// A frame waiting out its jitter before being rebroadcast.
+// A frame whose jitter is up, as Mesh::nextDue hands it back for rebroadcast.
 struct Forward {
   uint8_t wire[FRAME_MAX];
   uint16_t len = 0;
   uint32_t src = 0;
   uint32_t id = 0;
   uint32_t dueMs = 0;
-  bool used = false;
 };
 
 struct Rider {
@@ -213,7 +208,8 @@ class Mesh {
 
   // Hold a frame to forward once the jitter has elapsed. False if there is no
   // room, which means the ride is busier than this can keep up with and the
-  // frame is dropped rather than delaying the ones already queued.
+  // frame is dropped rather than delaying the ones already queued. A position
+  // takes a small slot while there is one, keeping the full ones for voice.
   bool defer(const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uint32_t dueMs);
 
   // The next held frame whose time has come and which is still worth sending.
@@ -270,12 +266,27 @@ class Mesh {
     bool used = false;
   };
 
+  // A frame waiting out its jitter. Its bytes are held at slotBytes(i).
+  struct Held {
+    uint32_t src = 0;
+    uint32_t id = 0;
+    uint32_t dueMs = 0;
+    uint16_t len = 0;
+    bool used = false;
+  };
+
   Seen* lookup(uint32_t src, uint32_t id, uint32_t nowMs);
   const Seen* lookup(uint32_t src, uint32_t id, uint32_t nowMs) const;
 
+  // Slots 0 .. FORWARD_FULL_SLOTS-1 are full-size, the rest position-sized.
+  static size_t slotCapacity(size_t i);
+  uint8_t* slotBytes(size_t i);
+  bool holdIn(size_t i, const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uint32_t dueMs);
+
   Seen seen_[SEEN_SLOTS];
   Rider riders_[MAX_RIDERS];
-  Forward forwards_[FORWARD_SLOTS];
+  Held held_[FORWARD_SLOTS];
+  uint8_t forwardBytes_[FORWARD_BYTES];
   uint32_t lastId_ = 0;
   uint32_t suppressed_ = 0;
 };

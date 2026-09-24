@@ -20,6 +20,8 @@
 #include <atomic>
 #include <stddef.h>
 #include <stdint.h>
+#include "mesh.h"
+#include "ram.h"
 
 namespace touge {
 
@@ -115,7 +117,13 @@ bool decodeBatchHeader(const uint8_t* in, size_t len, BatchHeader& header);
 
 // ---- Newest unsent position per car ----------------------------------------
 
+// One pending record per car heard on 2.4 GHz, so the roster's size is enough;
+// a car past it evicts the longest-waiting record. 40 bytes a slot.
+#if TOUGE_LEAN_RAM
+static const size_t PHONE_STORE_SLOTS = MAX_RIDERS;
+#else
 static const size_t PHONE_STORE_SLOTS = 32;
+#endif
 
 // How long the first record in may wait for others to join it. SCALE-PLAN asks
 // for 50-100 ms; the top of that range buys the most cars per read.

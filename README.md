@@ -60,8 +60,11 @@ between a phone, a board and every other board, and none of them need a radio
 to check. They are platform-free and tested on the host:
 
 ```sh
-pio test -e native
+pio test -e native -e native-lean
 ```
+
+`native-lean` runs the same suite with the smaller tables a board without PSRAM
+(the Heltec V3) builds with; see `overlay/src/touge/ram.h`.
 
 This needs a host C++ compiler (MinGW-w64, MSVC, or gcc). It is the only part
 of this that runs without hardware, so it is worth having.

@@ -587,6 +587,127 @@ void test_a_forward_scheduled_across_the_millis_wrap_still_fires() {
   TEST_ASSERT_TRUE(m.nextDue(0x00000004, out));
 }
 
+// ---- Forward slots sized to what they hold (lean on a V3) -------------------
+//
+// These run under both sizings: env:native has every slot full-size, and
+// env:native-lean only FORWARD_FULL_SLOTS of them.
+
+// [len] bytes of wire filled from [seed], so a copy handed back can be checked
+// byte for byte. Mesh never parses what it holds.
+static void patternFrame(uint8_t* wire, size_t len, uint8_t seed) {
+  for (size_t i = 0; i < len; i++) wire[i] = (uint8_t)(seed + i * 7);
+}
+
+void test_the_longest_position_frame_fits_a_small_forward_slot() {
+  Position p = posNamed(nullptr);
+  // Every byte of the name used, as a sender that does not terminate it would.
+  memset(p.name, 'x', sizeof(p.name));
+  uint8_t body[POSITION_MIN + sizeof(p.name)];
+  const size_t n = encodePosition(p, body, sizeof(body));
+  TEST_ASSERT_EQUAL_UINT32(POSITION_MIN + sizeof(p.name), n);
+
+  // Sealed, the body carries a tag on the end.
+  uint8_t sealed[FRAME_MAX_PAYLOAD];
+  memcpy(sealed, body, n);
+  memset(sealed + n, 0xAA, TAG_LEN);
+  Frame f;
+  f.type = FRAME_POSITION;
+  f.src = 1;
+  f.id = 2;
+  f.payload = sealed;
+  f.len = (uint16_t)(n + TAG_LEN);
+  uint8_t wire[FRAME_MAX];
+  const size_t w = encodeFrame(f, wire, sizeof(wire));
+  TEST_ASSERT_EQUAL_UINT32(POSITION_FRAME_MAX, w);
+  TEST_ASSERT_TRUE(w <= FORWARD_SMALL_BYTES);
+}
+
+void test_positions_fill_small_slots_before_borrowing_full_ones() {
+  Mesh m;
+  m.reset();
+  uint8_t pos[POSITION_FRAME_MAX];
+  uint8_t voice[FRAME_MAX];
+  patternFrame(pos, sizeof(pos), 1);
+  patternFrame(voice, sizeof(voice), 2);
+
+  for (size_t i = FORWARD_FULL_SLOTS; i < FORWARD_SLOTS; i++)
+    TEST_ASSERT_TRUE(m.defer(pos, sizeof(pos), 1, (uint32_t)i, 10));
+  // Small slots gone: one more position borrows a full-size one...
+  TEST_ASSERT_TRUE(m.defer(pos, sizeof(pos), 1, 500, 10));
+  // ...which leaves one fewer for whole frames.
+  for (size_t i = 1; i < FORWARD_FULL_SLOTS; i++)
+    TEST_ASSERT_TRUE(m.defer(voice, sizeof(voice), 2, (uint32_t)i, 10));
+  TEST_ASSERT_FALSE(m.defer(voice, sizeof(voice), 2, 999, 10));
+  TEST_ASSERT_FALSE(m.defer(pos, sizeof(pos), 1, 999, 10));
+}
+
+void test_a_whole_frame_is_never_squeezed_into_a_small_slot() {
+  Mesh m;
+  m.reset();
+  uint8_t pos[POSITION_FRAME_MAX];
+  uint8_t voice[FRAME_MAX];
+  patternFrame(pos, sizeof(pos), 1);
+  patternFrame(voice, sizeof(voice), 2);
+
+  for (size_t i = 0; i < FORWARD_FULL_SLOTS; i++)
+    TEST_ASSERT_TRUE(m.defer(voice, sizeof(voice), 2, (uint32_t)i, 10));
+  // Only position-sized slots left, if any: a whole frame is refused, a
+  // position still goes in.
+  TEST_ASSERT_FALSE(m.defer(voice, sizeof(voice), 2, 999, 10));
+  for (size_t i = FORWARD_FULL_SLOTS; i < FORWARD_SLOTS; i++)
+    TEST_ASSERT_TRUE(m.defer(pos, sizeof(pos), 1, (uint32_t)i, 10));
+  TEST_ASSERT_FALSE(m.defer(pos, sizeof(pos), 1, 999, 10));
+}
+
+void test_forwards_come_back_byte_exact_from_either_kind_of_slot() {
+  Mesh m;
+  m.reset();
+  uint8_t pos[POSITION_FRAME_MAX];
+  uint8_t voice[FRAME_MAX];
+  patternFrame(pos, sizeof(pos), 3);
+  patternFrame(voice, sizeof(voice), 4);
+  TEST_ASSERT_TRUE(m.defer(voice, sizeof(voice), 2, 20, 20));
+  TEST_ASSERT_TRUE(m.defer(pos, sizeof(pos), 1, 10, 10));
+
+  // Oldest debt first, whichever slot it sits in.
+  Forward out;
+  TEST_ASSERT_TRUE(m.nextDue(30, out));
+  TEST_ASSERT_EQUAL_UINT32(1, out.src);
+  TEST_ASSERT_EQUAL_UINT32(10, out.id);
+  TEST_ASSERT_EQUAL_UINT16(sizeof(pos), out.len);
+  TEST_ASSERT_EQUAL_MEMORY(pos, out.wire, sizeof(pos));
+
+  TEST_ASSERT_TRUE(m.nextDue(30, out));
+  TEST_ASSERT_EQUAL_UINT32(2, out.src);
+  TEST_ASSERT_EQUAL_UINT16(sizeof(voice), out.len);
+  TEST_ASSERT_EQUAL_MEMORY(voice, out.wire, sizeof(voice));
+  TEST_ASSERT_FALSE(m.nextDue(30, out));
+}
+
+void test_dedupe_holds_its_whole_window_at_peak_traffic() {
+  Mesh m;
+  m.reset();
+  // A full ride's worth of distinct frames, spread over one window.
+  const uint32_t frames = (uint32_t)(PEAK_FRAMES_PER_SEC * SEEN_TTL_MS / 1000);
+  for (uint32_t i = 0; i < frames; i++)
+    TEST_ASSERT_TRUE(m.firstSight(100 + i, 7, i * SEEN_TTL_MS / frames));
+  // The first is still known at the end of it, so its late echo is not
+  // mistaken for a new frame and forwarded a second time.
+  TEST_ASSERT_FALSE(m.firstSight(100, 7, SEEN_TTL_MS));
+}
+
+void test_mesh_tables_stay_inside_their_budget() {
+  // Build 36 ran a V3 out of internal RAM. The roster, dedupe table and held
+  // forwards together, pinned so growing them is a decision and not drift.
+#if TOUGE_LEAN_RAM
+  TEST_ASSERT_TRUE(sizeof(Mesh) <= 5600);
+#else
+  TEST_ASSERT_TRUE(sizeof(Mesh) <= 7500);
+#endif
+  // Still a whole ride, lean or not.
+  TEST_ASSERT_TRUE(MAX_RIDERS >= 25);
+}
+
 void test_packet_ids_never_restart_at_zero() {
   // The id is half the AES-CTR nonce. Counting from zero after a reboot would
   // replay every nonce this node has already used under the same channel key.
@@ -1111,6 +1232,12 @@ int main(int, char**) {
   RUN_TEST(test_a_forward_nobody_else_made_still_goes);
   RUN_TEST(test_forward_queue_drops_rather_than_delaying_what_is_waiting);
   RUN_TEST(test_a_forward_scheduled_across_the_millis_wrap_still_fires);
+  RUN_TEST(test_the_longest_position_frame_fits_a_small_forward_slot);
+  RUN_TEST(test_positions_fill_small_slots_before_borrowing_full_ones);
+  RUN_TEST(test_a_whole_frame_is_never_squeezed_into_a_small_slot);
+  RUN_TEST(test_forwards_come_back_byte_exact_from_either_kind_of_slot);
+  RUN_TEST(test_dedupe_holds_its_whole_window_at_peak_traffic);
+  RUN_TEST(test_mesh_tables_stay_inside_their_budget);
   RUN_TEST(test_distance_is_close_enough_to_be_a_gate);
   RUN_TEST(test_distance_does_not_overflow_on_a_full_span_of_longitude);
   RUN_TEST(test_the_cycle_must_divide_a_second);

@@ -68,7 +68,13 @@ class FastRadio {
 
   void end();
 
+  // end(), and the Wi-Fi driver and the receive queue handed back as well, for
+  // a board that cannot spare the heap. begin() can start it all again.
+  void shutdown();
+
   bool ready() const { return ready_; }
+  // The Wi-Fi driver is initialised, whether or not ESP-NOW is running on it.
+  bool driverUp() const;
   uint8_t channel() const { return channel_; }
 
   // Broadcast. Returns false if the driver rejected it, which on a busy
@@ -122,5 +128,15 @@ class FastRadio {
 // One radio, because there is one 2.4 GHz transceiver and the receive callback
 // has to reach it from the Wi-Fi task without being handed a context pointer.
 extern FastRadio fastRadio;
+
+// Internal DMA-capable RAM, the pool BLE's controller and the Wi-Fi driver both
+// allocate from: free now, the least it has been since boot, and the largest
+// block one allocation could get.
+struct DramHeap {
+  uint32_t freeBytes = 0;
+  uint32_t minFreeBytes = 0;
+  uint32_t largestBlock = 0;
+};
+DramHeap dramHeap();
 
 } // namespace touge

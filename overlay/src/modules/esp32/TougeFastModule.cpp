@@ -176,7 +176,11 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // 36: positions reach the phone only in batches, after a hello (no pre-hello per-packet path,
 //     hello bit 0 retired); plain age clamp; fs/fq/fd status with named keys; the lane
 //     report ("fl" with "up") goes out even when the lane is down, with the reason.
-const uint32_t TOUGE_BUILD = 36;
+// 37: a board without PSRAM (V3) starts Wi-Fi with per-frame TX buffers and sizes its forward,
+//     dedupe and phone tables to a full ride, keeps 16 phone-queue slots (core-patches/0009),
+//     and drops the lane if it leaves BLE under LANE_HEAP_FLOOR; a "touge: heap" line every
+//     status cycle; no "fl" reports queue up while no phone is connected.
+const uint32_t TOUGE_BUILD = 37;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -212,6 +216,16 @@ const uint32_t FAST_LANE_START_DELAY_MS = 8000;
 // How long after the BLE server exists before WiFi may start, for NimBLE to
 // finish building and starting its advertising, which is where it allocates.
 const uint32_t FAST_LANE_AFTER_BLE_MS = 2000;
+
+#if TOUGE_LEAN_RAM
+// What a board without PSRAM must still have free once the lane is up. A phone's
+// config download and the reads after it allocate as they go, and BLE's
+// controller does not survive running out (build 36 on a V3: "BLE_INIT: Malloc
+// failed", reads unanswered). Below this the lane is taken down for the boot:
+// the phone link matters more. An estimate, not a measurement; check it against
+// the "touge: heap" line.
+const uint32_t LANE_HEAP_FLOOR = 16 * 1024;
+#endif
 
 // The longest the fast lane waits for Bluetooth at all. A board with Bluetooth
 // switched off never gets a BLE server, and must not sit off 2.4 GHz for good
@@ -383,6 +397,10 @@ void TougeFastModule::saveIdCounter()
 
 void TougeFastModule::syncChannel()
 {
+    // Taken down for want of heap; laneDown_ already says so. Not retried: a
+    // board that short stays LoRa-only until it reboots.
+    if (heapRefused_) return;
+
     CryptoKey key = channels.getKey(channels.getPrimaryIndex());
     // No secret, no fast lane.
     //
@@ -438,6 +456,7 @@ void TougeFastModule::syncChannel()
     lastHopCheckMs_ = lastHeardMs_;
     heardInWindow_ = 0;
 
+    const bool wifiWasUp = fastRadio.driverUp();
     if (!fastRadio.begin(net_)) {
         laneDown_ = LaneDown::RADIO;
         LOG_WARN("touge: ESP-NOW would not start (%s, heap %u free, %u largest), LoRa only",
@@ -445,6 +464,25 @@ void TougeFastModule::syncChannel()
                  (unsigned)fastRadio.beginFreeHeap(), (unsigned)fastRadio.beginLargestBlock());
         started_ = false;
         return;
+    }
+    if (!wifiWasUp) {
+        const DramHeap afterLane = dramHeap();
+        LOG_INFO("touge: Wi-Fi up, dram heap %u free before, %u after (%u largest)",
+                 (unsigned)fastRadio.beginFreeHeap(), (unsigned)afterLane.freeBytes,
+                 (unsigned)afterLane.largestBlock);
+#if TOUGE_LEAN_RAM
+        // Only when the driver was just brought up: a key change mid-ride reuses
+        // it, and a dip then is the phone's doing, not the lane's.
+        if (afterLane.freeBytes < LANE_HEAP_FLOOR) {
+            LOG_WARN("touge: %u B heap left with the lane up, BLE needs %u; lane off until reboot, LoRa only",
+                     (unsigned)afterLane.freeBytes, (unsigned)LANE_HEAP_FLOOR);
+            fastRadio.shutdown();
+            laneDown_ = LaneDown::RADIO;
+            heapRefused_ = true;
+            started_ = false;
+            return;
+        }
+#endif
     }
     if (!fastRadio.retuneTo(hop_.channel())) {
         // Up, but not where we meant to be. Worth one line at boot rather than
@@ -1190,6 +1228,7 @@ void TougeFastModule::status(uint32_t nowMs)
     const uint32_t statusWindowMs = nowMs - lastStatusMs_;
     lastStatusMs_ = nowMs;
     reportLinkStats(nowMs, statusWindowMs);
+    logHeap();
 
     uint32_t nowSec = getValidTime(RTCQualityFromNet);
     const char *clock = rideClock.locked((uint64_t)esp_timer_get_time()) ? "gps"
@@ -1232,8 +1271,9 @@ void TougeFastModule::status(uint32_t nowMs)
     // Goes out on the private port as JSON, which the app already parses and
     // which ignores keys it does not know, so an older app sees nothing new
     // rather than breaking. sendToPhone only queues for BLE; none of this
-    // touches the air.
-    {
+    // touches the air. Not while no phone is connected: unread, these filled
+    // all 32 places in the phone queue (depth=32 on a V3's log, build 36).
+    if (service->api_state != MeshService::STATE_DISCONNECTED) {
         char js[meshtastic_Constants_DATA_PAYLOAD_LEN];
         int n = snprintf(
             js, sizeof(js),
@@ -1576,10 +1616,12 @@ void TougeFastModule::flushPhoneBatch(uint32_t nowMs)
 
 bool TougeFastModule::handPhoneBatch(const uint8_t *payload, size_t len, uint32_t &packetId, bool &preloaded)
 {
-    // Static: a MeshPacket and a FromRadio are over a kilobyte together, too much
-    // for the main task's stack on every flush.
-    static meshtastic_MeshPacket packet;
-    memset(&packet, 0, sizeof(packet));
+    // Static, since a FromRadio is 768 bytes, too much for the main task's stack
+    // on every flush. The batch's MeshPacket is built inside it rather than in a
+    // static of its own, 432 bytes less of internal RAM.
+    static meshtastic_FromRadio fromRadio;
+    memset(&fromRadio, 0, sizeof(fromRadio));
+    meshtastic_MeshPacket &packet = fromRadio.packet;
     packet.from = nodeId_;
     packet.to = NODENUM_BROADCAST;
     packet.id = generatePacketId();
@@ -1602,11 +1644,8 @@ bool TougeFastModule::handPhoneBatch(const uint8_t *payload, size_t len, uint32_
     // of order; the app keeps the newest frame per car. Readied in place when
     // it is read (readyPreloadedBatch), like a queued one in notePhoneDelivered.
     if ((hello_.flags & HELLO_PRELOAD) != 0 && !batchesInFlight_.hasPreloaded()) {
-        static meshtastic_FromRadio fromRadio;
         static uint8_t fromRadioBytes[meshtastic_FromRadio_size];
-        memset(&fromRadio, 0, sizeof(fromRadio));
         fromRadio.which_payload_variant = meshtastic_FromRadio_packet_tag;
-        fromRadio.packet = packet;
         const size_t n = pb_encode_to_bytes(fromRadioBytes, sizeof(fromRadioBytes), &meshtastic_FromRadio_msg, &fromRadio);
         // A bytes field is copied verbatim, so the payload is findable as is.
         const int at = n > 0 ? findPayload(fromRadioBytes, n, payload, len) : -1;
@@ -1761,7 +1800,7 @@ void TougeFastModule::reportLinkStats(uint32_t nowMs, uint32_t windowMs)
     stats_.preloadRead = c.offeredRead;
     stats_.preloadRefused = c.offerRefused;
 #endif
-    stats_.minFreeHeap = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    stats_.minFreeHeap = dramHeap().minFreeBytes;
 
     char line[320];
     if (formatBaseline(stats_, statsAtLastReport_, windowMs, line, sizeof(line)) > 0) {
@@ -1788,9 +1827,20 @@ void TougeFastModule::reportLaneDown(uint32_t nowMs, LaneDown why)
     // lane is down no longer looks like stock.
     if ((uint32_t)(nowMs - lastStatusMs_) < STATUS_EVERY_MS) return;
     lastStatusMs_ = nowMs;
+    // A board whose lane is down for want of heap is the one this line is for.
+    logHeap();
     if (service == nullptr || router == nullptr || service->api_state == MeshService::STATE_DISCONNECTED) return;
     char js[BATCH_MAX_PAYLOAD];
     queueJsonToPhone(js, formatLaneDown(TOUGE_BUILD, why, js, sizeof(js)));
+}
+
+void TougeFastModule::logHeap()
+{
+    // A line of its own: Meshtastic cuts a log message at 159 characters, and
+    // the status and BASELINE lines are already there. Same pool as "hp" in fq.
+    const DramHeap h = dramHeap();
+    LOG_INFO("touge: heap dram free=%u min=%u largest=%u", (unsigned)h.freeBytes, (unsigned)h.minFreeBytes,
+             (unsigned)h.largestBlock);
 }
 
 #endif
