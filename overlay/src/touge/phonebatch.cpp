@@ -320,6 +320,21 @@ int findPayload(const uint8_t* fromRadio, size_t len, const uint8_t* payload, si
   return -1;
 }
 
+size_t fromRadioPacketHeader(size_t packetLen, uint8_t* out, size_t cap) {
+  if (out == nullptr || cap == 0) return 0;
+  // Field 2, wire type 2 (length-delimited).
+  out[0] = (2 << 3) | 2;
+  size_t at = 1;
+  size_t rest = packetLen;
+  do {
+    if (at >= cap) return 0;
+    const uint8_t low = (uint8_t)(rest & 0x7F);
+    rest >>= 7;
+    out[at++] = rest != 0 ? (uint8_t)(low | 0x80) : low;
+  } while (rest != 0);
+  return at;
+}
+
 // ---- Writes the radio dropped --------------------------------------------------------
 
 namespace {

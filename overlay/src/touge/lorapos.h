@@ -1,7 +1,7 @@
 #pragma once
 //
 // LoRa positions: the identity they carry, and how the queues keep one per car
-// (SCALE-PLAN 5b and 5c).
+// (SCALE-PLAN 5b and 5c); how ours goes out (build 43).
 //
 // The radio sends its car's LoRa position itself, from the fix it holds
 // (ownfix.h), at the interval the measured load allows (loraload.h).
@@ -18,6 +18,42 @@
 #include "frame.h"
 
 namespace touge {
+
+// ---- Our own position on the air (build 43) ----------------------------------
+
+// Meshtastic's MeshPacket priorities (mesh.proto; the module asserts they
+// match). A relay queues at DEFAULT, and the TX queue sends the highest first.
+static const uint8_t PRIORITY_BACKGROUND = 10;
+static const uint8_t PRIORITY_DEFAULT = 64;
+static const uint8_t PRIORITY_RELIABLE = 70;
+
+// Our position goes one step above relays, and on its own contention delay
+// rather than what is left of the SNR-weighted one a relay started, up to
+// 2.2 s on SHORT_FAST (core-patches/0014). At BACKGROUND, as PositionModule's,
+// it waited behind every relay: bench, build 41, median 0.6 s, p90 4.5 s, max
+// 6.2 s from queued to on the air. Priority is local, in neither the LoRa header
+// nor the encrypted Data. One position an interval, so relays still go between
+// ours; texts, admin and acks stay above it.
+static const uint8_t OWN_POSITION_PRIORITY = PRIORITY_RELIABLE;
+
+// Meshtastic's POSITION_APP port (the module asserts it matches).
+static const uint32_t PORT_POSITION = 3;
+
+// Whether a packet this radio originates goes without Meshtastic's XEdDSA
+// signature (core-patches/0015): our position, broadcast on a channel with a
+// real key while the fast lane sends it ([ownsPositions]). The signature field
+// is 66 bytes: signed, a position is 130-133 bytes on the air, 112-114 ms on
+// SHORT_FAST (111 ms measured on the bench); unsigned, 64-67 bytes and 63-66
+// ms. Texts, NodeInfo, reach summaries, admin and routing stay signed, and so
+// does everything from a radio in stock mode, or a licensed (ham) one, where
+// the signature is all that authenticates a packet.
+bool sendsUnsigned(uint32_t portnum, bool broadcast, bool ownsPositions, bool privateChannel, bool licensed);
+
+// Whether an unsigned packet from a node Meshtastic has seen sign passes its
+// Balanced policy anyway (core-patches/0015): a position on a channel with a
+// real key, which only the ride's radios can send. Everything else keeps the
+// downgrade protection, and a licensed radio keeps it all.
+bool passesUnsigned(uint32_t portnum, bool privateChannel, bool licensed);
 
 // The identity a Meshtastic Position carries: sensor_id is the session,
 // seq_number the sequence, and the fix time is timestamp plus its millisecond

@@ -22,13 +22,59 @@
 // Without renewal a preference lapses and the car is back to ordinary
 // forwarding. A summary showing worse delivery through us ends it at once.
 //
+// From build 43 a car also skips a relay nobody needs (relayVerdict): when
+// fresh summaries show every other car it knows already hears the origin
+// steadily direct. A preference only matters for a relay that goes at all.
+//
 // Platform-free.
 
 #include <stddef.h>
 #include <stdint.h>
+#include "lorapos.h"
 #include "reach.h"
 
 namespace touge {
+
+// ---- Relays nobody needs (build 43) ------------------------------------------
+
+enum class RelayVerdict : uint8_t {
+  STOCK,        // not a Touge position: Meshtastic relays it as ever
+  SKIP,         // every other car we know hears the origin steadily direct
+  NO_EVIDENCE,  // relayed: a car we know has claimed nothing (a stock node, an older build, a car just heard)
+  STALE,        // relayed: a car's last full summary is older than the window
+  NEEDED,       // relayed: a car's fresh summary says it does not hear the origin steadily direct
+};
+
+// The cars we know other than us and [origin], into [cars] (room for [cap]);
+// false when there are more, and nobody can then be shown not to need a relay.
+typedef bool (*KnownCars)(uint32_t origin, uint32_t* cars, size_t cap, size_t& n, void* ctx);
+
+// The most cars a relay decision reads: a full ride and a few strangers. On
+// the stack of the one relay being judged, 128 bytes.
+static const size_t KNOWN_CARS_MAX = MAX_RIDERS + 4;
+
+// Whether a position from [origin] is worth relaying for the [n] cars in
+// [known]. SKIP only when every one of them claims to hear the origin steadily
+// direct in a summary fresh within [freshMs]; otherwise the strongest reason to
+// relay, NEEDED over STALE over NO_EVIDENCE. Nobody else known is nobody to
+// relay for: a car that turns up is known from its first packet.
+RelayVerdict judgeRelay(const Reach& reach, uint32_t origin, const uint32_t* known, size_t n, uint32_t freshMs,
+                        uint32_t nowMs);
+
+// The same for packet [from, id] as Meshtastic is about to relay it. Only a
+// position noted with a fix identity (5c) is judged; text, NodeInfo, control,
+// summaries and stock positions are STOCK, and [known] is not asked.
+RelayVerdict relayVerdict(const TxPositions& noted, uint32_t from, uint32_t id, const Reach& reach, KnownCars known,
+                          void* ctx, uint32_t freshMs, uint32_t nowMs);
+
+// Since boot, in "le": how many relays were skipped, and why the rest went.
+struct RelaySkips {
+  uint32_t skipped = 0;     // sk
+  uint32_t noEvidence = 0;  // rn
+  uint32_t stale = 0;       // rs
+  uint32_t needed = 0;      // rd
+  void note(RelayVerdict v);
+};
 
 // Origins one car can be a preferred relay for. A car in a convoy carries the
 // cars behind it one way and the cars ahead the other; eight covers a long
@@ -78,8 +124,11 @@ class RelayPrefs {
   uint32_t withdrawn_ = 0;
 };
 
-// "le": summaries sent and heard, preferences granted and withdrawn, since
-// boot. Serial line when [json] is false, the phone's JSON when true.
-size_t formatLoraReach(const Reach& reach, const RelayPrefs& prefs, bool json, char* out, size_t cap);
+// "le", since boot: summaries sent and heard, preferences granted and
+// withdrawn, then (build 43) how many of our summaries went early, relays
+// skipped and why the rest went. Serial line when [json] is false, the phone's
+// JSON when true.
+size_t formatLoraReach(const Reach& reach, const RelayPrefs& prefs, const RelaySkips& skips, bool json, char* out,
+                       size_t cap);
 
 }  // namespace touge
