@@ -36,7 +36,9 @@ void encodeRecord(const PhoneRecord& r, uint32_t nowMs, uint8_t* b) {
   // age wrapped and saturated to 65.5 s, and the phone threw away every fresh
   // 2.4 GHz position as older than LoRa.
   const int32_t age = (int32_t)(nowMs - r.heardMs);
-  put16(b + 20, age <= 0 ? (uint16_t)0 : age > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)age);
+  // Saturates at 0xFFFE: build 31+ apps read 0xFFFF as a build 30 radio's wrapped
+  // negative age, i.e. "just heard", so a genuinely old position must not say it.
+  put16(b + 20, age <= 0 ? (uint16_t)0 : age > (int32_t)AGE_MAX ? AGE_MAX : (uint16_t)age);
   b[22] = (uint8_t)r.rssi;
   b[23] = (uint8_t)((r.external ? 0x01 : 0) | ((r.lane & 0x03) << 1) | ((r.hopsAway & 0x0F) << 4));
 }
@@ -202,37 +204,52 @@ size_t PhoneStore::takeBatch(uint8_t* out, size_t cap, uint16_t seq, uint32_t no
 
 void BatchesInFlight::clear() { count_ = 0; }
 
-void BatchesInFlight::removeAt(size_t i) {
+uint8_t BatchesInFlight::removeAt(size_t i) {
+  const uint8_t records = entries_[i].records;
   for (size_t k = i + 1; k < count_; k++) entries_[k - 1] = entries_[k];
   count_--;
+  return records;
 }
 
-void BatchesInFlight::add(uint16_t seq, uint8_t records, uint32_t nowMs) {
-  // Callers check full() first; if they did not, the oldest is the one to lose.
-  if (count_ >= MAX_BATCHES_IN_FLIGHT) removeAt(0);
-  entries_[count_].seq = seq;
-  entries_[count_].records = records;
-  entries_[count_].atMs = nowMs;
-  count_++;
+bool BatchesInFlight::add(uint16_t seq, uint8_t records, uint32_t nowMs, uint32_t packetId, bool preloaded) {
+  if (count_ >= MAX_BATCHES_IN_FLIGHT) return false;
+  Entry& e = entries_[count_++];
+  e.seq = seq;
+  e.records = records;
+  e.atMs = nowMs;
+  e.packetId = packetId;
+  e.preloaded = preloaded;
+  return true;
 }
 
 uint8_t BatchesInFlight::delivered(uint16_t seq) {
-  for (size_t i = 0; i < count_; i++) {
-    if (entries_[i].seq != seq) continue;
-    const uint8_t records = entries_[i].records;
-    removeAt(i);
-    return records;
-  }
+  for (size_t i = 0; i < count_; i++)
+    if (entries_[i].seq == seq) return removeAt(i);
   return 0;
 }
 
-uint32_t BatchesInFlight::expire(uint32_t nowMs, uint32_t maxMs) {
+uint8_t BatchesInFlight::dropped(uint16_t seq) { return delivered(seq); }
+
+uint8_t BatchesInFlight::preloadRead() {
+  for (size_t i = 0; i < count_; i++)
+    if (entries_[i].preloaded) return removeAt(i);
+  return 0;
+}
+
+uint8_t BatchesInFlight::preloadLost() { return preloadRead(); }
+
+bool BatchesInFlight::hasPreloaded() const {
+  for (size_t i = 0; i < count_; i++)
+    if (entries_[i].preloaded) return true;
+  return false;
+}
+
+uint32_t BatchesInFlight::reconcile(bool (*stillQueued)(uint32_t packetId, void* ctx), void* ctx) {
   uint32_t lost = 0;
   size_t i = 0;
   while (i < count_) {
-    if (nowMs - entries_[i].atMs >= maxMs) {
-      lost += entries_[i].records;
-      removeAt(i);
+    if (!entries_[i].preloaded && !stillQueued(entries_[i].packetId, ctx)) {
+      lost += removeAt(i);
     } else {
       i++;
     }
@@ -253,6 +270,22 @@ uint32_t BatchesInFlight::oldestAgeMs(uint32_t nowMs) const {
     if (age > oldest) oldest = age;
   }
   return oldest;
+}
+
+bool restampBatch(uint8_t* payload, size_t len, uint32_t nowMs) {
+  BatchHeader h;
+  if (!decodeBatchHeader(payload, len, h)) return false;
+  const int32_t waited = (int32_t)(nowMs - h.radioMs);
+  const uint32_t extra = waited > 0 ? (uint32_t)waited : 0;
+  const size_t headerLen = payload[2];
+  const size_t recordLen = payload[3];
+  for (size_t i = 0; i < h.count; i++) {
+    uint8_t* age = payload + headerLen + i * recordLen + 20;
+    const uint32_t older = (uint32_t)get16(age) + extra;
+    put16(age, older > AGE_MAX ? AGE_MAX : (uint16_t)older);
+  }
+  put32(payload + 8, h.radioMs + extra);
+  return true;
 }
 
 // ---- Hello -------------------------------------------------------------------------

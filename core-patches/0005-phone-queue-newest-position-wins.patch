@@ -27,7 +27,7 @@
      // For compatibility with PointerQueue interface
 --- a/src/mesh/MeshService.h
 +++ b/src/mesh/MeshService.h
-@@ -128,6 +128,14 @@
+@@ -128,6 +128,18 @@
      /// last few packets if needs to.
      meshtastic_MeshPacket *getForPhone() { return toPhoneQueue.dequeuePtr(0); }
  
@@ -38,11 +38,15 @@
 +    uint32_t tougePositionsReplaced = 0; // a car's queued position superseded by its newer one
 +    uint32_t tougePositionsEvicted = 0;  // oldest queued position dropped to make room
 +    uint32_t tougePhoneDropped = 0;      // packet lost to a full queue with no position to evict
++    /// Touge: whether a packet is still waiting in the phone queue, so the fast lane can tell a
++    /// batch that was discarded from one not read yet. Always true on Portduino, which has no
++    /// way to look inside its queue.
++    bool toPhoneQueueHasPacket(uint32_t id);
 +
      /// Allows the bluetooth handler to free packets after they have been sent
      void releaseToPool(meshtastic_MeshPacket *p) { packetPool.release(p); }
  
-@@ -228,6 +236,10 @@
+@@ -228,6 +240,10 @@
      uint32_t GetTimeSinceMeshPacket(const meshtastic_MeshPacket *mp);
  
    private:
@@ -55,7 +59,7 @@
      /// returns 0 to allow further processing
 --- a/src/mesh/MeshService.cpp
 +++ b/src/mesh/MeshService.cpp
-@@ -479,6 +479,62 @@
+@@ -479,6 +479,77 @@
      }
  }
  
@@ -97,6 +101,21 @@
 +#endif
 +}
 +
++bool MeshService::toPhoneQueueHasPacket(uint32_t id)
++{
++#ifdef ARCH_PORTDUINO
++    (void)id;
++    return true;
++#else
++    for (int i = 0; i < toPhoneQueue.numUsed(); i++) {
++        const meshtastic_MeshPacket *queued = toPhoneQueue.at(i);
++        if (queued && queued->id == id)
++            return true;
++    }
++    return false;
++#endif
++}
++
 +bool MeshService::evictOldestQueuedPosition()
 +{
 +#ifdef ARCH_PORTDUINO
@@ -118,7 +137,7 @@
  void MeshService::sendToPhone(meshtastic_MeshPacket *p)
  {
      perhapsDecode(p);
-@@ -503,6 +559,11 @@
+@@ -503,6 +574,11 @@
  #endif
  #endif
  
@@ -130,7 +149,7 @@
      if (toPhoneQueue.numFree() == 0) {
          // ROUTING_APP is the phone's only delivery confirmation, so it displaces the oldest like
          // text does. Gate the variant: decoded.portnum aliases encrypted.size in the union.
-@@ -513,8 +574,13 @@
+@@ -513,8 +589,13 @@
              meshtastic_MeshPacket *d = toPhoneQueue.dequeuePtr(0);
              if (d)
                  releaseToPool(d);

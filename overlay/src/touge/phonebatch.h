@@ -39,6 +39,10 @@ static const size_t BATCH_HEADER = 12;
 //   23 flags: bit 0 phone fix, bits 1-2 lane (0 = 2.4 GHz), bits 4-7 hops away
 static const size_t BATCH_RECORD = 24;
 
+// The largest age a record carries. 0xFFFF itself is left alone: build 30 radios
+// wrote it for a slightly negative age, and the app reads it as "just heard".
+static const uint16_t AGE_MAX = 0xFFFE;
+
 // Meshtastic's Data payload ceiling (meshtastic_Constants_DATA_PAYLOAD_LEN).
 // The batch rides in one, so this is the most a batch can be whatever the MTU.
 static const size_t BATCH_MAX_PAYLOAD = 233;
@@ -144,37 +148,59 @@ class PhoneStore {
 // history in front of the phone, which is what the store exists to prevent.
 static const size_t MAX_BATCHES_IN_FLIGHT = 2;
 
-// A batch not read in this long was lost somewhere below us.
-static const uint32_t BATCH_LOST_MS = 3000;
-
+// A batch holds its place until it is read or is known to have left the
+// queues some other way. There is no timeout: a timed-out batch still sitting
+// in Meshtastic's phone queue would let a third in behind it, and a long stall
+// would stack them up (review 2026-09-24).
 class BatchesInFlight {
  public:
-  void clear();
-  bool full() const { return count_ >= MAX_BATCHES_IN_FLIGHT; }
-  size_t count() const { return count_; }
-  void add(uint16_t seq, uint8_t records, uint32_t nowMs);
-
-  // Marks [seq] read. Returns its record count, 0 if it was not in flight.
-  uint8_t delivered(uint16_t seq);
-
-  // Drops batches older than [maxMs]. Returns how many records went with them.
-  uint32_t expire(uint32_t nowMs, uint32_t maxMs);
-
-  // Records dropped by clear(), e.g. on a disconnect.
-  uint32_t pendingRecords() const;
-
-  uint32_t oldestAgeMs(uint32_t nowMs) const;
-
- private:
   struct Entry {
     uint16_t seq = 0;
     uint8_t records = 0;
     uint32_t atMs = 0;
+    // The MeshPacket id it went out under, to find it in the phone queue.
+    uint32_t packetId = 0;
+    // In NimBLE's read queue rather than Meshtastic's (core-patches/0007).
+    bool preloaded = false;
   };
+
+  void clear();
+  bool full() const { return count_ >= MAX_BATCHES_IN_FLIGHT; }
+  size_t count() const { return count_; }
+  const Entry& at(size_t i) const { return entries_[i]; }
+  // False, adding nothing, when full: the caller must check full() first.
+  bool add(uint16_t seq, uint8_t records, uint32_t nowMs, uint32_t packetId, bool preloaded);
+
+  // The phone read [seq]. Returns its record count, 0 if it was not in flight.
+  uint8_t delivered(uint16_t seq);
+
+  // [seq] left the queues without being read. Returns its record count.
+  uint8_t dropped(uint16_t seq);
+
+  // The pre-encoded batch was read, or was lost with the link. Record counts.
+  uint8_t preloadRead();
+  uint8_t preloadLost();
+  bool hasPreloaded() const;
+
+  // Drops every queued (not pre-encoded) batch whose packet is no longer in
+  // the phone queue: it left without the delivered hook firing, so it was
+  // discarded. [stillQueued] answers for one packet id. Returns records lost.
+  uint32_t reconcile(bool (*stillQueued)(uint32_t packetId, void* ctx), void* ctx);
+
+  uint32_t pendingRecords() const;
+  uint32_t oldestAgeMs(uint32_t nowMs) const;
+
+ private:
   Entry entries_[MAX_BATCHES_IN_FLIGHT];
   size_t count_ = 0;
-  void removeAt(size_t i);
+  uint8_t removeAt(size_t i);
 };
+
+// Moves a batch's clock to [nowMs], the moment it is handed to the phone:
+// every record's age grows by the time the batch waited in the queue, so a
+// batch read five seconds late says its positions are five seconds older.
+// False, changing nothing, if [payload] is not a batch.
+bool restampBatch(uint8_t* payload, size_t len, uint32_t nowMs);
 
 // ---- Phone hello ------------------------------------------------------------
 //

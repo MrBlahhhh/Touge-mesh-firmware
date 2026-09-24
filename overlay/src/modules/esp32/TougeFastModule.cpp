@@ -172,7 +172,9 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // 32: extra beacons in free slots of a car's own row, up to 4 Hz with few cars
 //     (frame flag 0x10, not forwarded); the phone sends each new fix at once.
 // 33: core-patches/0008, a 3 s button hold shuts down with the button still held.
-const uint32_t TOUGE_BUILD = 33;
+// 34: a batch holds its in-flight place until read or gone from the phone queue (no 3 s
+//     timeout), is restamped with its queue wait as it leaves; ages cap at 0xFFFE.
+const uint32_t TOUGE_BUILD = 34;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -1545,9 +1547,11 @@ void TougeFastModule::offerToPhone(const PhoneRecord &r)
 void TougeFastModule::flushPhoneBatch(uint32_t nowMs)
 {
     if (!batchingToPhone()) return;
-    stats_.dropLost += batchesInFlight_.expire(nowMs, BATCH_LOST_MS);
     // Backpressure: with two batches unread, positions wait here, where a newer
     // one replaces an older one, rather than in a queue in front of the phone.
+    // A batch frees its place only by being read or leaving the queues
+    // (trackPhoneLink), never on a timer: a timed-out batch was still queued,
+    // and long stalls stacked them up behind it.
     if (batchesInFlight_.full()) return;
 
     const size_t budget = batchBudgetForMtu(hello_.mtu);
@@ -1559,15 +1563,17 @@ void TougeFastModule::flushPhoneBatch(uint32_t nowMs)
     const size_t len = phoneStore_.takeBatch(payload, budget, seq, nowMs, taken);
     if (len == 0) return;
     batchSeq_++;
-    if (!handPhoneBatch(payload, len, seq)) {
+    uint32_t packetId = 0;
+    bool preloaded = false;
+    if (!handPhoneBatch(payload, len, packetId, preloaded)) {
         stats_.dropAlloc += (uint32_t)taken;
         return;
     }
     stats_.batches++;
-    batchesInFlight_.add(seq, (uint8_t)taken, nowMs);
+    batchesInFlight_.add(seq, (uint8_t)taken, nowMs, packetId, preloaded);
 }
 
-bool TougeFastModule::handPhoneBatch(const uint8_t *payload, size_t len, uint16_t seq)
+bool TougeFastModule::handPhoneBatch(const uint8_t *payload, size_t len, uint32_t &packetId, bool &preloaded)
 {
     // Static: a MeshPacket and a FromRadio are over a kilobyte together, too much
     // for the main task's stack on every flush.
@@ -1584,12 +1590,16 @@ bool TougeFastModule::handPhoneBatch(const uint8_t *payload, size_t len, uint16_
     packet.decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
     memcpy(packet.decoded.payload.bytes, payload, len);
     packet.decoded.payload.size = (pb_size_t)len;
+    packetId = packet.id;
+    preloaded = false;
 
 #if TOUGE_HAS_NIMBLE
     // Straight into NimBLE's read queue, so the phone's read is answered without
     // waiting for the main task (SCALE-PLAN step 3b). Refused when the link is
-    // busy or not streaming, and then the batch takes the ordinary queue.
-    if ((hello_.flags & HELLO_PRELOAD) != 0 && preloadedSeq_ < 0) {
+    // busy or not streaming, and then the batch takes the ordinary queue. It is
+    // read ahead of anything in that queue, so batches can reach the phone out
+    // of order; the app keeps the newest frame per car.
+    if ((hello_.flags & HELLO_PRELOAD) != 0 && !batchesInFlight_.hasPreloaded()) {
         static meshtastic_FromRadio fromRadio;
         static uint8_t fromRadioBytes[meshtastic_FromRadio_size];
         memset(&fromRadio, 0, sizeof(fromRadio));
@@ -1597,7 +1607,7 @@ bool TougeFastModule::handPhoneBatch(const uint8_t *payload, size_t len, uint16_
         fromRadio.packet = packet;
         const size_t n = pb_encode_to_bytes(fromRadioBytes, sizeof(fromRadioBytes), &meshtastic_FromRadio_msg, &fromRadio);
         if (n > 0 && nimbleOfferToPhone(fromRadioBytes, n)) {
-            preloadedSeq_ = seq;
+            preloaded = true;
             return true;
         }
     }
@@ -1606,8 +1616,15 @@ bool TougeFastModule::handPhoneBatch(const uint8_t *payload, size_t len, uint16_
     meshtastic_MeshPacket *pp = router->allocForSending();
     if (!pp) return false;
     *pp = packet;
+    // May be refused by a full queue; trackPhoneLink then finds it gone.
     service->sendToPhone(pp);
     return true;
+}
+
+bool TougeFastModule::stillInPhoneQueue(uint32_t packetId, void *ctx)
+{
+    (void)ctx;
+    return service->toPhoneQueueHasPacket(packetId);
 }
 
 void TougeFastModule::trackPhoneLink(uint32_t nowMs)
@@ -1617,33 +1634,38 @@ void TougeFastModule::trackPhoneLink(uint32_t nowMs)
     stats_.queueDepth = (uint16_t)depth;
     if (depth > stats_.queueDepthMax) stats_.queueDepthMax = (uint16_t)depth;
 
-    // A hello lasts one connection. The next phone may be an app that only
-    // reads one packet per position, so it has to say hello for itself.
-    if (service->api_state == MeshService::STATE_DISCONNECTED) {
-        if (helloSeen_) LOG_INFO("touge: phone gone, positions go one packet each until the next hello");
-        helloSeen_ = false;
-        stats_.dropDisconnect += (uint32_t)phoneStore_.pending() + batchesInFlight_.pendingRecords();
-        phoneStore_.clear();
-        batchesInFlight_.clear();
-        preloadedSeq_ = -1;
-        return;
-    }
-
 #if TOUGE_HAS_NIMBLE
     NimbleTougeCounters c;
     nimbleTougeCounters(c);
     // Only one batch is ever pre-encoded at a time, so a read is that one.
     if (c.offeredRead != preloadReadSeen_) {
         preloadReadSeen_ = c.offeredRead;
-        if (preloadedSeq_ >= 0) notePhoneRead((uint16_t)preloadedSeq_);
-        preloadedSeq_ = -1;
+        const uint8_t records = batchesInFlight_.preloadRead();
+        if (records > 0) {
+            stats_.batchesRead++;
+            stats_.fast.delivered += records;
+        }
     }
-    // Lost with a link reset; its records are counted when it expires.
     if (c.offeredLost != preloadLostSeen_) {
         preloadLostSeen_ = c.offeredLost;
-        preloadedSeq_ = -1;
+        stats_.dropDisconnect += batchesInFlight_.preloadLost();
     }
 #endif
+    // A queued batch that is no longer in the phone queue and was never
+    // delivered (the hook would have removed it) was discarded: refused by a
+    // full queue, or pushed out by a text. Its place is free again.
+    stats_.dropLost += batchesInFlight_.reconcile(&TougeFastModule::stillInPhoneQueue, nullptr);
+
+    // A hello lasts one connection. The next phone may be an app that only
+    // reads one packet per position, so it has to say hello for itself.
+    // Batches already queued stay tracked: they are still in Meshtastic's
+    // queue and the next phone reads them, restamped with their real age.
+    if (service->api_state == MeshService::STATE_DISCONNECTED) {
+        if (helloSeen_) LOG_INFO("touge: phone gone, positions go one packet each until the next hello");
+        helloSeen_ = false;
+        stats_.dropDisconnect += (uint32_t)phoneStore_.pending();
+        phoneStore_.clear();
+    }
 }
 
 void TougeFastModule::notePhoneRead(uint16_t seq)
@@ -1654,12 +1676,12 @@ void TougeFastModule::notePhoneRead(uint16_t seq)
     stats_.fast.delivered += records;
 }
 
-void TougeFastModule::onPhoneDelivered(const meshtastic_MeshPacket &p)
+void TougeFastModule::onPhoneDelivered(meshtastic_MeshPacket &p)
 {
     if (tougeFastModule) tougeFastModule->notePhoneDelivered(p);
 }
 
-void TougeFastModule::notePhoneDelivered(const meshtastic_MeshPacket &p)
+void TougeFastModule::notePhoneDelivered(meshtastic_MeshPacket &p)
 {
     if (p.which_payload_variant != meshtastic_MeshPacket_decoded_tag) return;
     if (p.decoded.portnum == meshtastic_PortNum_POSITION_APP) {
@@ -1673,6 +1695,9 @@ void TougeFastModule::notePhoneDelivered(const meshtastic_MeshPacket &p)
         return;
     }
     if (p.decoded.portnum != meshtastic_PortNum_PRIVATE_APP || p.from != nodeId_) return;
+    // The ages were taken when the batch was packed. Move them on by however
+    // long it sat in the queue, so a batch read five seconds late says so.
+    if (!restampBatch(p.decoded.payload.bytes, p.decoded.payload.size, millis())) return;
     BatchHeader header;
     if (decodeBatchHeader(p.decoded.payload.bytes, p.decoded.payload.size, header)) notePhoneRead(header.seq);
 }

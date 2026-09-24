@@ -101,12 +101,46 @@ rm -f "$MODULES.bak"
 # reverse-applies is in, and is skipped.
 if ls "$HERE"/core-patches/*.patch >/dev/null 2>&1; then
   echo "==> core patches"
+  # A copy of each patch as applied, so an edited patch can take the old one out
+  # first. A tree patched before these copies existed falls back to the version
+  # in this repo's last commit, which is what that tree was patched with.
+  APPLIED="$DEST/.touge-core-patches"
+  mkdir -p "$APPLIED"
   for patch in "$HERE"/core-patches/*.patch; do
     name="$(basename "$patch")"
     if patch -p1 -d "$DEST" -R --dry-run -f <"$patch" >/dev/null 2>&1; then
       echo "    $name already applied"
-    elif patch -p1 -d "$DEST" --dry-run -f <"$patch" >/dev/null 2>&1; then
+      cp "$patch" "$APPLIED/$name"
+      continue
+    fi
+
+    # Not in as it stands. If an older version of it is, reverse that first.
+    # The saved copy first; failing that, every committed version of the patch,
+    # newest first, until one is found that is actually in the tree. Searching
+    # history rather than only HEAD means it works whether or not the new
+    # version was committed before this ran.
+    old=""
+    if [[ -f "$APPLIED/$name" ]] && ! cmp -s "$APPLIED/$name" "$patch" &&
+       patch -p1 -d "$DEST" -R --dry-run -f <"$APPLIED/$name" >/dev/null 2>&1; then
+      old="$APPLIED/$name"
+    else
+      for rev in $(git -C "$HERE" log --format=%h -- "core-patches/$name" 2>/dev/null); do
+        git -C "$HERE" show "$rev:firmware/core-patches/$name" >"$APPLIED/$name.old" 2>/dev/null || continue
+        if ! cmp -s "$APPLIED/$name.old" "$patch" &&
+           patch -p1 -d "$DEST" -R --dry-run -f <"$APPLIED/$name.old" >/dev/null 2>&1; then
+          old="$APPLIED/$name.old"
+          break
+        fi
+      done
+    fi
+    if [[ -n "$old" ]] && patch -p1 -d "$DEST" -R -f <"$old" >/dev/null; then
+      echo "    took out the older $name"
+    fi
+    rm -f "$APPLIED/$name.old"
+
+    if patch -p1 -d "$DEST" --dry-run -f <"$patch" >/dev/null 2>&1; then
       patch -p1 -d "$DEST" -f <"$patch" >/dev/null && echo "    applied $name"
+      cp "$patch" "$APPLIED/$name"
     else
       echo "    error: $name does not apply; upstream moved, patch by hand" >&2
       exit 1

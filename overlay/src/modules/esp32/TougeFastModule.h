@@ -156,15 +156,18 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     void offerToPhone(const touge::PhoneRecord &r);
     void flushPhoneBatch(uint32_t nowMs);
     // Hands one encoded batch toward the phone: pre-encoded for the next read
-    // when allowed, the ordinary phone queue otherwise. False if neither took it.
-    bool handPhoneBatch(const uint8_t *payload, size_t len, uint16_t seq);
-    // Once a tick: queue depth, a phone that went away, a pre-encoded batch read.
+    // when allowed, the ordinary phone queue otherwise. False if neither took it;
+    // otherwise [packetId] is the MeshPacket it went as and [preloaded] which way.
+    bool handPhoneBatch(const uint8_t *payload, size_t len, uint32_t &packetId, bool &preloaded);
+    // Once a tick: queue depth, a phone that went away, batches read or discarded.
     void trackPhoneLink(uint32_t nowMs);
     void notePhoneRead(uint16_t seq);
     void reportLinkStats(uint32_t nowMs, uint32_t windowMs);
     void queueJsonToPhone(const char *json, size_t len);
-    void notePhoneDelivered(const meshtastic_MeshPacket &p);
-    static void onPhoneDelivered(const meshtastic_MeshPacket &p);
+    // Not const: a batch is restamped on its way out (core-patches/0006).
+    void notePhoneDelivered(meshtastic_MeshPacket &p);
+    static void onPhoneDelivered(meshtastic_MeshPacket &p);
+    static bool stillInPhoneQueue(uint32_t packetId, void *ctx);
 
     touge::PhoneStore phoneStore_;
     touge::BatchesInFlight batchesInFlight_;
@@ -173,8 +176,7 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     touge::PhoneHello hello_;
     bool helloSeen_ = false;
     uint16_t batchSeq_ = 0;
-    // The batch sitting pre-encoded in NimBLE's read queue, -1 for none.
-    int32_t preloadedSeq_ = -1;
+    // NimBLE counters last seen, to notice the pre-encoded batch being read or lost.
     uint32_t preloadReadSeen_ = 0;
     uint32_t preloadLostSeen_ = 0;
 };
