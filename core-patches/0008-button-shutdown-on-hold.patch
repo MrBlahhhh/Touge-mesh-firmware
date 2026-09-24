@@ -1,0 +1,238 @@
+--- a/src/Power.cpp
++++ b/src/Power.cpp
+@@ -1087,6 +1087,9 @@
+                                         // banner on the sleep screen
+ #else
+         screen->showSimpleBanner("Shutting Down...", 0); // stays on screen
++        // Touge (core-patches/0008): the main loop, and with it the screen thread, never runs again from
++        // here, so draw the banner now, waking a dark screen. Screen::doDeepSleep() holds it for a second.
++        screen->drawNow();
+ #endif
+     }
+ #endif
+--- a/src/graphics/Screen.cpp
++++ b/src/graphics/Screen.cpp
+@@ -665,6 +665,10 @@
+  */
+ void Screen::doDeepSleep()
+ {
++    // Touge (core-patches/0008): leave what drawNow() put up (the shutdown banner) on screen for a second
++    // so it can be read. The radios and BLE are already down by the time sleep.cpp calls this.
++    while (drewNow && millis() - drewNowAtMs < 1000)
++        delay(10);
+ #ifdef USE_EINK
+     setOn(false, graphics::UIRenderer::drawDeepSleepFrame);
+ #else
+@@ -673,6 +677,22 @@
+ #endif
+ }
+ 
++void Screen::drawNow()
++{
++    if (!useDisplay)
++        return;
++    handleSetOn(true);
++    // ui->update() only draws once a frame interval has passed; at the fast rate that is a few tens of ms.
++    setFastFramerate();
++    const uint32_t startMs = millis();
++    while (ui->getUiState()->lastUpdate < startMs && millis() - startMs < 500) {
++        updateUiFrame(ui);
++        delay(10);
++    }
++    drewNow = true;
++    drewNowAtMs = millis();
++}
++
+ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
+ {
+     if (!useDisplay)
+--- a/src/graphics/Screen.h
++++ b/src/graphics/Screen.h
+@@ -73,6 +73,7 @@
+     void setup() {}
+     void setOn(bool) {}
+     void doDeepSleep() {}
++    void drawNow() {}
+     void forceDisplay(bool forceUiUpdate = false) {}
+     void startFirmwareUpdateScreen() {}
+     void increaseBrightness() {}
+@@ -327,6 +328,10 @@
+      */
+     void doDeepSleep();
+ 
++    /// Touge (core-patches/0008): turn the display on and draw the current frame and banner now, for a
++    /// caller that is blocking the main loop on its way to deep sleep. doDeepSleep() keeps it up a second.
++    void drawNow();
++
+     // Draw north
+     float estimatedHeading(double lat, double lon);
+ 
+@@ -839,6 +844,9 @@
+     bool useDisplay = false;
+     /// Whether the display is currently powered
+     bool screenOn = false;
++    /// Touge (core-patches/0008): when drawNow() last drew, for doDeepSleep() to hold it on screen
++    bool drewNow = false;
++    uint32_t drewNowAtMs = 0;
+     // Whether we are showing the regular screen (as opposed to booth screen or
+     // Bluetooth PIN screen)
+     bool showingNormalScreen = false;
+--- a/src/input/ButtonThread.cpp
++++ b/src/input/ButtonThread.cpp
+@@ -41,6 +41,7 @@
+     _releaseHandler = config.onRelease;
+     _suppressLeadUp = config.suppressLeadUpSound;
+     _longLongPress = config.longLongPress;
++    _shutdownOnHold = BUTTON_SHUTDOWN_ON_HOLD && _longLongPress == INPUT_BROKER_SHUTDOWN;
+ 
+     userButton = OneButton(config.pinNumber, config.activeLow, config.activePullup);
+ 
+@@ -135,12 +136,16 @@
+     // Check if we should play lead-up sound during long press
+     // Play lead-up when button has been held for BUTTON_LEADUP_MS but before long press triggers
+     bool buttonCurrentlyPressed = isButtonPressed(_pinNum);
++    if (!buttonCurrentlyPressed)
++        buttonSeenUpSinceBoot = true;
+ 
+     // Detect start of button press
+     if (buttonCurrentlyPressed && !buttonWasPressed) {
+         if (_pressHandler)
+             _pressHandler();
+         buttonPressStartTime = millis();
++        pressCanShutDown = buttonSeenUpSinceBoot && buttonPressStartTime >= BUTTON_SHUTDOWN_BOOT_HOLDOFF_MS;
++        shutdownSent = false;
+         leadUpPlayed = false;
+         leadUpSequenceActive = false;
+         resetLeadUpSequence();
+@@ -179,6 +184,21 @@
+ 
+     buttonWasPressed = buttonCurrentlyPressed;
+ 
++    // Touge (core-patches/0008): shut down at BUTTON_SHUTDOWN_HOLD_MS with the button still down. Nothing
++    // transmits from here; cpuDeepSleep() keeps the board out of deep sleep until the button is let go.
++    if (_shutdownOnHold && buttonCurrentlyPressed && pressCanShutDown && !shutdownSent &&
++        millis() - buttonPressStartTime >= BUTTON_SHUTDOWN_HOLD_MS) {
++        shutdownSent = true;
++        LOG_INFO("Button held %u ms, shut down", millis() - buttonPressStartTime);
++        InputEvent evt;
++        evt.source = _originName;
++        evt.inputEvent = _longLongPress;
++        evt.kbchar = 0;
++        evt.touchX = 0;
++        evt.touchY = 0;
++        this->notifyObservers(&evt);
++    }
++
+     // new behavior
+     if (btnEvent != BUTTON_EVENT_NONE) {
+         InputEvent evt;
+@@ -281,9 +301,11 @@
+         case BUTTON_EVENT_LONG_RELEASED: {
+ 
+             LOG_INFO("LONG PRESS RELEASE AFTER %u MILLIS", millis() - buttonPressStartTime);
+-            // Require press started after boot holdoff to avoid phantom shutdown from floating pins
+-            if (millis() > 30000 && buttonPressStartTime > 30000 && _longLongPress != INPUT_BROKER_NONE &&
+-                (millis() - buttonPressStartTime) >= _longLongPressTime && leadUpPlayed) {
++            // Require press started after boot holdoff to avoid phantom shutdown from floating pins.
++            // Touge (core-patches/0008): a shutdown-on-hold button already fired while held.
++            if (!_shutdownOnHold && millis() > 30000 && buttonPressStartTime > 30000 &&
++                _longLongPress != INPUT_BROKER_NONE && (millis() - buttonPressStartTime) >= _longLongPressTime &&
++                leadUpPlayed) {
+                 evt.inputEvent = _longLongPress;
+                 this->notifyObservers(&evt);
+             }
+--- a/src/input/ButtonThread.h
++++ b/src/input/ButtonThread.h
+@@ -46,6 +46,29 @@
+ #define BUTTON_LEADUP_MS 2200 // Play lead-up sound after 2.5 seconds of holding
+ #endif
+ 
++// Touge (core-patches/0008): a longLongPress of INPUT_BROKER_SHUTDOWN fires once the button has been
++// held this long, without waiting for release. ESP32 only, because cpuDeepSleep() there waits for the
++// release itself; elsewhere a held button would wake the board straight back up.
++#ifndef BUTTON_SHUTDOWN_ON_HOLD
++#ifdef ARCH_ESP32
++#define BUTTON_SHUTDOWN_ON_HOLD 1
++#else
++#define BUTTON_SHUTDOWN_ON_HOLD 0
++#endif
++#endif
++
++#ifndef BUTTON_SHUTDOWN_HOLD_MS
++#define BUTTON_SHUTDOWN_HOLD_MS 3000
++#endif
++
++// A shutdown-on-hold press counts only if it starts this long after boot and after the button has been
++// seen up once. Seen-up covers a button pressed to wake the board and still held while it boots, and a
++// pin stuck or floating low. The 5 s floor covers glitches while the rails and peripherals come up.
++// Upstream's 30 s ignored anyone switching a radio on and straight back off.
++#ifndef BUTTON_SHUTDOWN_BOOT_HOLDOFF_MS
++#define BUTTON_SHUTDOWN_BOOT_HOLDOFF_MS 5000
++#endif
++
+ class ButtonThread : public Observable<const InputEvent *>, public concurrency::OSThread
+ {
+   public:
+@@ -109,6 +132,12 @@
+     uint32_t buttonPressStartTime = 0;
+     bool buttonWasPressed = false;
+ 
++    // Touge (core-patches/0008): shutdown on hold, see BUTTON_SHUTDOWN_ON_HOLD.
++    bool _shutdownOnHold = false;
++    bool buttonSeenUpSinceBoot = false;
++    bool pressCanShutDown = false;
++    bool shutdownSent = false;
++
+ #ifdef ARCH_ESP32
+     // Get notified when lightsleep begins and ends
+     CallbackObserver<ButtonThread, void *> lsObserver =
+--- a/src/platform/esp32/main-esp32.cpp
++++ b/src/platform/esp32/main-esp32.cpp
+@@ -343,6 +343,38 @@
+ }
+ #endif
+ 
++#if SOC_PM_SUPPORT_EXT1_WAKEUP && (defined(BUTTON_PIN) || defined(DEEP_SLEEP_WAKE_PIN))
++/**
++ * Touge (core-patches/0008): block until the wake button has been let go.
++ *
++ * ext1 wakes on a level, not an edge, so deep sleep entered with the button still down ends at once
++ * and the board boots straight back up. A button shutdown now fires while the button is held, so the
++ * radio, BLE, screen and LEDs are already off by the time this runs; only the sleep itself waits.
++ */
++static void waitForWakeButtonRelease(int pin)
++{
++#ifdef ESP32S3_WAKE_TYPE
++    const int pressedLevel = (ESP32S3_WAKE_TYPE == ESP_EXT1_WAKEUP_ANY_HIGH) ? HIGH : LOW;
++#else
++    const int pressedLevel = LOW;
++#endif
++    if (pin < 0 || digitalRead(pin) != pressedLevel)
++        return;
++
++    LOG_INFO("Wake button held; deep sleep waits for release");
++    const int releasedReadsNeeded = 5; // 50 ms of steady release rides out contact bounce
++    // A stuck button or a pin that reads low must not leave a dark board awake on battery for good.
++    const uint32_t giveUpMs = 60000;
++    const uint32_t waitStartMs = millis();
++    int releasedReads = 0;
++    while (releasedReads < releasedReadsNeeded && millis() - waitStartMs < giveUpMs) {
++        esp_task_wdt_reset(); // the 90 s app watchdog would otherwise reboot someone still holding
++        delay(10);
++        releasedReads = (digitalRead(pin) == pressedLevel) ? 0 : releasedReads + 1;
++    }
++}
++#endif
++
+ void cpuDeepSleep(uint32_t msecToWake)
+ {
+     /*
+@@ -416,6 +448,8 @@
+     gpioMask = filterExt1WakeMask(gpioMask);
+     if (!gpioMask)
+         LOG_ERROR("No RTC-capable wake pin: deep sleep will not wake on a button");
++    else
++        waitForWakeButtonRelease(wakeButton);
+ 
+     esp_err_t wakeRes = ESP_OK;
+     if (gpioMask) {

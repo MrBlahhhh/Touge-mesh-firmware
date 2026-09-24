@@ -171,7 +171,8 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // 31: batch record ages clamp at zero instead of wrapping to 65.5 s.
 // 32: extra beacons in free slots of a car's own row, up to 4 Hz with few cars
 //     (frame flag 0x10, not forwarded); the phone sends each new fix at once.
-const uint32_t TOUGE_BUILD = 32;
+// 33: core-patches/0008, a 3 s button hold shuts down with the button still held.
+const uint32_t TOUGE_BUILD = 33;
 
 // How long a board hunts before giving up and waiting at home.
 //

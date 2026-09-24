@@ -95,7 +95,8 @@ rm -f "$MODULES.bak"
 # disconnect could lose (both NimbleBluetooth.cpp), and from build 30 the phone
 # queue's newest-wins positions (MeshService.cpp), the delivered hook
 # (PhoneAPI.cpp) and the pre-encoded batch path (NimbleBluetooth.cpp), which
-# TougeFastModule links against. Without these
+# TougeFastModule links against. From build 33, 0008 makes a 3 s button hold
+# shut the board down without waiting for release. Without these
 # the fast lane builds but does not carry. Idempotent: a patch that already
 # reverse-applies is in, and is skipped.
 if ls "$HERE"/core-patches/*.patch >/dev/null 2>&1; then
