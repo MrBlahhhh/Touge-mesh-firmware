@@ -1,0 +1,21 @@
+--- a/src/gps/GPS.cpp
++++ b/src/gps/GPS.cpp
+@@ -834,6 +834,18 @@
+                     detectedBaud = rareSerialSpeeds[speedSelect];
+                 } else if (currentStep == 0 && ++speedSelect == array_count(rareSerialSpeeds)) {
+                     LOG_WARN("Give up GPS probe, set to %d", GPS_BAUDRATE);
++                    // Touge: a board that has never answered a probe has no
++                    // receiver (a Heltec V4 without the GNSS kit). Mark it
++                    // NOT_PRESENT so later boots skip this probe, which blocks
++                    // the main loop for about a minute and starves BLE reads.
++                    // Only when no probe cache exists: a board that has seen
++                    // a module before keeps its GPS after one bad probe.
++                    if (!hasProbeCache &&
++                        config.position.gps_mode != meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT) {
++                        LOG_WARN("No GNSS module ever found; setting gps_mode NOT_PRESENT");
++                        config.position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT;
++                        nodeDB->saveToDisk(SEGMENT_CONFIG);
++                    }
+                     return true;
+                 }
+             }

@@ -152,7 +152,8 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // it whenever the on-air behaviour changes.
 // 26: core-patches/0003, the BLE advertising restart a disconnect could lose.
 // 27: the receiver's own fix to the phone ("gf"), and GNSS speed read as km/h.
-const uint32_t TOUGE_BUILD = 27;
+// 28: core-patches/0004, a board that never found a GNSS stops probing for one.
+const uint32_t TOUGE_BUILD = 28;
 
 // How long a board hunts before giving up and waiting at home.
 //
