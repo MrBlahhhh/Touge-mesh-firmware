@@ -385,6 +385,29 @@ void test_a_fix_nobody_feeds_goes_stale() {
   TEST_ASSERT_TRUE(wrapped.fresh(0x00000F00u));
 }
 
+// 5d and 5e run on UTC from our own fix: the send grid every car shares, and
+// how old another car's fix is when it arrives.
+void test_utc_runs_on_from_the_fix_as_it_came_in() {
+  OwnFix own;
+  uint64_t utc = 0;
+  TEST_ASSERT_FALSE(own.utcMs(10000, utc));
+  own.fromPhone(reading(355000000, 1790000000, 250), 10000, 1);
+  TEST_ASSERT_TRUE(own.utcMs(12000, utc));
+  TEST_ASSERT_EQUAL_UINT64(1790000000250ull + 2000, utc);
+  // A repeat of the same fix does not move it: the fix is no newer.
+  own.fromPhone(reading(355000000, 1790000000, 250), 13000, 1);
+  TEST_ASSERT_TRUE(own.utcMs(13000, utc));
+  TEST_ASSERT_EQUAL_UINT64(1790000000250ull + 3000, utc);
+  // A new one does.
+  own.fromPhone(reading(355000100, 1790000004, 0), 14000, 1);
+  TEST_ASSERT_TRUE(own.utcMs(14500, utc));
+  TEST_ASSERT_EQUAL_UINT64(1790000004000ull + 500, utc);
+  // A fix with no time says nothing about the clock.
+  OwnFix untimed;
+  untimed.fromPhone(reading(355000000, 0), 10000, 1);
+  TEST_ASSERT_FALSE(untimed.utcMs(10000, utc));
+}
+
 static Fix gnssReading(int32_t lat, uint32_t fixSec) {
   Fix f = reading(lat, fixSec);
   f.external = false;
@@ -1410,6 +1433,7 @@ int main(int, char**) {
   RUN_TEST(test_a_write_with_no_coordinates_changes_nothing);
   RUN_TEST(test_a_session_is_never_zero);
   RUN_TEST(test_a_fix_nobody_feeds_goes_stale);
+  RUN_TEST(test_utc_runs_on_from_the_fix_as_it_came_in);
   RUN_TEST(test_the_phone_fix_beats_the_boards_receiver_while_it_keeps_writing);
   RUN_TEST(test_a_receiver_that_stops_producing_fixes_goes_stale);
   RUN_TEST(test_the_fix_time_comes_from_the_solution_then_the_write);

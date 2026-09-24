@@ -101,7 +101,8 @@ rm -f "$MODULES.bak"
 # for the internal RAM BLE needs beside Wi-Fi. From build 39, 0010 keeps one position
 # per car in the LoRa TX queue (MeshPacketQueue.cpp, with a hook the module sets),
 # 0011 has PositionModule stand down while the module sends the LoRa position, and
-# 0005 ranks queued positions by fix identity. Without these
+# 0005 ranks queued positions by fix identity. From build 41, 0012 lets the module
+# have a relay go in the ROUTER's early window (RadioInterface.cpp). Without these
 # the fast lane builds but does not carry. Idempotent: a patch that already
 # reverse-applies is in, and is skipped.
 if ls "$HERE"/core-patches/*.patch >/dev/null 2>&1; then

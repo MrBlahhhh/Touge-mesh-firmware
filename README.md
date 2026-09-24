@@ -137,6 +137,13 @@ body    0..7   lat, lon as int32 at 1e7
         67..   name, sent every 30 s rather than every ping
 ```
 
+A reach summary (SCALE-PLAN 5e) goes over LoRa on the private port, first
+byte 0xC3, then version, entry count and a flag saying the list goes on in the
+next one; 10 bytes an origin: node, fix sequence (low 16 bits), fix age on
+arrival in 250 ms steps, seconds since heard, hops, and the relay byte of the
+copy that got there first. See
+`touge/reach.h` and "Who reaches whom" below.
+
 The fix identity (SCALE-PLAN step 5a) names each of a car's fixes once, on
 the radio whose car it is: a session drawn at random per boot, a sequence that
 counts up with every new fix, and when the fix was measured. Relays forward the
@@ -154,10 +161,18 @@ the phone only writes its fix to its own radio, which never goes on air.
   board's own GNSS fills in once the phone has not written for 3 s. Both lanes
   stop 15 s after the last write or new GNSS fix, counted on the radio's clock
   (`touge/ownfix.h`).
-- **How often.** Every 5 s, longer when the group is more than the modem preset
-  carries: cars x cars x the packet's airtime held under 30 % of the channel,
-  capped at 20 s (`loraIntervalMs` in `touge/lorapos.h`). The lane report
-  carries it as `li`.
+- **How often.** Every 5 s while the channel is under a quarter busy, the
+  share of the last minute Meshtastic measures as busy with everything heard
+  and sent (its "polite" limit). Above that, the interval at which the same
+  traffic would sit at 25 %, re-judged every 30 s, at most doubling a step,
+  whole seconds, capped at 20 s (`LoraLoad` in `touge/loraload.h`, from build
+  41; before it, a cars x cars estimate). Busier than 25 % even at 20 s is
+  reported as overloaded, not run over quietly.
+- **On a grid.** Each car's sends fall on the interval's multiples of UTC, which
+  every car has from its own fix, shifted by its rank among the nodes heard
+  (interval / cars apart) plus jitter under half that share. Cars that fell
+  into step by chance used to stay in step. Meshtastic's contention delay and
+  channel sensing still run on top.
 - **When.** Only while a Touge app has said hello since boot and the primary
   channel has a real key. A stock app on a Touge radio, or a radio handed back
   to a default channel, keeps Meshtastic's own position broadcasts. While the
@@ -174,6 +189,73 @@ as it goes to the router, keyed by origin and packet id. A newer one takes the
 older one's place and turn, so the queue goes round the cars; a late older copy
 is refused. Text, control and positions without an identity keep the stock
 rules. The phone queue (0005) ranks queued positions by the same identity.
+
+Relayed positions queue at Meshtastic's DEFAULT priority and ours at
+BACKGROUND, so under a backlog ours could wait behind relays indefinitely. When
+our last one is still queued as the next falls due, the next goes at RELIABLE,
+ahead of them, once, and the miss is counted (`os`). Priority never goes on the
+air.
+
+## What the radio measures on LoRa
+
+Every packet leaving the TX queue passes Meshtastic's `RadioTxHook` (upstream,
+no patch); one whose transmission completed has moved Meshtastic's `txGood`
+count first. From that the module counts, by kind, what went on the air and
+for how long, and for positions how long they waited in the queue (noted as
+they enter it). Every five seconds three reports go to serial as
+`touge: lora ll ...` and to the phone as JSON with the same keys
+(`touge/kvline.h`). The app logs them as `BASELINE lora ...` and shows them in
+Group & radio › Advanced › Link diagnostics. They go out whether or not the
+2.4 GHz lane runs.
+
+| report | key | what |
+|---|---|---|
+| `ll`, this window | `li` | interval the load allows, ms; 0 while not sending |
+| | `la` | mean of the last four gaps between our positions on the air |
+| | `lx` | longest such gap ending in the window |
+| | `cu`, `tu` | channel busy over the last minute; our own TX over the last hour; permille |
+| | `ov` | 1: over 25 % busy at 20 s. 2: our position missed its turn |
+| | `ow`, `rw` | longest TX-queue wait of our position, of a relayed one, ms |
+| | `qm` | TX queue high-water mark |
+| | `oh`, `pf` | cars heard on LoRa in 4 min; cars we relay early for |
+| `lt`, since boot | `ot`, `oa` | our positions sent, their airtime ms |
+| | `rt`, `ra`, `re` | relays sent, airtime, how many went early |
+| | `sa`, `xa` | airtime of our reach summaries; of our other traffic |
+| | `dr`, `cn` | Meshtastic's TX-queue drops; relays cancelled on hearing another copy |
+| | `rp`, `rf`, `os` | 5c replaced, refused; our position late |
+| `le`, since boot | `st`, `sh` | reach summaries sent, heard |
+| | `pg`, `pw` | early-relay grants, withdrawals |
+
+## Who reaches whom, and relays chosen on it
+
+Hearing a neighbour relay a packet proves only that it went one hop further.
+So each car keeps, per origin, the newest position it heard over LoRa: the fix
+sequence, how old the fix was on arrival (UTC from its own fix, good to the
+phone's delivery delay, under a second), the hops it had come and whose copy
+arrived first (Meshtastic's one-byte `relay_node`). With every twelfth of its
+own positions, staggered by rank, it broadcasts that list (`touge/reach.h`).
+Meshtastic relays it like any broadcast and hands it to every phone, which logs
+each one (`lora reach from a1b2: ...`) and lists them in Link diagnostics; the
+radio logs every summary it sends and hears the same way.
+
+A summary is a private-port packet, not Position fields: a relay re-encodes a
+packet from the fields it knows, so there is no spare room in a position that
+survives relaying, and a stock app shows the fields there are. A full one is
+16 origins, about 153 ms on SHORT_FAST against a position's 58; with every
+twelfth position that is 16-22 % on top of a car's own LoRa airtime.
+
+A car whose relayed copy of an origin's position a summary names as the one
+that reached the reporter first, a hop or more out, fresh (fix under 10 s old
+on arrival, reporter heard it within three intervals), while this car still
+hears that origin itself, relays that origin's positions early: in the window Meshtastic gives a ROUTER
+(core-patches/0012, a hook in `shouldRebroadcastEarlyLikeRouter`), 0-15 slots
+against the ordinary 16 and up. The others keep their ordinary delay and drop
+their copy on hearing the early one, which is managed flooding as it was; if it
+never comes, they relay. A grant lasts two and a half summary periods, renewed
+by each summary that says the same; a summary showing worse delivery through
+this car ends it at once (`touge/relaypref.h`). A 2.4 GHz link is never an
+input, so a good fast lane cannot turn a LoRa relay off, and nothing turns one
+off: preference only changes who usually goes first.
 
 The payload is AES-256-CTR under a key derived from the channel PSK. The packet
 id is half the nonce, which is why it is 32 bits and why the counter is kept in

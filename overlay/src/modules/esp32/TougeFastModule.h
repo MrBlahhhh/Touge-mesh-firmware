@@ -30,6 +30,7 @@
 #if defined(ARCH_ESP32) && !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST)
 
 #include "MeshPacketQueue.h"
+#include "RadioTxHook.h"
 #include "SinglePortModule.h"
 #include "concurrency/OSThread.h"
 #include "touge/espnow.h"
@@ -40,7 +41,10 @@
 #include "touge/phonebatch.h"
 #include "touge/ride.h"
 #include "touge/hop.h"
+#include "touge/loraload.h"
 #include "touge/lorapos.h"
+#include "touge/reach.h"
+#include "touge/relaypref.h"
 #include "touge/rideclock.h"
 #include "touge/schedule.h"
 
@@ -91,31 +95,63 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
 
     // ---- Our LoRa position, and the TX queue's one per car (SCALE-PLAN 5b, 5c)
     //
-    // This radio sends its car's LoRa position from ownFix_, every
-    // loraIntervalMs_, while loraOwned(); PositionModule's own broadcasts stand
-    // down meanwhile (core-patches/0011). See touge/lorapos.h.
+    // This radio sends its car's LoRa position from ownFix_, at the interval
+    // the measured load allows (loraLoad_), while loraOwned(); PositionModule's
+    // own broadcasts stand down meanwhile (core-patches/0011). See
+    // touge/lorapos.h and touge/loraload.h.
     void sendLoraPosition(uint32_t nowMs);
     // A Touge app has said hello since boot, the primary channel is a ride, and
     // there is a fix, fresh or not.
     bool loraOwned() const;
-    // This car and every node heard on either radio within RIDER_DROP_MS.
-    uint32_t carsOnRide() const;
+    // This car and every node heard on either radio within RIDER_DROP_MS, and
+    // how many of them have a lower node number: our share of the send grid.
+    void loraRoster(uint32_t &cars, uint32_t &rank) const;
     // A position from another car that we may relay, noted for the TX queue.
-    void noteRelayedPosition(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos);
-    // The hooks in core-patches/0010 and 0011.
+    void noteRelayedPosition(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos, uint32_t nowMs);
+    // The hooks in core-patches/0010, 0011 and 0012.
     static bool ownsPositionBroadcast();
     static TougeTxPlace placeTxPacket(const std::vector<meshtastic_MeshPacket *> &queue, const meshtastic_MeshPacket *p,
                                       size_t &at);
     static bool inTxQueue(uint32_t from, uint32_t id, void *ctx);
+    static bool relayEarly(const meshtastic_MeshPacket *p);
     touge::TxPositions txPositions_;
     uint32_t lastLoraMs_ = 0;
-    // The gap after our last LoRa position, 0 before the first; reported as "li".
-    uint32_t loraIntervalMs_ = 0;
-    // What the TX queue did with positions: took an older one's place, or
-    // turned away one its car already had newer queued.
-    uint32_t txReplaced_ = 0;
-    uint32_t txRefused_ = 0;
+    uint32_t nextLoraMs_ = 0;
+    // Our last LoRa position's packet id, to see whether it is still queued
+    // when the next is due.
+    uint32_t lastOwnPositionId_ = 0;
     bool rideAppSeen_ = false;
+
+    // ---- The LoRa lane measured, and relays chosen on evidence (SCALE-PLAN 5d-5f)
+    //
+    // What went on the air and how long it waited, from every packet leaving the
+    // TX queue (Meshtastic's RadioTxHook); the reach summaries this car sends
+    // and hears; which origins it relays early. Reported as "ll", "lt" and "le".
+    class LoraTxWatch : public RadioTxHook
+    {
+      public:
+        void packetReleased(RadioInterface *iface, const meshtastic_MeshPacket *p) override;
+    };
+    void noteLoraReleased(RadioInterface *iface, const meshtastic_MeshPacket *p);
+    // Meshtastic's busy share of the channel over the last minute, permille.
+    static uint32_t loraBusyPermille();
+    void noteLoraReach(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos, uint32_t nowMs);
+    void noteReachSummary(const meshtastic_MeshPacket &mp);
+    void sendReachSummary(uint32_t nowMs);
+    // A summary to serial, a few entries a line: [what] "sent" or "from".
+    void logReach(const char *what, uint32_t reporter, const uint8_t *payload, size_t len);
+    // The three LoRa reports to serial, and to the phone when one is connected.
+    void reportLora(uint32_t nowMs);
+    touge::LoraLoad loraLoad_;
+    touge::Reach reach_;
+    touge::RelayPrefs relayPrefs_;
+    LoraTxWatch loraTxWatch_;
+    // Meshtastic's count of completed transmissions, last seen: it moves before
+    // a sent packet is released and not for a cancelled or dropped one.
+    uint32_t txGoodSeen_ = 0;
+    uint32_t lorasSent_ = 0;
+    uint32_t lastReachId_ = 0;
+    uint32_t reachQueuedMs_ = 0;
 
     // The receiver's own fix to the phone, about 1 Hz, so a tablet with no GPS
     // can navigate on it. See touge/gnssfix.h.

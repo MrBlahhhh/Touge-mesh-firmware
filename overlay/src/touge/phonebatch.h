@@ -13,7 +13,8 @@
 //   'T'  0x54  voice frame (VoicePacket.MAGIC, planned)
 //   0xC1       position batch, radio to phone (this file)
 //   0xC2       phone hello, phone to its own radio (this file)
-// 0xC1 and 0xC2 can never start UTF-8 text, so no JSON document collides.
+//   0xC3       reach summary, radio to radio over LoRa (reach.h)
+// None of the three can start UTF-8 text, so no JSON document collides.
 //
 // Platform-free like mesh.h: time comes in as an argument.
 

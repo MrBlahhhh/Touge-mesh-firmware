@@ -1,5 +1,6 @@
-// Host tests for LoRa positions (SCALE-PLAN 5b and 5c): this car's interval,
-// and one position per car in the queues.
+// Host tests for LoRa positions (SCALE-PLAN 5b and 5c): the identity they
+// carry, and one position per car in the queues. The interval they go out at is
+// measured load now (5d, test_loraload).
 //
 // The TX queue here is a plain FIFO driven by the same rules the core patch
 // applies (core-patches/0010): place() first, then the stock capacity check.
@@ -13,34 +14,6 @@ using namespace touge;
 
 void setUp() {}
 void tearDown() {}
-
-// ---- The interval (5b) --------------------------------------------------------
-//
-// The app's PingPacingTest pins the same numbers for Convoy.loraIntervalMs.
-
-void test_the_interval_is_5_s_until_the_air_says_otherwise() {
-  // SHORT_FAST, about 58 ms a position.
-  TEST_ASSERT_EQUAL_UINT32(5000, loraIntervalMs(1, 58));
-  TEST_ASSERT_EQUAL_UINT32(5000, loraIntervalMs(3, 58));
-  // 8 x 8 x 58 ms is 3.7 s of positions a round, 30 % of 12.4 s.
-  TEST_ASSERT_EQUAL_UINT32(12373, loraIntervalMs(8, 58));
-  TEST_ASSERT_EQUAL_UINT32(LORA_MAX_MS, loraIntervalMs(30, 58));
-  // LONG_FAST: three cars already want more than the cap.
-  TEST_ASSERT_EQUAL_UINT32(LORA_MAX_MS, loraIntervalMs(3, 760));
-  // Nobody heard yet, or no radio to ask for an airtime: the target.
-  TEST_ASSERT_EQUAL_UINT32(5000, loraIntervalMs(0, 58));
-  TEST_ASSERT_EQUAL_UINT32(5000, loraIntervalMs(25, 0));
-}
-
-void test_the_interval_never_shrinks_as_cars_join() {
-  uint32_t last = 0;
-  for (uint32_t cars = 1; cars <= 40; cars++) {
-    const uint32_t ms = loraIntervalMs(cars, 58);
-    TEST_ASSERT_TRUE(ms >= last);
-    TEST_ASSERT_TRUE(ms >= LORA_TARGET_MS && ms <= LORA_MAX_MS);
-    last = ms;
-  }
-}
 
 // ---- Fix identity out of Meshtastic's Position ---------------------------------
 
@@ -86,6 +59,7 @@ struct SimQueue {
   uint32_t replaced = 0;
   uint32_t refused = 0;
   uint32_t full = 0;
+  uint32_t nowMs = 0;
 
   SimQueue() { tags.clear(); }
 
@@ -100,7 +74,7 @@ struct SimQueue {
   // A packet on its way to the queue; a position is noted first, as the module
   // does before the router queues it.
   TxPlace offer(uint32_t from, uint32_t id, uint8_t hops, const FixId* fix) {
-    if (fix != nullptr) tags.note(from, id, *fix, &SimQueue::inQueue, this);
+    if (fix != nullptr) tags.note(from, id, *fix, nowMs, &SimQueue::inQueue, this);
     QueuedPacket in;
     in.from = from;
     in.id = id;
@@ -232,13 +206,29 @@ static bool alwaysQueued(uint32_t, uint32_t, void*) { return true; }
 void test_a_note_with_every_place_queued_is_dropped() {
   TxPositions tags;
   tags.clear();
-  for (uint32_t i = 1; i <= TxPositions::SLOTS; i++) tags.note(i, i, fixId(1, i, 1790000000), &alwaysQueued, nullptr);
+  for (uint32_t i = 1; i <= TxPositions::SLOTS; i++) tags.note(i, i, fixId(1, i, 1790000000), 0, &alwaysQueued, nullptr);
   for (uint32_t i = 1; i <= TxPositions::SLOTS; i++) TEST_ASSERT_NOT_NULL(tags.find(i, i));
-  tags.note(99, 99, fixId(1, 99, 1790000000), &alwaysQueued, nullptr);
+  tags.note(99, 99, fixId(1, 99, 1790000000), 0, &alwaysQueued, nullptr);
   TEST_ASSERT_NULL(tags.find(99, 99));
   // Noting a packet already held updates it in place.
-  tags.note(3, 3, fixId(1, 300, 1790000300), &alwaysQueued, nullptr);
+  tags.note(3, 3, fixId(1, 300, 1790000300), 0, &alwaysQueued, nullptr);
   TEST_ASSERT_EQUAL_UINT32(300, tags.find(3, 3)->seq);
+}
+
+// 5d reads a position's TX queue wait off its note as it leaves the queue.
+void test_a_noted_position_knows_how_long_it_has_waited() {
+  TxPositions tags;
+  tags.clear();
+  tags.note(CAR_B, 20, fixId(2, 1, 1790000000), 1000, &alwaysQueued, nullptr);
+  uint32_t waited = 0;
+  TEST_ASSERT_TRUE(tags.waited(CAR_B, 20, 1750, waited));
+  TEST_ASSERT_EQUAL_UINT32(750, waited);
+  // Across millis() wrapping.
+  tags.note(CAR_C, 30, fixId(3, 1, 1790000000), 0xFFFFFF00u, &alwaysQueued, nullptr);
+  TEST_ASSERT_TRUE(tags.waited(CAR_C, 30, 0x100, waited));
+  TEST_ASSERT_EQUAL_UINT32(0x200, waited);
+  // A packet never noted (text, a stock position) has no wait to give.
+  TEST_ASSERT_FALSE(tags.waited(CAR_B, 21, 1750, waited));
 }
 
 // A busy car next to us sends every second, five more every 5 s, and a car at
@@ -308,8 +298,6 @@ void test_under_a_backlog_the_rear_car_keeps_its_turn() {
 
 int main(int, char**) {
   UNITY_BEGIN();
-  RUN_TEST(test_the_interval_is_5_s_until_the_air_says_otherwise);
-  RUN_TEST(test_the_interval_never_shrinks_as_cars_join);
   RUN_TEST(test_the_identity_is_read_from_meshtastics_fields);
   RUN_TEST(test_without_an_identity_the_later_arrival_wins);
   RUN_TEST(test_a_newer_position_takes_the_older_ones_place_and_turn);
@@ -320,6 +308,7 @@ int main(int, char**) {
   RUN_TEST(test_the_same_packet_again_is_not_its_own_rival);
   RUN_TEST(test_tags_reuse_places_no_longer_queued);
   RUN_TEST(test_a_note_with_every_place_queued_is_dropped);
+  RUN_TEST(test_a_noted_position_knows_how_long_it_has_waited);
   RUN_TEST(test_under_a_backlog_the_rear_car_keeps_its_turn);
   return UNITY_END();
 }

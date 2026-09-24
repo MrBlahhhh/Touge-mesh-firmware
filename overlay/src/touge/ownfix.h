@@ -63,16 +63,23 @@ class OwnFix {
   uint32_t fedAgeMs(uint32_t nowMs) const { return has_ ? nowMs - fedMs_ : 0; }
   const Fix& fix() const { return fix_; }
   FixId id() const;
+  // UTC now, in ms: the held fix's measured time run on by the radio's clock
+  // since that fix came in. Every car keeps one from its own fixes, so they
+  // agree to within their fixes' delivery delay (a phone's, under a second).
+  // False with no fix or one with no time.
+  bool utcMs(uint32_t nowMs, uint64_t& out) const;
 
  private:
   // Takes [reading] as the current fix: the next sequence number if it differs
   // from the one held. False for a reading with no coordinates.
-  bool take(const Fix& reading, uint32_t entropy);
+  bool take(const Fix& reading, uint32_t nowMs, uint32_t entropy);
 
   Fix fix_;
   uint32_t seq_ = 0;
   uint32_t fedMs_ = 0;
   uint32_t phoneFedMs_ = 0;
+  // When the held fix came in (a repeat of it does not move this).
+  uint32_t takenMs_ = 0;
   uint16_t session_ = 0;
   bool has_ = false;
   bool phoneFed_ = false;
