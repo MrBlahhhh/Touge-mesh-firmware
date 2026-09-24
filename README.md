@@ -143,11 +143,12 @@ body    0..7   lat, lon as int32 at 1e7
 ```
 
 A reach summary (SCALE-PLAN 5e) goes over LoRa on the private port, first
-byte 0xC3, then version, entry count and a flag saying the list goes on in the
-next one; 10 bytes an origin: node, fix sequence (low 16 bits), fix age on
-arrival in 250 ms steps, seconds since heard, hops, and the relay byte of the
-copy that got there first. See
-`touge/reach.h` and "Who reaches whom" below.
+byte 0xC3, then version, entry count and flags: the list goes on in the next
+one (0x01), an early summary (0x02), entries carry the steady flag (0x04, from
+build 43). 10 bytes an origin: node, fix sequence (low 16 bits), fix age on
+arrival in 250 ms steps, seconds since heard, hops in the low nibble with 0x10
+for "heard steadily direct", and the relay byte of the copy that got there
+first. See `touge/reach.h` and "Who reaches whom" below.
 
 The fix identity (SCALE-PLAN step 5a) names each of a car's fixes once, on
 the radio whose car it is: a session drawn at random per boot, a sequence that
@@ -184,9 +185,9 @@ the phone only writes its fix to its own radio, which never goes on air.
   radio sends, PositionModule's periodic and smart broadcasts stand down
   (core-patches/0011); replies to a position request still go.
 - **What.** A standard Meshtastic Position on the first channel sharing
-  positions, BACKGROUND priority like PositionModule's: coordinates, speed,
-  track, source, `time`, and the fix identity above. Stock nodes and apps read
-  it as an ordinary position.
+  positions: coordinates, speed, track, source, `time`, and the fix identity
+  above, unsigned from build 43 (below). Stock nodes and apps read it as an
+  ordinary position.
 
 The LoRa TX queue keeps one position per car (5c, core-patches/0010). It holds
 packets already encrypted, so the module notes each position with an identity
@@ -195,11 +196,44 @@ older one's place and turn, so the queue goes round the cars; a late older copy
 is refused. Text, control and positions without an identity keep the stock
 rules. The phone queue (0005) ranks queued positions by the same identity.
 
-Relayed positions queue at Meshtastic's DEFAULT priority and ours at
-BACKGROUND, so under a backlog ours could wait behind relays indefinitely. When
-our last one is still queued as the next falls due, the next goes at RELIABLE,
-ahead of them, once, and the miss is counted (`os`). Priority never goes on the
-air.
+Our position goes ahead of relays. Relays queue at Meshtastic's DEFAULT
+priority, and up to build 42 ours went at BACKGROUND, as PositionModule's,
+behind every one of them; on the build 41 bench it waited a median 0.6 s, p90
+4.5 s and up to 6.2 s from queued to on the air. From build 43 it goes at
+RELIABLE, ahead of relays and behind texts, admin and acks. That alone would
+still leave it waiting out whatever was left of the transmit timer a relay had
+started, Meshtastic's SNR-weighted delay (up to 2.2 s on SHORT_FAST at a strong
+signal), which a new head of the queue does not otherwise cut short. So when
+our position arrives at the head, core-patches/0014 pulls that timer in to our
+own contention delay (0-56 ms), and nothing else changes. One position an
+interval, so relays still go between ours. Priority never goes on the air. If
+our last position is still queued when the next falls due it is counted (`os`),
+which should now stay at 0.
+
+### Unsigned positions
+
+Meshtastic 2.8 signs every broadcast with a 64-byte XEdDSA signature, 66 bytes
+on the air. A position is 64-67 bytes unsigned and 130-133 signed: 63-66 ms on
+SHORT_FAST against 112-114 (111 ms measured on the bench). From build 43 a
+Touge radio sends its own position unsigned, on a channel with a real key, while
+the module sends positions (core-patches/0015, `sendsUnsigned` in
+`touge/lorapos.h`). Everything else stays signed: texts, NodeInfo, reach
+summaries, admin, routing. A radio in stock mode (no Touge hello) signs as
+stock, and so does a licensed one.
+
+On the way in, Meshtastic's Balanced policy drops an unsigned broadcast from a
+node it has seen sign, which a Touge car's signed NodeInfo makes every Touge
+car. A Touge radio lets an unsigned position through that one check when it
+came on a channel with a real key, and nothing else: every path the check sits
+on (the routing gate before relaying, the decode for the phone and modules, the
+upgraded-copy and MQTT paths, and the cached verdict between them) goes through
+`checkXeddsaReceivePolicy`, where the exception is. Strict still drops unsigned
+packets, a malformed or failing signature still drops, and a position on a
+public channel keeps Balanced's rule. The radio is never switched to
+Compatible. Both ends need build 43: an older Touge radio, or a stock one on
+Balanced, drops a build 43 car's positions once it has seen that car sign, and
+does not relay them either. A stock rider's radio needs its packet signature
+policy set to Compatible to see Touge cars.
 
 ## What the radio measures on LoRa
 
@@ -228,8 +262,11 @@ Group & radio › Advanced › Link diagnostics. They go out whether or not the
 | | `sa`, `xa` | airtime of our reach summaries; of our other traffic |
 | | `dr`, `cn` | Meshtastic's TX-queue drops; relays cancelled on hearing another copy |
 | | `rp`, `rf`, `os` | 5c replaced, refused; our position late |
-| `le`, since boot | `st`, `sh` | reach summaries sent, heard |
+| `le`, since boot | `st`, `sh` | reach summaries sent (early ones too), heard |
 | | `pg`, `pw` | early-relay grants, withdrawals |
+| | `se` | of our summaries, those sent early (build 43) |
+| | `sk` | position relays skipped: every other car known hears the origin steadily direct |
+| | `rn`, `rs`, `rd` | position relays that went anyway: a known car has claimed nothing, a claim is stale, a car does not hear the origin steadily direct |
 
 ## Who reaches whom, and relays chosen on it
 
@@ -245,9 +282,10 @@ radio logs every summary it sends and hears the same way.
 
 A summary is a private-port packet, not Position fields: a relay re-encodes a
 packet from the fields it knows, so there is no spare room in a position that
-survives relaying, and a stock app shows the fields there are. A full one is
-16 origins, about 153 ms on SHORT_FAST against a position's 58; with every
-twelfth position that is 16-22 % on top of a car's own LoRa airtime.
+survives relaying, and a stock app shows the fields there are. Summaries stay
+signed: a full one is 16 origins, 204 ms on SHORT_FAST against an unsigned
+position's 66, and with every twelfth position that is 13-26 % on top of a
+car's own LoRa airtime.
 
 A car whose relayed copy of an origin's position a summary names as the one
 that reached the reporter first, a hop or more out, fresh (fix under 10 s old
@@ -258,9 +296,37 @@ against the ordinary 16 and up. The others keep their ordinary delay and drop
 their copy on hearing the early one, which is managed flooding as it was; if it
 never comes, they relay. A grant lasts two and a half summary periods, renewed
 by each summary that says the same; a summary showing worse delivery through
-this car ends it at once (`touge/relaypref.h`). A 2.4 GHz link is never an
-input, so a good fast lane cannot turn a LoRa relay off, and nothing turns one
-off: preference only changes who usually goes first.
+this car ends it at once (`touge/relaypref.h`). Preference only changes who
+usually goes first.
+
+From build 43 a relay nobody needs is skipped. Each summary entry also says
+whether the car hears that origin steadily direct: its last four positions came
+first straight from the origin, none missed, the latest within an interval and
+a half and under 10 s old on arrival. Every car keeps the other cars' latest
+claims. Before Meshtastic relays a Touge position (core-patches/0013, a hook in
+`perhapsRebroadcast`), the car goes through every other car it knows, every
+node heard on either radio in the last 10 minutes, and skips the relay only if
+each one claims to hear the origin steadily direct in a summary no older than
+two and a half summary periods (150 s at 5 s). A car that has claimed nothing
+(a stock node, an older build, a car just heard), a stale claim, or a car that
+says it does not hear the origin directly keeps the relay going as stock
+(`relayVerdict` in `touge/relaypref.h`). Only Touge positions are judged:
+texts, NodeInfo, summaries, control and stock positions relay as ever. A 2.4
+GHz link is never an input, so a good fast lane cannot turn a LoRa relay off.
+On the bench (three cars in direct range) every position was relayed once
+(`rt`=92 against `ot`=73 on the V3); in the host test, from the first summaries
+on, none are.
+
+A claim can go out of date between summaries, a minute apart at 5 s. So a car
+that stops hearing an origin it claimed, quiet for two and a half intervals or
+its last two positions first through a relay, says so in an early summary
+listing just those origins, a random part of a quarter interval later and never
+within an interval of its last one, with one repeat two intervals on if the
+origin stays quiet. The cars that were skipping relay that origin's next
+position. In the host test a car that drifts out of the front car's range
+misses two of its positions and gets the third through the car still in range,
+within an interval of its early summary. One to three entries, signed, is
+91-107 ms on SHORT_FAST.
 
 The payload is AES-256-CTR under a key derived from the channel PSK. The packet
 id is half the nonce, which is why it is 32 bits and why the counter is kept in

@@ -108,17 +108,24 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     void loraRoster(uint32_t &cars, uint32_t &rank) const;
     // A position from another car that we may relay, noted for the TX queue.
     void noteRelayedPosition(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos, uint32_t nowMs);
-    // The hooks in core-patches/0010, 0011 and 0012.
+    // The hooks in core-patches/0010 to 0015.
     static bool ownsPositionBroadcast();
     static TougeTxPlace placeTxPacket(const std::vector<meshtastic_MeshPacket *> &queue, const meshtastic_MeshPacket *p,
                                       size_t &at);
     static bool inTxQueue(uint32_t from, uint32_t id, void *ctx);
     static bool relayEarly(const meshtastic_MeshPacket *p);
+    static bool skipRelay(const meshtastic_MeshPacket *p);
+    // Our latest LoRa position at the head of the TX queue, which goes on its
+    // own contention delay (0014).
+    static bool txSoon(const meshtastic_MeshPacket *p);
+    // Our position goes unsigned; unsigned positions from signers pass (0015).
+    static bool sendUnsigned(const meshtastic_MeshPacket *p);
+    static bool acceptUnsigned(const meshtastic_MeshPacket *p);
     touge::TxPositions txPositions_;
     uint32_t lastLoraMs_ = 0;
     uint32_t nextLoraMs_ = 0;
-    // Our last LoRa position's packet id, to see whether it is still queued
-    // when the next is due.
+    // Our last LoRa position's packet id: still queued when the next is due
+    // ("os"), and the one packet core-patches/0014 lets go on its own delay.
     uint32_t lastOwnPositionId_ = 0;
     bool rideAppSeen_ = false;
 
@@ -126,7 +133,8 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     //
     // What went on the air and how long it waited, from every packet leaving the
     // TX queue (Meshtastic's RadioTxHook); the reach summaries this car sends
-    // and hears; which origins it relays early. Reported as "ll", "lt" and "le".
+    // and hears; which origins it relays early, and which relays nobody needs.
+    // Reported as "ll", "lt" and "le".
     class LoraTxWatch : public RadioTxHook
     {
       public:
@@ -137,14 +145,26 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     static uint32_t loraBusyPermille();
     void noteLoraReach(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos, uint32_t nowMs);
     void noteReachSummary(const meshtastic_MeshPacket &mp);
-    void sendReachSummary(uint32_t nowMs);
+    // Our summary: with every twelfth position, or [early] (touge/reach.h).
+    void sendReachSummary(uint32_t nowMs, bool early);
+    void sendEarlySummary(uint32_t nowMs);
+    // How long a car's summary counts: two and a half summary periods, so one
+    // lost summary is outlasted and two are not. A 5f grant holds as long.
+    uint32_t summaryHoldMs() const;
     // A summary to serial, a few entries a line: [what] "sent" or "from".
     void logReach(const char *what, uint32_t reporter, const uint8_t *payload, size_t len);
     // The three LoRa reports to serial, and to the phone when one is connected.
     void reportLora(uint32_t nowMs);
+    // core-patches/0013: true when every other car we know already hears this
+    // Touge position's origin steadily direct. Counts every verdict.
+    bool relayNotNeeded(const meshtastic_MeshPacket &p);
+    // touge::KnownCars: every node NodeDB heard within RIDER_DROP_MS (either
+    // radio, not MQTT, not ignored) other than us and [origin].
+    static bool carsKnown(uint32_t origin, uint32_t *cars, size_t cap, size_t &n, void *ctx);
     touge::LoraLoad loraLoad_;
     touge::Reach reach_;
     touge::RelayPrefs relayPrefs_;
+    touge::RelaySkips relaySkips_;
     LoraTxWatch loraTxWatch_;
     // Meshtastic's count of completed transmissions, last seen: it moves before
     // a sent packet is released and not for a cancelled or dropped one.

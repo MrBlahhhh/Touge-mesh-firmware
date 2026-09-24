@@ -1,0 +1,76 @@
+--- a/src/concurrency/NotifiedWorkerThread.h
++++ b/src/concurrency/NotifiedWorkerThread.h
+@@ -36,6 +36,12 @@
+      */
+     bool notifyLater(uint32_t delay, uint32_t v, bool overwrite);
+ 
++    /**
++     * Touge (core-patches/0014): when v is the notification pending, bring it forward to fire in delay msecs if it
++     * was due later. False, and nothing changed, if anything else is pending: an interrupt's is never delayed.
++     */
++    bool notifySooner(uint32_t delay, uint32_t v);
++
+   protected:
+     virtual void onNotify(uint32_t notification) = 0;
+ 
+--- a/src/concurrency/NotifiedWorkerThread.cpp
++++ b/src/concurrency/NotifiedWorkerThread.cpp
+@@ -74,6 +74,20 @@
+     return didIt;
+ }
+ 
++// Touge (core-patches/0014): see NotifiedWorkerThread.h.
++bool NotifiedWorkerThread::notifySooner(uint32_t delay, uint32_t v)
++{
++    if (notification != v || !enabled || tillRun(millis()) <= (long)delay)
++        return false;
++    setIntervalFromNow(delay);
++    // An interrupt that took the slot meanwhile asked to run at once: keep it so.
++    if (notification != v)
++        setInterval(0);
++    // The main loop may be asleep until the later time; wake it, as notify() does.
++    mainDelay.interrupt();
++    return true;
++}
++
+ void NotifiedWorkerThread::checkNotification()
+ {
+     // Atomically read and clear. (This avoids a potential race condition where an interrupt handler could set a new notification
+--- a/src/mesh/RadioLibInterface.h
++++ b/src/mesh/RadioLibInterface.h
+@@ -418,3 +418,8 @@
+     static bool isIsrTxCallback(void (*callback)());
+     virtual void handleSoftwareLoraIrqPoll() {}
+ };
++
++/// Touge (core-patches/0014): true for the fast lane's own LoRa position. Queued at the head, it goes on its own
++/// contention delay instead of what is left of a relay's SNR-weighted one, which a new head does not otherwise cut
++/// short. Null unless the fast lane sets it.
++extern bool (*tougeTxSoonHook)(const meshtastic_MeshPacket *p);
+--- a/src/mesh/RadioLibInterface.cpp
++++ b/src/mesh/RadioLibInterface.cpp
+@@ -90,6 +90,9 @@
+  */
+ RadioLibInterface *RadioLibInterface::instance;
+ 
++// Touge (core-patches/0014): see RadioLibInterface.h.
++bool (*tougeTxSoonHook)(const meshtastic_MeshPacket *p) = nullptr;
++
+ /** Could we send right now (i.e. either not actively receiving or transmitting)? */
+ bool RadioLibInterface::canSendImmediately()
+ {
+@@ -201,7 +204,13 @@
+ 
+     // set (random) transmit delay to let others reconfigure their radio,
+     // to avoid collisions and implement timing-based flooding
+-    setTransmitDelay();
++    // Touge (core-patches/0014): the fast lane's position, now at the head, goes on its own contention delay rather
++    // than what is left of the SNR-weighted one a relay it went ahead of started (up to 2.2 s on SHORT_FAST), which
++    // setTransmitDelay() leaves running. Everything else takes the stock path.
++    const bool cutShort = tougeTxSoonHook && txQueue.getFront() == p && tougeTxSoonHook(p) &&
++                          notifySooner(getTxDelayMsec(), TRANSMIT_DELAY_COMPLETED);
++    if (!cutShort)
++        setTransmitDelay();
+ 
+     return res;
+ #else

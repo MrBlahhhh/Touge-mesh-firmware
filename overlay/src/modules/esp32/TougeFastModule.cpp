@@ -4,6 +4,7 @@
 
 #include "Channels.h"
 #include "MeshService.h"
+#include "NextHopRouter.h"
 #include "NodeDB.h"
 #include "RTC.h"
 #include "PhoneAPI.h"
@@ -22,6 +23,7 @@
 #include <esp_heap_caps.h>
 #include <esp_random.h>
 #include <esp_timer.h>
+#include <pb_encode.h>
 #include <string.h>
 
 // The pre-encoded batch path and the write-drop counters live in NimbleBluetooth.cpp
@@ -200,7 +202,12 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     rank; own-position TX accounting, queue waits and drops ("ll", "lt"); reach summaries (0xC3) say which
 //     origins reach each car and how old ("le"); relays chosen on that evidence go early (core-patches/0012).
 // 42: every ride's fast lane on Wi-Fi channel 1 instead of the ride key's pick of 1/6/11.
-const uint32_t TOUGE_BUILD = 42;
+// 43: our LoRa position goes ahead of relays (RELIABLE, own contention delay, core-patches/0014) and unsigned on a
+//     keyed channel, and unsigned positions from signers pass there (0015); a position relay is skipped when fresh
+//     summaries show every other car known hears the origin steadily direct (0013), summaries say so per entry and
+//     go early when a car stops hearing an origin it claimed ("le" se, sk, rn, rs, rd); 981 B less static RAM for
+//     the pre-encoded batch.
+const uint32_t TOUGE_BUILD = 43;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -298,6 +305,12 @@ static_assert(SYNC_BIAS_MS * (MAX_REF_HOPS + 1) + FRAME_AIRTIME_MS <= SLOT_MS,
 // 32 byte PSK, so anything this short is a channel nobody has secured.
 const int MIN_PSK_BYTES = 16;
 
+// A channel only the ride can read: its key is a real secret (MIN_PSK_BYTES).
+bool privateChannel(ChannelIndex ch)
+{
+    return ch < channels.getNumChannels() && channels.getKey(ch).length >= MIN_PSK_BYTES;
+}
+
 const char *NVS_NAMESPACE = "tougefast";
 const char *NVS_ID_KEY = "idceil";
 
@@ -387,6 +400,19 @@ TougeFastModule::TougeFastModule()
     relayPrefs_.clear();
     if (RadioLibInterface::instance) txGoodSeen_ = RadioLibInterface::instance->txGood;
     tougeRelayEarlyHook = &TougeFastModule::relayEarly;
+
+    // Build 43: relays nobody needs are skipped (0013), our position leaves ahead of relays on its own delay
+    // (0014) and goes unsigned, with unsigned positions from signers let in (0015). touge/lorapos.h mirrors
+    // Meshtastic's numbers.
+    static_assert(PRIORITY_BACKGROUND == meshtastic_MeshPacket_Priority_BACKGROUND &&
+                      PRIORITY_DEFAULT == meshtastic_MeshPacket_Priority_DEFAULT &&
+                      PRIORITY_RELIABLE == meshtastic_MeshPacket_Priority_RELIABLE,
+                  "touge/lorapos.h priorities must be Meshtastic's");
+    static_assert(PORT_POSITION == meshtastic_PortNum_POSITION_APP, "touge/lorapos.h PORT_POSITION must be POSITION_APP");
+    tougeRelaySkipHook = &TougeFastModule::skipRelay;
+    tougeTxSoonHook = &TougeFastModule::txSoon;
+    tougeSendUnsignedHook = &TougeFastModule::sendUnsigned;
+    tougeAcceptUnsignedHook = &TougeFastModule::acceptUnsigned;
 }
 
 size_t TougeFastModule::fastNeighbours(uint32_t nowMs) const
@@ -873,7 +899,7 @@ bool TougeFastModule::loraOwned() const
     // keeps Meshtastic's own position broadcasts. A real key is the fast lane's
     // test for a ride too (syncChannel).
     if (!rideAppSeen_ || !ownFix_.has()) return false;
-    return channels.getKey(channels.getPrimaryIndex()).length >= MIN_PSK_BYTES;
+    return privateChannel(channels.getPrimaryIndex());
 }
 
 bool TougeFastModule::ownsPositionBroadcast()
@@ -907,17 +933,16 @@ void TougeFastModule::sendLoraPosition(uint32_t nowMs)
     uint8_t channel = 0;
     if (!findPositionChannel(channel)) return;
 
-    // The last one still queued now this one is due: it lost its turn.
+    // The last one still queued now this one is due: it lost its turn ("os").
+    // Ahead of relays from build 43, it should not.
     const bool previousLate = lastOwnPositionId_ != 0 && router->findInTxQueue(nodeId_, lastOwnPositionId_);
     meshtastic_MeshPacket *p = router->allocForSending();
     if (!p) return;
     p->to = NODENUM_BROADCAST;
     p->channel = channel;
-    // BACKGROUND, as PositionModule's. Relayed positions queue at DEFAULT and
-    // go first, so under a backlog ours could wait behind them for good; after
-    // one missed its turn, the next goes ahead of them (5d). Local only: the
-    // priority is not on the air.
-    p->priority = previousLate ? meshtastic_MeshPacket_Priority_RELIABLE : meshtastic_MeshPacket_Priority_BACKGROUND;
+    // Ahead of relays, and on its own contention delay (txSoon): see
+    // OWN_POSITION_PRIORITY. Sent unsigned (sendUnsigned).
+    p->priority = (meshtastic_MeshPacket_Priority)OWN_POSITION_PRIORITY;
     p->decoded.portnum = meshtastic_PortNum_POSITION_APP;
     const meshtastic_Position pos = ownLoraPosition();
     p->decoded.payload.size =
@@ -952,7 +977,7 @@ void TougeFastModule::sendLoraPosition(uint32_t nowMs)
 
     // A reach summary with every REACH_EVERY_POSITIONS-th, staggered by rank so
     // the cars' summaries fall in different rounds.
-    if (++lorasSent_ % REACH_EVERY_POSITIONS == rank % REACH_EVERY_POSITIONS) sendReachSummary(nowMs);
+    if (++lorasSent_ % REACH_EVERY_POSITIONS == rank % REACH_EVERY_POSITIONS) sendReachSummary(nowMs, false);
 }
 
 void TougeFastModule::noteRelayedPosition(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos, uint32_t nowMs)
@@ -1048,6 +1073,64 @@ bool TougeFastModule::relayEarly(const meshtastic_MeshPacket *p)
     return tougeFastModule->relayPrefs_.preferred(p->from, millis());
 }
 
+bool TougeFastModule::skipRelay(const meshtastic_MeshPacket *p)
+{
+    if (tougeFastModule == nullptr || p == nullptr || isFromUs(p)) return false;
+    return tougeFastModule->relayNotNeeded(*p);
+}
+
+bool TougeFastModule::relayNotNeeded(const meshtastic_MeshPacket &p)
+{
+    // A radio in stock mode relays as stock.
+    if (!loraOwned()) return false;
+    const RelayVerdict verdict =
+        relayVerdict(txPositions_, p.from, p.id, reach_, &TougeFastModule::carsKnown, nullptr, summaryHoldMs(), millis());
+    relaySkips_.note(verdict);
+    return verdict == RelayVerdict::SKIP;
+}
+
+bool TougeFastModule::carsKnown(uint32_t origin, uint32_t *cars, size_t cap, size_t &n, void *ctx)
+{
+    (void)ctx;
+    // The ride as loraRoster counts it, every node heard on either radio lately.
+    // A car only on 2.4 GHz, or a stock node, has no claims, so it keeps relays
+    // going, which is the safe way round.
+    n = 0;
+    const NodeNum self = nodeDB->getNodeNum();
+    for (size_t i = 0; i < nodeDB->getNumMeshNodes(); i++) {
+        const meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
+        if (node->num == self || node->num == origin || node->last_heard == 0) continue;
+        if (nodeInfoLiteViaMqtt(node) || nodeInfoLiteIsIgnored(node)) continue;
+        if (sinceLastSeen(node) >= RIDER_DROP_MS / 1000) continue;
+        if (n == cap) return false;
+        cars[n++] = node->num;
+    }
+    return true;
+}
+
+bool TougeFastModule::txSoon(const meshtastic_MeshPacket *p)
+{
+    // Our latest LoRa position, and nothing else of ours.
+    return tougeFastModule != nullptr && p != nullptr && isFromUs(p) && p->id == tougeFastModule->lastOwnPositionId_;
+}
+
+bool TougeFastModule::sendUnsigned(const meshtastic_MeshPacket *p)
+{
+    if (tougeFastModule == nullptr || p == nullptr || p->which_payload_variant != meshtastic_MeshPacket_decoded_tag) return false;
+    // p->channel is still an index here: Router::perhapsEncode swaps in the hash after signing.
+    return touge::sendsUnsigned(p->decoded.portnum, isBroadcast(p->to), isFromUs(p) && tougeFastModule->loraOwned(),
+                                privateChannel(p->channel), owner.is_licensed);
+}
+
+bool TougeFastModule::acceptUnsigned(const meshtastic_MeshPacket *p)
+{
+    // Not gated on loraOwned(): a radio in stock mode still rides with Touge
+    // cars, and dropping their positions would also stop it relaying them.
+    // p->channel is the index it decoded on (perhapsDecode).
+    if (p == nullptr || p->which_payload_variant != meshtastic_MeshPacket_decoded_tag) return false;
+    return touge::passesUnsigned(p->decoded.portnum, privateChannel(p->channel), owner.is_licensed);
+}
+
 void TougeFastModule::noteLoraReach(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos, uint32_t nowMs)
 {
     // LoRa only, the lane the summaries measure. A 2.4 GHz car never comes
@@ -1064,7 +1147,8 @@ void TougeFastModule::noteLoraReach(const meshtastic_MeshPacket &mp, const mesht
         ageMs = age < UINT32_MAX ? (uint32_t)age : UINT32_MAX - 1;
     }
     const int8_t hops = getHopsAway(mp);
-    reach_.heard(mp.from, fix, ageMs, hops < 0 ? REACH_HOPS_UNKNOWN : (uint8_t)hops, (uint8_t)mp.relay_node, nowMs);
+    reach_.heard(mp.from, fix, ageMs, hops < 0 ? REACH_HOPS_UNKNOWN : (uint8_t)hops, (uint8_t)mp.relay_node,
+                 loraLoad_.intervalMs(), nowMs);
 }
 
 void TougeFastModule::noteReachSummary(const meshtastic_MeshPacket &mp)
@@ -1072,18 +1156,16 @@ void TougeFastModule::noteReachSummary(const meshtastic_MeshPacket &mp)
     if (mp.transport_mechanism != meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA) return;
     const uint8_t *payload = mp.decoded.payload.bytes;
     const size_t len = mp.decoded.payload.size;
-    size_t entries = 0;
-    uint8_t flags = 0;
-    if (!decodeReachHeader(payload, len, entries, flags)) return;
-    reach_.noteSummaryHeard();
-    logReach("from", mp.from, payload, len);
-
     const uint32_t nowMs = millis();
     const uint32_t intervalMs = loraLoad_.intervalMs();
+    // What it claims about hearing each origin directly, which the relays we
+    // skip go on (build 43).
+    if (!reach_.noteSummary(mp.from, payload, len, nowMs)) return;
+    logReach("from", mp.from, payload, len);
+
     // Worse delivery: the far car went three of our intervals without the origin.
     const uint32_t maxSinceS = 3 * intervalMs / 1000;
-    // A grant outlasts one missed summary, not two.
-    const uint32_t holdMs = REACH_EVERY_POSITIONS * intervalMs * 5 / 2;
+    const uint32_t holdMs = summaryHoldMs();
     // nodeDB, not nodeId_: a summary can arrive before the first pass sets it.
     const NodeNum self = nodeDB->getNodeNum();
     const uint8_t selfByte = nodeDB->getLastByteOfNodeNum(self);
@@ -1105,18 +1187,35 @@ void TougeFastModule::noteReachSummary(const meshtastic_MeshPacket &mp)
     }
 }
 
-void TougeFastModule::sendReachSummary(uint32_t nowMs)
+uint32_t TougeFastModule::summaryHoldMs() const
+{
+    return REACH_EVERY_POSITIONS * loraLoad_.intervalMs() * 5 / 2;
+}
+
+void TougeFastModule::sendEarlySummary(uint32_t nowMs)
+{
+    // Only while our regular summaries go too (sendLoraPosition).
+    if (!loraOwned() || !ownFix_.fresh(nowMs)) return;
+    if (reach_.earlyDue(nowMs, loraLoad_.intervalMs(), esp_random())) sendReachSummary(nowMs, true);
+}
+
+void TougeFastModule::sendReachSummary(uint32_t nowMs, bool early)
 {
     meshtastic_MeshPacket *p = router->allocForSending();
     if (!p) return;
-    const size_t len = reach_.takeSummary(nowMs, p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes));
+    uint8_t *out = p->decoded.payload.bytes;
+    const uint32_t intervalMs = loraLoad_.intervalMs();
+    const size_t len = early ? reach_.takeEarlySummary(nowMs, intervalMs, out, sizeof(p->decoded.payload.bytes))
+                             : reach_.takeSummary(nowMs, intervalMs, out, sizeof(p->decoded.payload.bytes));
     if (len == 0) {
         service->releaseToPool(p);
         return;
     }
     p->to = NODENUM_BROADCAST;
     p->channel = channels.getPrimaryIndex();
-    p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
+    // An early one is what brings relays back to a car that lost an origin:
+    // ahead of relays, like our position. The regular one can wait.
+    p->priority = early ? (meshtastic_MeshPacket_Priority)OWN_POSITION_PRIORITY : meshtastic_MeshPacket_Priority_BACKGROUND;
     p->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
     p->decoded.payload.size = (pb_size_t)len;
     lastReachId_ = p->id;
@@ -1147,7 +1246,8 @@ void TougeFastModule::logReach(const char *what, uint32_t reporter, const uint8_
     ReachEntry e;
     for (size_t i = 0; decodeReachEntry(payload, len, i, e); i++) {
         if (i % PER_LINE == 0) {
-            const int n = snprintf(line, sizeof(line), "touge: lora reach %s %08x:", what, (unsigned)reporter);
+            const int n = snprintf(line, sizeof(line), "touge: lora reach %s %08x%s:", what, (unsigned)reporter,
+                                   (flags & REACH_EARLY) ? " early" : "");
             at = n > 0 ? (size_t)n : 0;
         }
         char entry[40];
@@ -1182,8 +1282,8 @@ void TougeFastModule::reportLora(uint32_t nowMs)
     if (phone) queueJsonToPhone(text, formatLoraWindow(w, true, text, sizeof(text)));
     if (formatLoraTx(counts, false, text, sizeof(text)) > 0) LOG_INFO("touge: lora %s", text);
     if (phone) queueJsonToPhone(text, formatLoraTx(counts, true, text, sizeof(text)));
-    if (formatLoraReach(reach_, relayPrefs_, false, text, sizeof(text)) > 0) LOG_INFO("touge: lora %s", text);
-    if (phone) queueJsonToPhone(text, formatLoraReach(reach_, relayPrefs_, true, text, sizeof(text)));
+    if (formatLoraReach(reach_, relayPrefs_, relaySkips_, false, text, sizeof(text)) > 0) LOG_INFO("touge: lora %s", text);
+    if (phone) queueJsonToPhone(text, formatLoraReach(reach_, relayPrefs_, relaySkips_, true, text, sizeof(text)));
 }
 
 void TougeFastModule::reassertFastPositions()
@@ -1555,6 +1655,7 @@ int32_t TougeFastModule::runOnce()
     // LoRa carries the car whether or not the 2.4 GHz lane came up (a V3 short
     // of heap runs LoRa only).
     sendLoraPosition(now);
+    sendEarlySummary(now);
     if (!started_) {
         // Nothing else to do until there is a channel, but say so: see reportLaneDown.
         reportLaneDown(now, laneDown_);
@@ -2062,24 +2163,18 @@ void TougeFastModule::flushPhoneBatch(uint32_t nowMs)
 
 bool TougeFastModule::handPhoneBatch(const uint8_t *payload, size_t len, uint32_t &packetId, bool &preloaded)
 {
-    // Static, since a FromRadio is 768 bytes, too much for the main task's stack
-    // on every flush. The batch's MeshPacket is built inside it rather than in a
-    // static of its own, 432 bytes less of internal RAM.
-    static meshtastic_FromRadio fromRadio;
-    memset(&fromRadio, 0, sizeof(fromRadio));
-    meshtastic_MeshPacket &packet = fromRadio.packet;
-    packet.from = nodeId_;
-    packet.to = NODENUM_BROADCAST;
-    packet.id = generatePacketId();
-    packet.channel = channels.getPrimaryIndex();
-    packet.hop_limit = 0;
-    packet.hop_start = 0;
-    packet.rx_time = getValidTime(RTCQualityFromNet);
-    packet.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
-    packet.decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
-    memcpy(packet.decoded.payload.bytes, payload, len);
-    packet.decoded.payload.size = (pb_size_t)len;
-    packetId = packet.id;
+    // Built in a pool packet, which the ordinary queue takes as it is and the
+    // pre-encoded path encodes from. Until build 43 it was built in a static
+    // FromRadio, 768 bytes of internal RAM held for good.
+    meshtastic_MeshPacket *pp = router->allocForSending();
+    if (!pp) return false;
+    pp->from = nodeId_;
+    pp->channel = channels.getPrimaryIndex();
+    pp->hop_limit = 0;
+    pp->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
+    memcpy(pp->decoded.payload.bytes, payload, len);
+    pp->decoded.payload.size = (pb_size_t)len;
+    packetId = pp->id;
     preloaded = false;
 
 #if TOUGE_HAS_NIMBLE
@@ -2090,25 +2185,33 @@ bool TougeFastModule::handPhoneBatch(const uint8_t *payload, size_t len, uint32_
     // of order; the app keeps the newest frame per car. Readied in place when
     // it is read (readyPreloadedBatch), like a queued one in notePhoneDelivered.
     if ((hello_.flags & HELLO_PRELOAD) != 0 && !batchesInFlight_.hasPreloaded()) {
-        static uint8_t fromRadioBytes[meshtastic_FromRadio_size];
-        fromRadio.which_payload_variant = meshtastic_FromRadio_packet_tag;
-        const size_t n = pb_encode_to_bytes(fromRadioBytes, sizeof(fromRadioBytes), &meshtastic_FromRadio_msg, &fromRadio);
-        // A bytes field is copied verbatim, so the payload is findable as is.
-        const int at = n > 0 ? findPayload(fromRadioBytes, n, payload, len) : -1;
-        if (at >= 0) {
-            preloadPayloadAt = (size_t)at;
-            preloadPayloadLen = len;
-            if (nimbleOfferToPhone(fromRadioBytes, n, &readyPreloadedBatch)) {
-                preloaded = true;
-                return true;
+        // Static: NimBLE copies it, and on the main task's stack it would sit on
+        // top of flushPhoneBatch's payload every flush.
+        static uint8_t fromRadioBytes[BATCH_FROM_RADIO_MAX];
+        // FromRadio { packet }: its header by hand, then the packet, which is
+        // what nanopb makes of the struct (touge/phonebatch.h).
+        size_t packetLen = 0;
+        const size_t head = pb_get_encoded_size(&packetLen, &meshtastic_MeshPacket_msg, pp)
+                                ? fromRadioPacketHeader(packetLen, fromRadioBytes, sizeof(fromRadioBytes))
+                                : 0;
+        pb_ostream_t stream = pb_ostream_from_buffer(fromRadioBytes + head, sizeof(fromRadioBytes) - head);
+        if (head > 0 && pb_encode(&stream, &meshtastic_MeshPacket_msg, pp)) {
+            const size_t n = head + stream.bytes_written;
+            // A bytes field is copied verbatim, so the payload is findable as is.
+            const int at = findPayload(fromRadioBytes, n, payload, len);
+            if (at >= 0) {
+                preloadPayloadAt = (size_t)at;
+                preloadPayloadLen = len;
+                if (nimbleOfferToPhone(fromRadioBytes, n, &readyPreloadedBatch)) {
+                    service->releaseToPool(pp);
+                    preloaded = true;
+                    return true;
+                }
             }
         }
     }
 #endif
 
-    meshtastic_MeshPacket *pp = router->allocForSending();
-    if (!pp) return false;
-    *pp = packet;
     // May be refused by a full queue; trackPhoneLink then finds it gone.
     service->sendToPhone(pp);
     return true;

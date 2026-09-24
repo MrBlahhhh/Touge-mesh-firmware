@@ -15,9 +15,11 @@ using namespace touge;
 void setUp() {}
 void tearDown() {}
 
-// SHORT_FAST: about 58 ms a position (MeshProto.airtimeMs); LONG_FAST 760 ms.
-static const uint32_t SHORT_FAST_MS = 58;
-static const uint32_t LONG_FAST_MS = 760;
+// A moving car's unsigned position, 67 bytes on the air from build 43: 66 ms on
+// SHORT_FAST, 764 on LONG_FAST (MeshProto.airtimeMs). Signed it was 114 and
+// 1255.
+static const uint32_t SHORT_FAST_MS = 66;
+static const uint32_t LONG_FAST_MS = 764;
 
 static uint32_t busyPermille(uint32_t cars, uint32_t relays, uint32_t airtimeMs, uint32_t intervalMs) {
   const uint64_t busy = (uint64_t)cars * (1 + relays) * airtimeMs * 1000 / intervalMs;
@@ -59,13 +61,13 @@ void test_a_busy_channel_stretches_the_interval_only_as_far_as_it_needs() {
   load.judge(LORA_BUSY_TARGET_PERMILLE, 1000 + LORA_JUDGE_MS);
   TEST_ASSERT_EQUAL_UINT32(8000, load.intervalMs());
 
-  // Twenty-five cars on SHORT_FAST settle where the air sits under the target,
-  // not at the cap the cars-squared estimate put them at.
+  // Twenty-five cars on SHORT_FAST, every position relayed twice, settle where
+  // the air sits under the target: 20 s, 24.7 % busy.
   LoraLoad ride25;
   ride25.reset();
   uint32_t nowMs = 0;
   ride(ride25, nowMs, 25, 2, SHORT_FAST_MS, 10);
-  TEST_ASSERT_EQUAL_UINT32(18000, ride25.intervalMs());
+  TEST_ASSERT_EQUAL_UINT32(20000, ride25.intervalMs());
   TEST_ASSERT_TRUE(busyPermille(25, 2, SHORT_FAST_MS, ride25.intervalMs()) <= LORA_BUSY_TARGET_PERMILLE);
   TEST_ASSERT_FALSE(ride25.saturated());
 }
@@ -229,8 +231,8 @@ void test_a_pause_in_sending_is_not_a_gap() {
   TEST_ASSERT_EQUAL_UINT32(0, w.gapMaxMs);
 }
 
-// Our BACKGROUND position can wait behind relays for good under a backlog
-// (the 5c risk). It is counted and flagged for the window it happened in.
+// Our position still queued when the next is due: counted and flagged for the
+// window it happened in. Ahead of relays from build 43, it should not happen.
 void test_a_late_own_position_is_counted_and_flagged() {
   LoraLoad load;
   load.reset();

@@ -1,0 +1,52 @@
+--- a/src/mesh/Router.h
++++ b/src/mesh/Router.h
+@@ -283,6 +283,14 @@
+ bool checkXeddsaReceivePolicy(meshtastic_MeshPacket *p);
+ #endif
+ 
++/// Touge (core-patches/0015): true for a packet this node originates that goes unsigned: the fast lane's own
++/// position, on a channel with a real key. Null unless the fast lane sets it.
++extern bool (*tougeSendUnsignedHook)(const meshtastic_MeshPacket *p);
++/// Touge (core-patches/0015): true for an unsigned broadcast from a node known to sign that the Balanced policy lets
++/// through anyway: a position on a channel with a real key, which Touge radios send unsigned. A malformed or failed
++/// signature is still dropped, and Strict still drops every unsigned packet. Null unless the fast lane sets it.
++extern bool (*tougeAcceptUnsignedHook)(const meshtastic_MeshPacket *p);
++
+ #if !(MESHTASTIC_EXCLUDE_PKI)
+ /**
+  * Would perhapsEncode() PKC-encrypt this outgoing packet? Callers that must know the encryption a
+--- a/src/mesh/Router.cpp
++++ b/src/mesh/Router.cpp
+@@ -645,6 +645,10 @@
+     // FIXME, update nodedb here for any packet that passes through us
+ }
+ 
++// Touge (core-patches/0015): see Router.h.
++bool (*tougeSendUnsignedHook)(const meshtastic_MeshPacket *p) = nullptr;
++bool (*tougeAcceptUnsignedHook)(const meshtastic_MeshPacket *p) = nullptr;
++
+ #if !(MESHTASTIC_EXCLUDE_PKI) && !(MESHTASTIC_EXCLUDE_XEDDSA)
+ /** Size a decoded Data as the sender's signedDataFits() gate would have, with padding stripped:
+  * unknown fields inside Data.payload survive in payload.size and would otherwise let a forger
+@@ -791,6 +795,10 @@
+         // Balanced rejects only what a signer always signs: non-PKI broadcasts whose signed encoding
+         // would have fit, plus unicasts on ham where licensed senders sign too. Mirrors perhapsEncode.
+         if (nodeDB->isKnownXeddsaSigner(p->from) && (isBroadcast(p->to) || owner.is_licensed)) {
++            // Touge (core-patches/0015): Touge radios send their positions unsigned on a keyed channel; everything
++            // else keeps this.
++            if (tougeAcceptUnsignedHook && tougeAcceptUnsignedHook(p))
++                return true;
+             size_t canonicalSize;
+             if (!canonicalSignableSize(&p->decoded, &canonicalSize))
+                 return true; // can't size it; never drop on a sizing failure
+@@ -1263,7 +1271,9 @@
+             // where we sign-then-fail-TOO_LARGE breaks packets that
+             // were deliverable unsigned, and perhapsDecode() applies the mirror-image rule when
+             // deciding whether an unsigned broadcast from a known signer is a downgrade.
+-            if (!p->pki_encrypted && (owner.is_licensed || isBroadcast(p->to)) && signedDataFits(&p->decoded)) {
++            // Touge (core-patches/0015): not the fast lane's own position, which goes 66 bytes shorter unsigned.
++            if (!p->pki_encrypted && (owner.is_licensed || isBroadcast(p->to)) && signedDataFits(&p->decoded) &&
++                !(tougeSendUnsignedHook && tougeSendUnsignedHook(p))) {
+                 if (crypto->xeddsa_sign(p->from, p->id, p->decoded.portnum, p->decoded.payload.bytes, p->decoded.payload.size,
+                                         p->decoded.xeddsa_signature.bytes)) {
+                     p->decoded.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE;

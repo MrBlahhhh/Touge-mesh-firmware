@@ -59,12 +59,68 @@ size_t RelayPrefs::count(uint32_t nowMs) const {
   return n;
 }
 
-size_t formatLoraReach(const Reach& reach, const RelayPrefs& prefs, bool json, char* out, size_t cap) {
+RelayVerdict judgeRelay(const Reach& reach, uint32_t origin, const uint32_t* known, size_t n, uint32_t freshMs,
+                        uint32_t nowMs) {
+  RelayVerdict verdict = RelayVerdict::SKIP;
+  for (size_t i = 0; i < n; i++) {
+    switch (reach.claim(known[i], origin, freshMs, nowMs)) {
+      case DirectClaim::STEADY:
+        break;
+      case DirectClaim::NOT_STEADY:
+        return RelayVerdict::NEEDED;
+      case DirectClaim::STALE:
+        verdict = RelayVerdict::STALE;
+        break;
+      case DirectClaim::UNPROVEN:
+      default:
+        if (verdict == RelayVerdict::SKIP) verdict = RelayVerdict::NO_EVIDENCE;
+        break;
+    }
+  }
+  return verdict;
+}
+
+RelayVerdict relayVerdict(const TxPositions& noted, uint32_t from, uint32_t id, const Reach& reach, KnownCars known,
+                          void* ctx, uint32_t freshMs, uint32_t nowMs) {
+  if (noted.find(from, id) == nullptr) return RelayVerdict::STOCK;
+  uint32_t cars[KNOWN_CARS_MAX];
+  size_t n = 0;
+  if (!known(from, cars, KNOWN_CARS_MAX, n, ctx)) return RelayVerdict::NO_EVIDENCE;
+  return judgeRelay(reach, from, cars, n, freshMs, nowMs);
+}
+
+void RelaySkips::note(RelayVerdict v) {
+  switch (v) {
+    case RelayVerdict::SKIP:
+      skipped++;
+      break;
+    case RelayVerdict::NO_EVIDENCE:
+      noEvidence++;
+      break;
+    case RelayVerdict::STALE:
+      stale++;
+      break;
+    case RelayVerdict::NEEDED:
+      needed++;
+      break;
+    case RelayVerdict::STOCK:
+    default:
+      break;
+  }
+}
+
+size_t formatLoraReach(const Reach& reach, const RelayPrefs& prefs, const RelaySkips& skips, bool json, char* out,
+                       size_t cap) {
   KvLine line(out, cap, "le", json);
   line.add("st", reach.summariesSent());
   line.add("sh", reach.summariesHeard());
   line.add("pg", prefs.granted());
   line.add("pw", prefs.withdrawn());
+  line.add("se", reach.earlySent());
+  line.add("sk", skips.skipped);
+  line.add("rn", skips.noEvidence);
+  line.add("rs", skips.stale);
+  line.add("rd", skips.needed);
   return line.finish();
 }
 

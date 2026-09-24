@@ -1,5 +1,6 @@
-// Host tests for end-to-end delivery summaries (SCALE-PLAN 5e) and relays
-// chosen on their evidence (5f).
+// Host tests for end-to-end delivery summaries (SCALE-PLAN 5e), relays chosen
+// on their evidence (5f), and from build 43 relays nobody needs, skipped on the
+// claims summaries carry, with early summaries when a car loses an origin.
 //
 // The convoy tests fly a small Meshtastic flood on the host. Cars sit on a
 // line and hear the cars within one step. A broadcast is relayed by every car
@@ -20,6 +21,11 @@ using namespace touge;
 
 void setUp() {}
 void tearDown() {}
+
+// Our interval, which the table takes as every origin's, and how long a car's
+// summary counts at it (summaryHoldMs in the module): 150 s.
+static const uint32_t INTERVAL_MS = 5000;
+static const uint32_t HOLD_MS = REACH_EVERY_POSITIONS * INTERVAL_MS * 5 / 2;
 
 // ---- The summary on the wire -------------------------------------------------
 
@@ -55,6 +61,7 @@ void test_a_summary_round_trips() {
     TEST_ASSERT_EQUAL_UINT8(sent[i].sinceS, got.sinceS);
     TEST_ASSERT_EQUAL_UINT8(sent[i].hops, got.hops);
     TEST_ASSERT_EQUAL_HEX8(sent[i].relay, got.relay);
+    TEST_ASSERT_FALSE(got.steady);
   }
   // The app's LoraReachTest pins the same bytes, so the two ends cannot drift
   // apart unnoticed.
@@ -78,6 +85,35 @@ void test_a_summary_round_trips() {
   TEST_ASSERT_TRUE(encodeReach(many, REACH_PER_SUMMARY, 0, full, sizeof(full)) > 0);
 }
 
+// Build 43: the header says the entries carry the steady flag, and whether the
+// summary is an early one; an entry says it in its hops byte.
+void test_the_steady_and_early_flags_round_trip() {
+  ReachEntry sent[3] = {entry(0xA000A1B2, 1234, 3400, 12, 1, 0x5E), entry(0xA000C3D4, 65535, 250, 0, 0, 0xD4),
+                        entry(0x0000000F, 7, UINT32_MAX, 255, REACH_HOPS_UNKNOWN, 0x33)};
+  sent[1].steady = true;
+  uint8_t buf[64];
+  const size_t len = encodeReach(sent, 3, REACH_EARLY | REACH_STEADY, buf, sizeof(buf));
+  // LoraReachTest pins these too.
+  const uint8_t pinned[] = {0xC3, 0x01, 0x03, 0x06,                                      //
+                            0xA0, 0x00, 0xA1, 0xB2, 0x04, 0xD2, 0x0D, 0x0C, 0x01, 0x5E,  //
+                            0xA0, 0x00, 0xC3, 0xD4, 0xFF, 0xFF, 0x01, 0x00, 0x10, 0xD4,  //
+                            0x00, 0x00, 0x00, 0x0F, 0x00, 0x07, 0xFF, 0xFF, 0x0F, 0x33};
+  TEST_ASSERT_EQUAL_UINT32(sizeof(pinned), len);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(pinned, buf, sizeof(pinned));
+  ReachEntry got;
+  TEST_ASSERT_TRUE(decodeReachEntry(buf, len, 1, got));
+  TEST_ASSERT_TRUE(got.steady);
+  TEST_ASSERT_EQUAL_UINT8(0, got.hops);
+  TEST_ASSERT_TRUE(decodeReachEntry(buf, len, 0, got));
+  TEST_ASSERT_FALSE(got.steady);
+  TEST_ASSERT_EQUAL_UINT8(1, got.hops);
+  // Without the header's flag the bit means nothing.
+  buf[3] = REACH_EARLY;
+  TEST_ASSERT_TRUE(decodeReachEntry(buf, len, 1, got));
+  TEST_ASSERT_FALSE(got.steady);
+  TEST_ASSERT_EQUAL_UINT8(0, got.hops);
+}
+
 void test_ages_go_in_quarter_seconds() {
   TEST_ASSERT_EQUAL_UINT8(0, reachAgeQ(0));
   TEST_ASSERT_EQUAL_UINT8(0, reachAgeQ(249));
@@ -99,6 +135,10 @@ void test_an_entry_reads_as_the_app_shows_cars() {
   TEST_ASSERT_EQUAL_STRING("c3d4#9 0.2s 0h -0s", out);
   TEST_ASSERT_TRUE(formatReachEntry(entry(0x0000000F, 7, UINT32_MAX, 255, REACH_HOPS_UNKNOWN, 0x33), out, sizeof(out)) > 0);
   TEST_ASSERT_EQUAL_STRING("000f#7 ? ?h/33 -255s", out);
+  ReachEntry steadyDirect = entry(0xA000C3D4, 9, 250, 0, 0, 0xD4);
+  steadyDirect.steady = true;
+  TEST_ASSERT_TRUE(formatReachEntry(steadyDirect, out, sizeof(out)) > 0);
+  TEST_ASSERT_EQUAL_STRING("c3d4#9 0.2s 0h steady -0s", out);
 }
 
 // ---- One car's table ---------------------------------------------------------
@@ -114,7 +154,7 @@ static FixId fixId(uint16_t session, uint32_t seq) {
 // The one entry for [origin] in [reach]'s next summary.
 static bool summaryEntry(Reach& reach, uint32_t origin, uint32_t nowMs, ReachEntry& out) {
   uint8_t buf[233];
-  const size_t len = reach.takeSummary(nowMs, buf, sizeof(buf));
+  const size_t len = reach.takeSummary(nowMs, INTERVAL_MS, buf, sizeof(buf));
   for (size_t i = 0; decodeReachEntry(buf, len, i, out); i++) {
     if (out.origin == origin) return true;
   }
@@ -125,9 +165,9 @@ void test_the_newest_fix_per_origin_is_kept() {
   Reach reach;
   reach.clear();
   const uint32_t CAR = 0xA000B2B2;
-  reach.heard(CAR, fixId(7, 10), 1200, 1, 0x44, 1000);
+  reach.heard(CAR, fixId(7, 10), 1200, 1, 0x44, INTERVAL_MS, 1000);
   // A late copy of an older fix changes nothing.
-  reach.heard(CAR, fixId(7, 9), 800, 0, 0xB2, 1500);
+  reach.heard(CAR, fixId(7, 9), 800, 0, 0xB2, INTERVAL_MS, 1500);
   ReachEntry e;
   TEST_ASSERT_TRUE(summaryEntry(reach, CAR, 3000, e));
   TEST_ASSERT_EQUAL_UINT16(10, e.seq);
@@ -135,18 +175,18 @@ void test_the_newest_fix_per_origin_is_kept() {
   TEST_ASSERT_EQUAL_HEX8(0x44, e.relay);
   TEST_ASSERT_EQUAL_UINT8(2, e.sinceS);
   // The same fix again (a parked phone's repeat) is still the car heard.
-  reach.heard(CAR, fixId(7, 10), 6000, 0, 0xB2, 5000);
+  reach.heard(CAR, fixId(7, 10), 6000, 0, 0xB2, INTERVAL_MS, 5000);
   TEST_ASSERT_TRUE(summaryEntry(reach, CAR, 5000, e));
   TEST_ASSERT_EQUAL_UINT8(0, e.sinceS);
   TEST_ASSERT_EQUAL_UINT8(0, e.hops);
   // A rebooted car starts its sequence again under a new session.
-  reach.heard(CAR, fixId(9, 1), 900, 0, 0xB2, 6000);
+  reach.heard(CAR, fixId(9, 1), 900, 0, 0xB2, INTERVAL_MS, 6000);
   TEST_ASSERT_TRUE(summaryEntry(reach, CAR, 6000, e));
   TEST_ASSERT_EQUAL_UINT16(1, e.seq);
   // The low sixteen bits carry on across their wrap.
-  reach.heard(CAR, fixId(9, 30000), 900, 0, 0xB2, 6500);
-  reach.heard(CAR, fixId(9, 60000), 900, 0, 0xB2, 7000);
-  reach.heard(CAR, fixId(9, 65537), 900, 0, 0xB2, 8000);
+  reach.heard(CAR, fixId(9, 30000), 900, 0, 0xB2, INTERVAL_MS, 6500);
+  reach.heard(CAR, fixId(9, 60000), 900, 0, 0xB2, INTERVAL_MS, 7000);
+  reach.heard(CAR, fixId(9, 65537), 900, 0, 0xB2, INTERVAL_MS, 8000);
   TEST_ASSERT_TRUE(summaryEntry(reach, CAR, 8000, e));
   TEST_ASSERT_EQUAL_UINT16(1, e.seq);
   TEST_ASSERT_EQUAL_UINT8(0, e.sinceS);
@@ -157,20 +197,22 @@ void test_the_newest_fix_per_origin_is_kept() {
 void test_a_long_list_goes_on_in_the_next_summary() {
   Reach reach;
   reach.clear();
-  for (uint32_t i = 1; i <= 20; i++) reach.heard(0xB0000000 + i, fixId((uint16_t)i, 1), 1000, 0, (uint8_t)i, 1000);
+  for (uint32_t i = 1; i <= 20; i++) {
+    reach.heard(0xB0000000 + i, fixId((uint16_t)i, 1), 1000, 0, (uint8_t)i, INTERVAL_MS, 1000);
+  }
   uint8_t buf[233];
   size_t entries = 0;
   uint8_t flags = 0;
-  size_t len = reach.takeSummary(2000, buf, sizeof(buf));
+  size_t len = reach.takeSummary(2000, INTERVAL_MS, buf, sizeof(buf));
   TEST_ASSERT_TRUE(decodeReachHeader(buf, len, entries, flags));
   TEST_ASSERT_EQUAL_UINT32(REACH_PER_SUMMARY, entries);
-  TEST_ASSERT_EQUAL_HEX8(REACH_MORE, flags);
-  len = reach.takeSummary(3000, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_HEX8(REACH_MORE | REACH_STEADY, flags);
+  len = reach.takeSummary(3000, INTERVAL_MS, buf, sizeof(buf));
   TEST_ASSERT_TRUE(decodeReachHeader(buf, len, entries, flags));
   TEST_ASSERT_EQUAL_UINT32(4, entries);
-  TEST_ASSERT_EQUAL_HEX8(0, flags);
+  TEST_ASSERT_EQUAL_HEX8(REACH_STEADY, flags);
   // And round again.
-  len = reach.takeSummary(4000, buf, sizeof(buf));
+  len = reach.takeSummary(4000, INTERVAL_MS, buf, sizeof(buf));
   TEST_ASSERT_TRUE(decodeReachHeader(buf, len, entries, flags));
   TEST_ASSERT_EQUAL_UINT32(REACH_PER_SUMMARY, entries);
   TEST_ASSERT_EQUAL_UINT32(3, reach.summariesSent());
@@ -180,26 +222,432 @@ void test_a_long_list_goes_on_in_the_next_summary() {
 void test_an_origin_not_heard_for_4_minutes_is_forgotten() {
   Reach reach;
   reach.clear();
-  reach.heard(0xB0000001, fixId(1, 1), 1000, 0, 0x01, 1000);
-  reach.heard(0xB0000002, fixId(2, 1), 1000, 0, 0x02, 200000);
+  reach.heard(0xB0000001, fixId(1, 1), 1000, 0, 0x01, INTERVAL_MS, 1000);
+  reach.heard(0xB0000002, fixId(2, 1), 1000, 0, 0x02, INTERVAL_MS, 200000);
   TEST_ASSERT_EQUAL_UINT32(2, reach.count(200000));
   TEST_ASSERT_EQUAL_UINT32(1, reach.count(1000 + REACH_KEEP_MS));
   ReachEntry e;
   TEST_ASSERT_FALSE(summaryEntry(reach, 0xB0000001, 1000 + REACH_KEEP_MS, e));
   // Nobody at all: no summary.
   uint8_t buf[233];
-  TEST_ASSERT_EQUAL_UINT32(0, reach.takeSummary(200000 + REACH_KEEP_MS, buf, sizeof(buf)));
+  TEST_ASSERT_EQUAL_UINT32(0, reach.takeSummary(200000 + REACH_KEEP_MS, INTERVAL_MS, buf, sizeof(buf)));
 }
 
 void test_a_full_table_forgets_the_origin_heard_longest_ago() {
   Reach reach;
   reach.clear();
-  for (uint32_t i = 0; i < REACH_SLOTS; i++) reach.heard(0xC0000000 + i, fixId(1, 1), 0, 0, 1, 1000 + i * 10);
-  reach.heard(0xCFFFFFFF, fixId(1, 1), 0, 0, 1, 5000);
+  for (uint32_t i = 0; i < REACH_SLOTS; i++) reach.heard(0xC0000000 + i, fixId(1, 1), 0, 0, 1, INTERVAL_MS, 1000 + i * 10);
+  reach.heard(0xCFFFFFFF, fixId(1, 1), 0, 0, 1, INTERVAL_MS, 5000);
   TEST_ASSERT_FALSE(reach.heardWithin(0xC0000000, REACH_KEEP_MS, 5000));
   TEST_ASSERT_TRUE(reach.heardWithin(0xC0000001, REACH_KEEP_MS, 5000));
   TEST_ASSERT_TRUE(reach.heardWithin(0xCFFFFFFF, REACH_KEEP_MS, 5000));
   TEST_ASSERT_EQUAL_UINT32(REACH_SLOTS, reach.count(5000));
+}
+
+// ---- Heard steadily direct (build 43) ------------------------------------------
+
+static const uint32_t ORIGIN = 0xA00000C1;
+static const uint32_t REPORTER = 0xA00000D4;
+
+// [n] positions from [origin], an interval apart from [fromMs], first heard
+// [hops] out, each fix [ageMs] old on arrival. Returns when the last came in.
+static uint32_t hearPositions(Reach& reach, uint32_t origin, uint32_t n, uint32_t fromMs, uint8_t hops, uint32_t& seq,
+                              uint32_t ageMs = 300) {
+  uint32_t atMs = fromMs;
+  for (uint32_t i = 0; i < n; i++) {
+    atMs = fromMs + i * INTERVAL_MS;
+    reach.heard(origin, fixId(3, ++seq), ageMs, hops, hops == 0 ? (uint8_t)origin : 0x77, INTERVAL_MS, atMs);
+  }
+  return atMs;
+}
+
+void test_an_origin_is_claimed_steady_after_four_direct_positions_in_a_row() {
+  Reach reach;
+  reach.clear();
+  uint32_t seq = 0;
+  uint32_t atMs = hearPositions(reach, ORIGIN, 3, 1000, 0, seq);
+  ReachEntry e;
+  TEST_ASSERT_TRUE(summaryEntry(reach, ORIGIN, atMs + 100, e));
+  TEST_ASSERT_FALSE(e.steady);
+  atMs = hearPositions(reach, ORIGIN, 1, atMs + INTERVAL_MS, 0, seq);
+  TEST_ASSERT_TRUE(summaryEntry(reach, ORIGIN, atMs + 100, e));
+  TEST_ASSERT_TRUE(e.steady);
+  // Not once the latest is more than an interval and a half old.
+  TEST_ASSERT_TRUE(summaryEntry(reach, ORIGIN, atMs + INTERVAL_MS * 3 / 2 + 1, e));
+  TEST_ASSERT_FALSE(e.steady);
+}
+
+void test_a_relayed_copy_or_a_missed_position_starts_the_count_again() {
+  Reach reach;
+  reach.clear();
+  uint32_t seq = 0;
+  uint32_t atMs = hearPositions(reach, ORIGIN, 5, 1000, 0, seq);
+  ReachEntry e;
+  TEST_ASSERT_TRUE(summaryEntry(reach, ORIGIN, atMs, e));
+  TEST_ASSERT_TRUE(e.steady);
+  // First through a relay: not direct, and the count starts again.
+  atMs = hearPositions(reach, ORIGIN, 1, atMs + INTERVAL_MS, 1, seq);
+  TEST_ASSERT_TRUE(summaryEntry(reach, ORIGIN, atMs, e));
+  TEST_ASSERT_FALSE(e.steady);
+  atMs = hearPositions(reach, ORIGIN, 4, atMs + INTERVAL_MS, 0, seq);
+  TEST_ASSERT_TRUE(summaryEntry(reach, ORIGIN, atMs, e));
+  TEST_ASSERT_TRUE(e.steady);
+  // A position missed: two intervals between two of them.
+  atMs = hearPositions(reach, ORIGIN, 1, atMs + 2 * INTERVAL_MS, 0, seq);
+  TEST_ASSERT_TRUE(summaryEntry(reach, ORIGIN, atMs, e));
+  TEST_ASSERT_FALSE(e.steady);
+  atMs = hearPositions(reach, ORIGIN, 3, atMs + INTERVAL_MS, 0, seq);
+  TEST_ASSERT_TRUE(summaryEntry(reach, ORIGIN, atMs, e));
+  TEST_ASSERT_TRUE(e.steady);
+  // Direct, but a fix twelve seconds old on arrival is not a link to count on.
+  Reach late;
+  late.clear();
+  uint32_t lateSeq = 0;
+  atMs = hearPositions(late, ORIGIN, 5, 1000, 0, lateSeq, 12000);
+  TEST_ASSERT_TRUE(summaryEntry(late, ORIGIN, atMs, e));
+  TEST_ASSERT_FALSE(e.steady);
+}
+
+// A one-entry summary about [origin] as a car would send it.
+static size_t summaryAbout(uint32_t origin, bool steady, uint8_t flags, uint8_t* buf, size_t cap) {
+  ReachEntry e = entry(origin, 9, 300, 1, steady ? 0 : 1, 0x5E);
+  e.steady = steady;
+  return encodeReach(&e, 1, flags, buf, cap);
+}
+
+void test_a_cars_claims_come_from_its_summaries_and_age_out() {
+  Reach reach;
+  reach.clear();
+  uint32_t seq = 0, reporterSeq = 0;
+  hearPositions(reach, ORIGIN, 1, 1000, 0, seq);
+  hearPositions(reach, REPORTER, 1, 1000, 0, reporterSeq);
+  // Nothing from the reporter yet.
+  TEST_ASSERT_EQUAL(DirectClaim::UNPROVEN, reach.claim(REPORTER, ORIGIN, HOLD_MS, 2000));
+  uint8_t buf[64];
+  size_t len = summaryAbout(ORIGIN, true, REACH_STEADY, buf, sizeof(buf));
+  TEST_ASSERT_TRUE(reach.noteSummary(REPORTER, buf, len, 2000));
+  TEST_ASSERT_EQUAL(DirectClaim::STEADY, reach.claim(REPORTER, ORIGIN, HOLD_MS, 2000));
+  // Good for two and a half summary periods, then stale.
+  TEST_ASSERT_EQUAL(DirectClaim::STEADY, reach.claim(REPORTER, ORIGIN, HOLD_MS, 2000 + HOLD_MS - 10000));
+  TEST_ASSERT_EQUAL(DirectClaim::STALE, reach.claim(REPORTER, ORIGIN, HOLD_MS, 2000 + HOLD_MS + 5000));
+  // A fresh summary saying otherwise withdraws it at once.
+  len = summaryAbout(ORIGIN, false, REACH_STEADY, buf, sizeof(buf));
+  TEST_ASSERT_TRUE(reach.noteSummary(REPORTER, buf, len, 3000));
+  TEST_ASSERT_EQUAL(DirectClaim::NOT_STEADY, reach.claim(REPORTER, ORIGIN, HOLD_MS, 3000));
+  // An origin it never listed, it never claimed.
+  hearPositions(reach, 0xA00000EE, 1, 3000, 0, seq);
+  TEST_ASSERT_EQUAL(DirectClaim::NOT_STEADY, reach.claim(REPORTER, 0xA00000EE, HOLD_MS, 3000));
+  // A car gone quiet for four minutes is forgotten with its claims, and back
+  // again it has claimed nothing yet.
+  hearPositions(reach, ORIGIN, 1, 200000, 0, seq);
+  TEST_ASSERT_EQUAL(DirectClaim::UNPROVEN, reach.claim(REPORTER, ORIGIN, HOLD_MS, 1000 + REACH_KEEP_MS));
+  hearPositions(reach, REPORTER, 1, 1000 + REACH_KEEP_MS, 0, reporterSeq);
+  TEST_ASSERT_EQUAL(DirectClaim::UNPROVEN, reach.claim(REPORTER, ORIGIN, HOLD_MS, 1000 + REACH_KEEP_MS));
+}
+
+void test_only_a_build_43_summary_from_a_car_we_hear_makes_a_claim() {
+  uint8_t buf[64];
+  uint32_t seq = 0, reporterSeq = 0;
+  // A build 41 summary: no steady flag in its header, so no claim either way.
+  Reach reach;
+  reach.clear();
+  hearPositions(reach, ORIGIN, 1, 1000, 0, seq);
+  hearPositions(reach, REPORTER, 1, 1000, 0, reporterSeq);
+  size_t len = summaryAbout(ORIGIN, true, 0, buf, sizeof(buf));
+  TEST_ASSERT_TRUE(reach.noteSummary(REPORTER, buf, len, 2000));
+  TEST_ASSERT_EQUAL_UINT32(1, reach.summariesHeard());
+  TEST_ASSERT_EQUAL(DirectClaim::UNPROVEN, reach.claim(REPORTER, ORIGIN, HOLD_MS, 2000));
+  // A reporter whose positions we have not heard over LoRa has no slot to keep claims in.
+  Reach unheard;
+  unheard.clear();
+  hearPositions(unheard, ORIGIN, 1, 1000, 0, seq);
+  len = summaryAbout(ORIGIN, true, REACH_STEADY, buf, sizeof(buf));
+  TEST_ASSERT_TRUE(unheard.noteSummary(REPORTER, buf, len, 2000));
+  TEST_ASSERT_EQUAL(DirectClaim::UNPROVEN, unheard.claim(REPORTER, ORIGIN, HOLD_MS, 2000));
+  // Not a summary at all.
+  const uint8_t json[] = "{\"fl\":{}}";
+  TEST_ASSERT_FALSE(reach.noteSummary(REPORTER, json, sizeof(json), 2000));
+}
+
+// An early summary changes the claims it lists; the rest still age from the
+// car's last full summary.
+void test_an_early_summary_changes_what_it_lists_and_leaves_the_clock() {
+  Reach reach;
+  reach.clear();
+  uint32_t seq = 0, reporterSeq = 0;
+  const uint32_t OTHER = 0xA00000E1;
+  hearPositions(reach, ORIGIN, 1, 1000, 0, seq);
+  hearPositions(reach, OTHER, 1, 1000, 0, seq);
+  hearPositions(reach, REPORTER, 1, 1000, 0, reporterSeq);
+  ReachEntry both[2] = {entry(ORIGIN, 9, 300, 1, 0, 0xC1), entry(OTHER, 9, 300, 1, 0, 0xE1)};
+  both[0].steady = both[1].steady = true;
+  uint8_t buf[64];
+  size_t len = encodeReach(both, 2, REACH_STEADY, buf, sizeof(buf));
+  reach.noteSummary(REPORTER, buf, len, 2000);
+  len = summaryAbout(ORIGIN, false, REACH_EARLY | REACH_STEADY, buf, sizeof(buf));
+  reach.noteSummary(REPORTER, buf, len, 60000);
+  TEST_ASSERT_EQUAL(DirectClaim::NOT_STEADY, reach.claim(REPORTER, ORIGIN, HOLD_MS, 60000));
+  TEST_ASSERT_EQUAL(DirectClaim::STEADY, reach.claim(REPORTER, OTHER, HOLD_MS, 60000));
+  TEST_ASSERT_EQUAL(DirectClaim::STALE, reach.claim(REPORTER, OTHER, HOLD_MS, 2000 + HOLD_MS + 5000));
+}
+
+// A car that stays in range but stops sending summaries (a radio back in stock
+// mode) goes stale, then has claimed nothing, and its old claims never come
+// back as the clock the stamps run on goes round (4.7 hours).
+void test_claims_from_a_car_that_stopped_summarising_never_come_back() {
+  Reach reach;
+  reach.clear();
+  uint32_t seq = 0, reporterSeq = 0;
+  hearPositions(reach, ORIGIN, 1, 1000, 0, seq);
+  hearPositions(reach, REPORTER, 1, 1000, 0, reporterSeq);
+  uint8_t buf[64];
+  const size_t len = summaryAbout(ORIGIN, true, REACH_STEADY, buf, sizeof(buf));
+  reach.noteSummary(REPORTER, buf, len, 1000);
+  bool staleSeen = false;
+  uint32_t atMs = 1000;
+  for (uint32_t i = 0; i < 5 * 3600000 / INTERVAL_MS; i++) {
+    atMs += INTERVAL_MS;
+    reach.heard(ORIGIN, fixId(3, ++seq), 300, 0, 0xC1, INTERVAL_MS, atMs);
+    reach.heard(REPORTER, fixId(4, ++reporterSeq), 300, 0, 0xD4, INTERVAL_MS, atMs);
+    const DirectClaim c = reach.claim(REPORTER, ORIGIN, HOLD_MS, atMs);
+    if (atMs - 1000 > HOLD_MS + 1000) {
+      TEST_ASSERT_TRUE(c != DirectClaim::STEADY);
+    }
+    if (c == DirectClaim::STALE) staleSeen = true;
+    if (atMs - 1000 > 16 * 60000) {
+      TEST_ASSERT_EQUAL(DirectClaim::UNPROVEN, c);
+    }
+  }
+  TEST_ASSERT_TRUE(staleSeen);
+}
+
+// ---- Which relays go (build 43) -------------------------------------------------
+
+void test_a_relay_is_skipped_only_when_every_known_car_claims_the_origin() {
+  Reach reach;
+  reach.clear();
+  const uint32_t CAR_1 = 0xA0000011, CAR_2 = 0xA0000022, CAR_3 = 0xA0000033, CAR_4 = 0xA0000044;
+  uint32_t seq = 0;
+  hearPositions(reach, ORIGIN, 1, 1000, 0, seq);
+  hearPositions(reach, CAR_1, 1, 1000, 0, seq);
+  hearPositions(reach, CAR_2, 1, 1000, 0, seq);
+  hearPositions(reach, CAR_3, 1, 1000, 0, seq);
+  uint8_t buf[64];
+  size_t len = summaryAbout(ORIGIN, true, REACH_STEADY, buf, sizeof(buf));
+  reach.noteSummary(CAR_1, buf, len, 2000);
+  reach.noteSummary(CAR_2, buf, len, 2000);
+  len = summaryAbout(ORIGIN, false, REACH_STEADY, buf, sizeof(buf));
+  reach.noteSummary(CAR_3, buf, len, 2000);
+
+  const uint32_t steadyPair[] = {CAR_1, CAR_2};
+  TEST_ASSERT_EQUAL(RelayVerdict::SKIP, judgeRelay(reach, ORIGIN, steadyPair, 2, HOLD_MS, 3000));
+  // One car that does not hear it directly is reason enough.
+  const uint32_t withNeedy[] = {CAR_1, CAR_3, CAR_2};
+  TEST_ASSERT_EQUAL(RelayVerdict::NEEDED, judgeRelay(reach, ORIGIN, withNeedy, 3, HOLD_MS, 3000));
+  // So is one that has claimed nothing: a stock node, or a car just heard.
+  const uint32_t withSilent[] = {CAR_1, CAR_4};
+  TEST_ASSERT_EQUAL(RelayVerdict::NO_EVIDENCE, judgeRelay(reach, ORIGIN, withSilent, 2, HOLD_MS, 3000));
+  // Nobody else known is nobody to relay for.
+  TEST_ASSERT_EQUAL(RelayVerdict::SKIP, judgeRelay(reach, ORIGIN, steadyPair, 0, HOLD_MS, 3000));
+  // Stale claims count for nothing, and the strongest reason is the one given:
+  // needed, then stale, then no evidence.
+  const uint32_t lateMs = 2000 + HOLD_MS + 5000;
+  TEST_ASSERT_EQUAL(RelayVerdict::STALE, judgeRelay(reach, ORIGIN, steadyPair, 2, HOLD_MS, lateMs));
+  const uint32_t silentAndStale[] = {CAR_4, CAR_1};
+  TEST_ASSERT_EQUAL(RelayVerdict::STALE, judgeRelay(reach, ORIGIN, silentAndStale, 2, HOLD_MS, lateMs));
+  reach.noteSummary(CAR_3, buf, len, lateMs - 1000);
+  const uint32_t all[] = {CAR_4, CAR_1, CAR_3};
+  TEST_ASSERT_EQUAL(RelayVerdict::NEEDED, judgeRelay(reach, ORIGIN, all, 3, HOLD_MS, lateMs));
+}
+
+static uint32_t knownAsked = 0;
+
+static bool oneSilentCar(uint32_t origin, uint32_t* cars, size_t cap, size_t& n, void* ctx) {
+  (void)origin;
+  (void)ctx;
+  knownAsked++;
+  n = 0;
+  if (cap == 0) return false;
+  cars[n++] = 0xA00000FE;
+  return true;
+}
+
+static bool tooManyCars(uint32_t origin, uint32_t* cars, size_t cap, size_t& n, void* ctx) {
+  (void)origin;
+  (void)cars;
+  (void)cap;
+  (void)ctx;
+  knownAsked++;
+  n = 0;
+  return false;
+}
+
+static bool neverQueued(uint32_t, uint32_t, void*) { return false; }
+
+void test_the_relay_veto_never_touches_anything_but_a_touge_position() {
+  Reach reach;
+  reach.clear();
+  TxPositions noted;
+  noted.clear();
+  noted.note(ORIGIN, 100, fixId(3, 1), 1000, &neverQueued, nullptr);
+  knownAsked = 0;
+  // Text, NodeInfo, control, a summary: never noted, so stock, without even a
+  // look at who is around.
+  TEST_ASSERT_EQUAL(RelayVerdict::STOCK, relayVerdict(noted, ORIGIN, 101, reach, &oneSilentCar, nullptr, HOLD_MS, 1000));
+  // A stock position carries no identity and is never noted either.
+  noted.note(ORIGIN, 102, fixId(0, 5), 1000, &neverQueued, nullptr);
+  TEST_ASSERT_EQUAL(RelayVerdict::STOCK, relayVerdict(noted, ORIGIN, 102, reach, &oneSilentCar, nullptr, HOLD_MS, 1000));
+  TEST_ASSERT_EQUAL_UINT32(0, knownAsked);
+  // The Touge position is judged.
+  TEST_ASSERT_EQUAL(RelayVerdict::NO_EVIDENCE,
+                    relayVerdict(noted, ORIGIN, 100, reach, &oneSilentCar, nullptr, HOLD_MS, 1000));
+  TEST_ASSERT_EQUAL_UINT32(1, knownAsked);
+  // More cars around than a decision reads: nobody can be shown not to need it.
+  TEST_ASSERT_EQUAL(RelayVerdict::NO_EVIDENCE,
+                    relayVerdict(noted, ORIGIN, 100, reach, &tooManyCars, nullptr, HOLD_MS, 1000));
+  // The counts "le" reports: sk, rn, rs, rd.
+  RelaySkips skips;
+  skips.note(RelayVerdict::STOCK);
+  skips.note(RelayVerdict::SKIP);
+  skips.note(RelayVerdict::NO_EVIDENCE);
+  skips.note(RelayVerdict::NO_EVIDENCE);
+  skips.note(RelayVerdict::STALE);
+  skips.note(RelayVerdict::NEEDED);
+  TEST_ASSERT_EQUAL_UINT32(1, skips.skipped);
+  TEST_ASSERT_EQUAL_UINT32(2, skips.noEvidence);
+  TEST_ASSERT_EQUAL_UINT32(1, skips.stale);
+  TEST_ASSERT_EQUAL_UINT32(1, skips.needed);
+}
+
+// ---- Early summaries (build 43) --------------------------------------------------
+
+void test_an_origin_claimed_steady_and_quiet_two_and_a_half_intervals_goes_early() {
+  Reach reach;
+  reach.clear();
+  uint32_t seq = 0;
+  const uint32_t lastMs = hearPositions(reach, ORIGIN, 5, 1000, 0, seq);
+  uint8_t buf[233];
+  // Our summary claims it steady.
+  TEST_ASSERT_TRUE(reach.takeSummary(lastMs + 100, INTERVAL_MS, buf, sizeof(buf)) > 0);
+  // Two positions late is not yet two missed.
+  TEST_ASSERT_FALSE(reach.earlyDue(lastMs + INTERVAL_MS * 5 / 2, INTERVAL_MS, 0));
+  // Past that it is due, here at once (a random part of a quarter interval: 0).
+  const uint32_t quietMs = lastMs + INTERVAL_MS * 5 / 2 + 1;
+  TEST_ASSERT_TRUE(reach.earlyDue(quietMs, INTERVAL_MS, 0));
+  const size_t len = reach.takeEarlySummary(quietMs, INTERVAL_MS, buf, sizeof(buf));
+  size_t entries = 0;
+  uint8_t flags = 0;
+  TEST_ASSERT_TRUE(decodeReachHeader(buf, len, entries, flags));
+  TEST_ASSERT_EQUAL_UINT32(1, entries);
+  TEST_ASSERT_EQUAL_HEX8(REACH_EARLY | REACH_STEADY, flags);
+  ReachEntry e;
+  TEST_ASSERT_TRUE(decodeReachEntry(buf, len, 0, e));
+  TEST_ASSERT_EQUAL_HEX32(ORIGIN, e.origin);
+  TEST_ASSERT_FALSE(e.steady);
+  // Said, it is not said again, bar one repeat two intervals on if the origin
+  // stays quiet, in case the first was lost.
+  TEST_ASSERT_FALSE(reach.earlyDue(quietMs + INTERVAL_MS, INTERVAL_MS, 0));
+  TEST_ASSERT_TRUE(reach.earlyDue(quietMs + 2 * INTERVAL_MS, INTERVAL_MS, 0));
+  TEST_ASSERT_TRUE(reach.takeEarlySummary(quietMs + 2 * INTERVAL_MS, INTERVAL_MS, buf, sizeof(buf)) > 0);
+  TEST_ASSERT_FALSE(reach.earlyDue(quietMs + 10 * INTERVAL_MS, INTERVAL_MS, 0));
+  TEST_ASSERT_EQUAL_UINT32(2, reach.earlySent());
+  TEST_ASSERT_EQUAL_UINT32(3, reach.summariesSent());
+}
+
+void test_early_summaries_keep_an_interval_apart_and_stop_once_the_origin_is_heard() {
+  Reach reach;
+  reach.clear();
+  const uint32_t ORIGIN_B = ORIGIN + 1;
+  uint32_t seq = 0, seqB = 0;
+  // The first every 5 s from 1 s, the last at 21 s; the second from 5 s, the
+  // last at 25 s. In time order: the table's clock only goes forward.
+  for (uint32_t i = 0; i < 5; i++) {
+    hearPositions(reach, ORIGIN, 1, 1000 + i * INTERVAL_MS, 0, seq);
+    hearPositions(reach, ORIGIN_B, 1, 5000 + i * INTERVAL_MS, 0, seqB);
+  }
+  uint8_t buf[233];
+  TEST_ASSERT_TRUE(reach.takeSummary(25100, INTERVAL_MS, buf, sizeof(buf)) > 0);
+  // The first goes quiet: due a random part of a quarter interval later, a
+  // draw that holds once made.
+  TEST_ASSERT_FALSE(reach.earlyDue(33501, INTERVAL_MS, 1000));
+  TEST_ASSERT_FALSE(reach.earlyDue(34500, INTERVAL_MS, 7));
+  TEST_ASSERT_TRUE(reach.earlyDue(34501, INTERVAL_MS, 7));
+  size_t len = reach.takeEarlySummary(34501, INTERVAL_MS, buf, sizeof(buf));
+  size_t entries = 0;
+  uint8_t flags = 0;
+  ReachEntry e;
+  TEST_ASSERT_TRUE(decodeReachHeader(buf, len, entries, flags));
+  TEST_ASSERT_EQUAL_UINT32(1, entries);
+  TEST_ASSERT_TRUE(decodeReachEntry(buf, len, 0, e));
+  TEST_ASSERT_EQUAL_HEX32(ORIGIN, e.origin);
+  // The second goes quiet at 37.5 s, but waits out an interval from the first.
+  TEST_ASSERT_FALSE(reach.earlyDue(37501, INTERVAL_MS, 0));
+  TEST_ASSERT_FALSE(reach.earlyDue(39500, INTERVAL_MS, 0));
+  TEST_ASSERT_TRUE(reach.earlyDue(39501, INTERVAL_MS, 0));
+  len = reach.takeEarlySummary(39501, INTERVAL_MS, buf, sizeof(buf));
+  TEST_ASSERT_TRUE(decodeReachHeader(buf, len, entries, flags));
+  TEST_ASSERT_EQUAL_UINT32(1, entries);
+  TEST_ASSERT_TRUE(decodeReachEntry(buf, len, 0, e));
+  TEST_ASSERT_EQUAL_HEX32(ORIGIN_B, e.origin);
+  // The first comes back through a relay: its early summary worked, so no
+  // repeat for it. The second, still quiet, gets its one repeat.
+  reach.heard(ORIGIN, fixId(3, ++seq), 300, 1, 0x77, INTERVAL_MS, 40000);
+  TEST_ASSERT_FALSE(reach.earlyDue(49500, INTERVAL_MS, 0));
+  TEST_ASSERT_TRUE(reach.earlyDue(49501, INTERVAL_MS, 0));
+  len = reach.takeEarlySummary(49501, INTERVAL_MS, buf, sizeof(buf));
+  TEST_ASSERT_TRUE(decodeReachHeader(buf, len, entries, flags));
+  TEST_ASSERT_EQUAL_UINT32(1, entries);
+  TEST_ASSERT_TRUE(decodeReachEntry(buf, len, 0, e));
+  TEST_ASSERT_EQUAL_HEX32(ORIGIN_B, e.origin);
+  TEST_ASSERT_EQUAL_UINT32(3, reach.earlySent());
+}
+
+void test_an_origin_claimed_steady_now_coming_through_relays_goes_early() {
+  Reach reach;
+  reach.clear();
+  uint32_t seq = 0;
+  uint32_t atMs = hearPositions(reach, ORIGIN, 5, 1000, 0, seq);
+  uint8_t buf[233];
+  TEST_ASSERT_TRUE(reach.takeSummary(atMs + 100, INTERVAL_MS, buf, sizeof(buf)) > 0);
+  // One copy first through a relay can be a lost direct copy.
+  atMs = hearPositions(reach, ORIGIN, 1, atMs + INTERVAL_MS, 1, seq);
+  TEST_ASSERT_FALSE(reach.earlyDue(atMs + 100, INTERVAL_MS, 0));
+  // Two in a row is the direct link gone.
+  atMs = hearPositions(reach, ORIGIN, 1, atMs + INTERVAL_MS, 1, seq);
+  TEST_ASSERT_TRUE(reach.earlyDue(atMs + 100, INTERVAL_MS, 0));
+  // Heard directly again before it went: nothing to say after all.
+  atMs = hearPositions(reach, ORIGIN, 1, atMs + INTERVAL_MS, 0, seq);
+  TEST_ASSERT_FALSE(reach.earlyDue(atMs + 100, INTERVAL_MS, 0));
+  // Lost again; this time our regular summary goes first and says it, so the
+  // early one is dropped.
+  atMs = hearPositions(reach, ORIGIN, 2, atMs + INTERVAL_MS, 1, seq);
+  TEST_ASSERT_TRUE(reach.earlyDue(atMs + 100, INTERVAL_MS, 0));
+  ReachEntry e;
+  TEST_ASSERT_TRUE(summaryEntry(reach, ORIGIN, atMs + 150, e));
+  TEST_ASSERT_FALSE(e.steady);
+  TEST_ASSERT_FALSE(reach.earlyDue(atMs + 200, INTERVAL_MS, 0));
+  TEST_ASSERT_EQUAL_UINT32(0, reach.earlySent());
+}
+
+// ---- The "le" report -----------------------------------------------------------
+
+void test_the_le_report_carries_the_relays_skipped_and_why_the_rest_went() {
+  Reach reach;
+  reach.clear();
+  RelayPrefs prefs;
+  prefs.clear();
+  RelaySkips skips;
+  skips.skipped = 6;
+  skips.noEvidence = 7;
+  skips.stale = 8;
+  skips.needed = 9;
+  char out[233];
+  TEST_ASSERT_TRUE(formatLoraReach(reach, prefs, skips, false, out, sizeof(out)) > 0);
+  TEST_ASSERT_EQUAL_STRING("le st=0 sh=0 pg=0 pw=0 se=0 sk=6 rn=7 rs=8 rd=9", out);
+  TEST_ASSERT_TRUE(formatLoraReach(reach, prefs, skips, true, out, sizeof(out)) > 0);
+  TEST_ASSERT_EQUAL_STRING("{\"le\":{\"st\":0,\"sh\":0,\"pg\":0,\"pw\":0,\"se\":0,\"sk\":6,\"rn\":7,\"rs\":8,\"rd\":9}}", out);
+  skips.skipped = skips.noEvidence = skips.stale = skips.needed = 0xFFFFFFFF;
+  TEST_ASSERT_TRUE(formatLoraReach(reach, prefs, skips, true, out, sizeof(out)) > 0);
 }
 
 // ---- The relay decision --------------------------------------------------------
@@ -208,7 +656,6 @@ static const uint32_t SELF = 0xA00000B1;
 static const uint8_t SELF_BYTE = 0xB1;
 static const uint32_t FRONT = 0xA000000A;
 static const uint32_t REAR = 0xA000000C;
-static const uint32_t HOLD_MS = 150000;
 
 void test_a_summary_that_got_the_origin_through_us_grants_early_relaying() {
   RelayPrefs prefs;
@@ -290,17 +737,16 @@ void test_a_full_set_of_grants_gives_up_the_one_lapsing_soonest() {
 
 // ---- A convoy ------------------------------------------------------------------
 
-// SHORT_FAST-like timing: 58 ms a packet and 10 ms contention slots. An early
-// relay goes within 16 slots; an ordinary one waits those 16 and up to 64 more
-// (RadioInterface::getTxDelayMsecWeighted: 2 x CWmax slots, then 2^CW).
-static const uint32_t AIR_MS = 58;
+// SHORT_FAST-like timing: 66 ms a packet (an unsigned position) and 10 ms
+// contention slots. An early relay goes within 16 slots; an ordinary one waits
+// those 16 and up to 64 more (RadioInterface::getTxDelayMsecWeighted: 2 x CWmax
+// slots, then 2^CW).
+static const uint32_t AIR_MS = 66;
 static const uint32_t SLOT_MS = 10;
 static const uint8_t HOP_LIMIT = 3;  // Meshtastic's default
-static const uint32_t INTERVAL_MS = 5000;
 // The module's figures at a 5 s interval (noteReachSummary).
 static const uint32_t WE_HEAR_MS = 3 * INTERVAL_MS;
 static const uint32_t MAX_SINCE_S = 3 * INTERVAL_MS / 1000;
-static const uint32_t CONVOY_HOLD_MS = REACH_EVERY_POSITIONS * INTERVAL_MS * 5 / 2;
 
 struct Car {
   uint32_t id = 0;
@@ -409,7 +855,7 @@ struct Convoy {
         for (size_t r = 0; r < cars.size(); r++) {
           const Copy& c = lastGot[i][r];
           if (r == i || !c.got) continue;
-          cars[r].reach.heard(cars[i].id, fix, c.atMs - nowMs, c.hops, c.relay, c.atMs);
+          cars[r].reach.heard(cars[i].id, fix, c.atMs - nowMs, c.hops, c.relay, INTERVAL_MS, c.atMs);
           if (c.atMs > lastArrival) lastArrival = c.atMs;
         }
         // The next car sends once this flood is over: no car hears anything
@@ -427,7 +873,7 @@ struct Convoy {
     for (size_t i = 0; i < cars.size(); i++) {
       if (!cars[i].up) continue;
       uint8_t buf[233];
-      const size_t len = cars[i].reach.takeSummary(nowMs, buf, sizeof(buf));
+      const size_t len = cars[i].reach.takeSummary(nowMs, INTERVAL_MS, buf, sizeof(buf));
       if (len == 0) continue;
       const std::vector<Copy> got = flood(i, false, ignored);
       for (size_t r = 0; r < cars.size(); r++) {
@@ -440,11 +886,11 @@ struct Convoy {
 
   void weigh(size_t r, uint32_t reporter, const uint8_t* buf, size_t len) {
     Car& car = cars[r];
-    car.reach.noteSummaryHeard();
+    car.reach.noteSummary(reporter, buf, len, nowMs);
     ReachEntry e;
     for (size_t k = 0; decodeReachEntry(buf, len, k, e); k++) {
       const bool weHearIt = car.reach.heardWithin(e.origin, WE_HEAR_MS, nowMs);
-      car.prefs.consider(e, reporter, car.id, relayByte(car.id), weHearIt, MAX_SINCE_S, CONVOY_HOLD_MS, nowMs);
+      car.prefs.consider(e, reporter, car.id, relayByte(car.id), weHearIt, MAX_SINCE_S, HOLD_MS, nowMs);
     }
   }
 };
@@ -465,7 +911,7 @@ void test_a_strung_out_convoy_reports_which_origins_reach_the_far_end() {
   convoy.positions();
 
   uint8_t buf[233];
-  const size_t len = convoy.cars[0].reach.takeSummary(convoy.nowMs, buf, sizeof(buf));
+  const size_t len = convoy.cars[0].reach.takeSummary(convoy.nowMs, INTERVAL_MS, buf, sizeof(buf));
   TEST_ASSERT_TRUE(len > 0);
   uint32_t lastAgeMs = 0;
   for (size_t i = 1; i <= 4; i++) {
@@ -573,7 +1019,7 @@ void test_stale_evidence_returns_every_car_to_ordinary_forwarding() {
   TEST_ASSERT_TRUE(preferredSomewhere >= 6);
 
   // No summaries get through for longer than a grant holds.
-  const uint32_t lapseAt = convoy.nowMs + CONVOY_HOLD_MS;
+  const uint32_t lapseAt = convoy.nowMs + HOLD_MS;
   while ((int32_t)(convoy.nowMs - lapseAt) <= 0) {
     convoy.positions();
     // Positions still cross the whole line meanwhile.
@@ -588,15 +1034,369 @@ void test_stale_evidence_returns_every_car_to_ordinary_forwarding() {
   TEST_ASSERT_EQUAL_UINT8(2, convoy.lastGot[3][0].hops);
 }
 
+// ---- A ride with relays nobody needs skipped (build 43) --------------------------
+//
+// The same flood with the module's build 43 rules on every Touge car: each
+// notes a position it may relay as Meshtastic hands it over (the module runs
+// before RoutingModule), and relays it only if relayVerdict says a car it knows
+// needs it. Every car keeps NodeDB's last heard per car, which is the cars it
+// knows; sends its summary when told; and sends an early one when Reach says
+// it is due, checked every 100 ms as the module checks every pass. The ride's
+// clock stands still during a flood: cars send a share of the interval apart,
+// and the ages summaries carry are the flood's own.
+
+struct SimRider {
+  uint32_t id = 0;
+  int x = 0;
+  bool up = true;
+  bool touge = true;  // false: a stock node, positions with no identity and no summaries
+  uint32_t seq = 0;
+  Reach reach;
+  TxPositions noted;
+  RelaySkips skips;
+  std::vector<uint32_t> lastHeardMs;  // NodeDB's last_heard for each rider; 0 never
+  uint32_t lastEarlyMs = 0;
+};
+
+struct Ride;
+struct KnownBy {
+  const Ride* ride;
+  size_t self;
+};
+static bool knownOnRide(uint32_t origin, uint32_t* cars, size_t cap, size_t& n, void* ctx);
+
+struct Ride {
+  std::vector<SimRider> riders;
+  uint32_t nowMs = 1000;
+  uint32_t rng = 11;
+  uint32_t nextPacketId = 1;
+  uint32_t positionRelays = 0;
+  uint32_t summaryRelays = 0;
+  // Per origin, who got its last position, and how.
+  std::vector<std::vector<Copy>> lastGot;
+
+  explicit Ride(const std::vector<int>& xs) {
+    for (size_t i = 0; i < xs.size(); i++) {
+      SimRider r;
+      r.id = 0xA0000000u | (uint32_t)(0x11 * (i + 1));
+      r.x = xs[i];
+      r.reach.clear();
+      r.noted.clear();
+      r.lastHeardMs.assign(xs.size(), 0);
+      riders.push_back(r);
+    }
+    lastGot.assign(riders.size(), std::vector<Copy>(riders.size()));
+  }
+
+  uint32_t random() {
+    rng = rng * 1103515245u + 12345u;
+    return rng >> 8;
+  }
+  bool hears(size_t a, size_t b) const {
+    return a != b && riders[a].up && riders[b].up && abs(riders[a].x - riders[b].x) <= 1;
+  }
+
+  // One broadcast from [origin], flooded: a position when [fix] is set, a
+  // summary of [len] bytes otherwise.
+  std::vector<Copy> flood(size_t origin, const FixId* fix, const uint8_t* summary, size_t len) {
+    const size_t n = riders.size();
+    const uint32_t originId = riders[origin].id;
+    const uint32_t packetId = nextPacketId++;
+    std::vector<Copy> got(n);
+    std::vector<uint32_t> relayAt(n, UINT32_MAX);
+    std::vector<uint8_t> relayHops(n, 0);
+    got[origin].got = true;
+    size_t sender = origin;
+    uint32_t txAt = 0;
+    uint8_t hopLimit = HOP_LIMIT;
+    for (;;) {
+      for (size_t r = 0; r < n; r++) {
+        if (r == origin || !hears(sender, r)) continue;
+        if (got[r].got) {
+          // Another car's copy before ours went: Meshtastic drops the queued one.
+          if (relayAt[r] != UINT32_MAX && relayAt[r] >= txAt) relayAt[r] = UINT32_MAX;
+          continue;
+        }
+        SimRider& rider = riders[r];
+        got[r].got = true;
+        got[r].atMs = txAt + AIR_MS;
+        got[r].hops = (uint8_t)(HOP_LIMIT - hopLimit);
+        got[r].relay = Convoy::relayByte(riders[sender].id);
+        rider.lastHeardMs[origin] = nowMs;
+        if (fix != nullptr) {
+          rider.reach.heard(originId, *fix, got[r].atMs, got[r].hops, got[r].relay, INTERVAL_MS, nowMs);
+        } else if (rider.touge) {
+          rider.reach.noteSummary(originId, summary, len, nowMs);
+        }
+        if (hopLimit == 0) continue;
+        bool relay = true;
+        if (fix != nullptr && rider.touge) {
+          rider.noted.note(originId, packetId, *fix, nowMs, &neverQueued, nullptr);
+          KnownBy known = {this, r};
+          const RelayVerdict verdict =
+              relayVerdict(rider.noted, originId, packetId, rider.reach, &knownOnRide, &known, HOLD_MS, nowMs);
+          rider.skips.note(verdict);
+          relay = verdict != RelayVerdict::SKIP;
+        }
+        if (relay) {
+          relayAt[r] = txAt + AIR_MS + 16 * SLOT_MS + (random() % 64) * SLOT_MS;
+          relayHops[r] = (uint8_t)(hopLimit - 1);
+        }
+      }
+      size_t next = n;
+      for (size_t r = 0; r < n; r++) {
+        if (relayAt[r] != UINT32_MAX && (next == n || relayAt[r] < relayAt[next])) next = r;
+      }
+      if (next == n) break;
+      sender = next;
+      txAt = relayAt[next];
+      hopLimit = relayHops[next];
+      relayAt[next] = UINT32_MAX;
+      if (fix != nullptr) {
+        positionRelays++;
+      } else {
+        summaryRelays++;
+      }
+    }
+    return got;
+  }
+
+  void sendPosition(size_t i) {
+    SimRider& rider = riders[i];
+    FixId fix;
+    fix.session = rider.touge ? (uint16_t)(i + 1) : 0;
+    fix.seq = ++rider.seq;
+    const uint64_t utcMs = 1790000000000ull + nowMs;
+    fix.fixSec = (uint32_t)(utcMs / 1000);
+    fix.fixMs = (uint16_t)(utcMs % 1000);
+    lastGot[i] = flood(i, &fix, nullptr, 0);
+  }
+
+  void sendSummary(size_t i, bool early) {
+    uint8_t buf[233];
+    Reach& reach = riders[i].reach;
+    const size_t len = early ? reach.takeEarlySummary(nowMs, INTERVAL_MS, buf, sizeof(buf))
+                             : reach.takeSummary(nowMs, INTERVAL_MS, buf, sizeof(buf));
+    if (len == 0) return;
+    if (early) riders[i].lastEarlyMs = nowMs;
+    flood(i, nullptr, buf, len);
+  }
+
+  // Every Touge car's regular summary.
+  void summaries() {
+    for (size_t i = 0; i < riders.size(); i++) {
+      if (riders[i].up && riders[i].touge) sendSummary(i, false);
+    }
+  }
+
+  void advanceTo(uint32_t atMs) {
+    while ((int32_t)(atMs - nowMs) > 0) {
+      nowMs += atMs - nowMs < 100 ? atMs - nowMs : 100;
+      for (size_t i = 0; i < riders.size(); i++) {
+        SimRider& rider = riders[i];
+        if (rider.up && rider.touge && rider.reach.earlyDue(nowMs, INTERVAL_MS, random())) sendSummary(i, true);
+      }
+    }
+  }
+
+  // One interval: every car sends its position, a share of it apart.
+  void round() {
+    const uint32_t start = nowMs;
+    const uint32_t share = INTERVAL_MS / (uint32_t)riders.size();
+    for (size_t i = 0; i < riders.size(); i++) {
+      advanceTo(start + (uint32_t)i * share);
+      if (riders[i].up) sendPosition(i);
+    }
+    advanceTo(start + INTERVAL_MS);
+  }
+
+  bool everyoneGotEveryone() const {
+    for (size_t o = 0; o < riders.size(); o++) {
+      for (size_t r = 0; r < riders.size(); r++) {
+        if (r == o || !riders[o].up || !riders[r].up) continue;
+        if (!lastGot[o][r].got) return false;
+      }
+    }
+    return true;
+  }
+
+  uint32_t skipped() const {
+    uint32_t n = 0;
+    for (size_t i = 0; i < riders.size(); i++) n += riders[i].skips.skipped;
+    return n;
+  }
+};
+
+// The cars [ctx]'s rider knows: every other rider heard within RIDER_DROP_MS,
+// as the module reads NodeDB.
+static bool knownOnRide(uint32_t origin, uint32_t* cars, size_t cap, size_t& n, void* ctx) {
+  const KnownBy* by = (const KnownBy*)ctx;
+  const SimRider& me = by->ride->riders[by->self];
+  n = 0;
+  for (size_t i = 0; i < by->ride->riders.size(); i++) {
+    const SimRider& other = by->ride->riders[i];
+    if (i == by->self || other.id == origin || me.lastHeardMs[i] == 0) continue;
+    if ((uint32_t)(by->ride->nowMs - me.lastHeardMs[i]) >= RIDER_DROP_MS) continue;
+    if (n == cap) return false;
+    cars[n++] = other.id;
+  }
+  return true;
+}
+
+// The bench: three cars that all hear each other. Until their claims are in,
+// managed flooding relays every position once (bar the very first, which
+// nobody else was known to need); after the first summaries, never, and every
+// car still gets every position.
+void test_on_the_bench_position_relays_stop_once_the_claims_are_in() {
+  Ride ride({0, 0, 0});
+  for (int i = 0; i < 4; i++) ride.round();
+  TEST_ASSERT_TRUE(ride.positionRelays >= 10);
+  ride.summaries();
+  const uint32_t relaysBefore = ride.positionRelays;
+  for (int i = 0; i < 20; i++) {
+    ride.round();
+    TEST_ASSERT_TRUE(ride.everyoneGotEveryone());
+  }
+  TEST_ASSERT_EQUAL_UINT32(relaysBefore, ride.positionRelays);
+  // The two cars that got each position both skipped their relay.
+  TEST_ASSERT_TRUE(ride.skipped() >= 20 * 3 * 2);
+  // The summaries themselves relayed as ever.
+  TEST_ASSERT_TRUE(ride.summaryRelays >= 3);
+}
+
+// Missing or stale evidence keeps stock relaying: with no summaries every
+// position is relayed; claims older than two and a half summary periods count
+// for nothing; and a node that never claims anything, a stock one here, keeps
+// every relay going.
+void test_missing_or_stale_claims_keep_stock_relaying() {
+  Ride none({0, 0, 0});
+  for (int i = 0; i < 10; i++) none.round();
+  TEST_ASSERT_TRUE(none.positionRelays >= 28);
+  for (size_t i = 0; i < 3; i++) TEST_ASSERT_TRUE(none.riders[i].skips.noEvidence >= 18);
+
+  Ride stale({0, 0, 0});
+  for (int i = 0; i < 4; i++) stale.round();
+  stale.summaries();
+  uint32_t before = stale.positionRelays;
+  for (int i = 0; i < 26; i++) stale.round();
+  TEST_ASSERT_EQUAL_UINT32(before, stale.positionRelays);
+  for (int i = 0; i < 8; i++) stale.round();
+  before = stale.positionRelays;
+  for (int i = 0; i < 5; i++) stale.round();
+  TEST_ASSERT_EQUAL_UINT32(before + 5 * 3, stale.positionRelays);
+  TEST_ASSERT_TRUE(stale.riders[0].skips.stale > 0);
+
+  Ride mixed({0, 0, 0, 0});
+  mixed.riders[3].touge = false;
+  for (int i = 0; i < 4; i++) mixed.round();
+  mixed.summaries();
+  before = mixed.positionRelays;
+  const uint32_t skippedBefore = mixed.skipped();
+  for (int i = 0; i < 10; i++) mixed.round();
+  TEST_ASSERT_EQUAL_UINT32(before + 10 * 4, mixed.positionRelays);
+  TEST_ASSERT_EQUAL_UINT32(skippedBefore, mixed.skipped());
+}
+
+// A strung-out convoy: the front car, two cars side by side, the rear car. The
+// middle pair hear everyone and the ends hear only the middle. Once the claims
+// are in the middle cars' positions go unrelayed, since everyone hears them;
+// the ends' still go through one of the pair, once each; and the far car still
+// gets every car.
+void test_a_strung_out_convoy_still_carries_every_origin_to_the_far_car() {
+  Ride ride({0, 1, 1, 2});
+  for (int i = 0; i < 4; i++) ride.round();
+  ride.summaries();
+  const uint32_t before = ride.positionRelays;
+  for (int i = 0; i < 10; i++) {
+    ride.round();
+    TEST_ASSERT_TRUE(ride.everyoneGotEveryone());
+    TEST_ASSERT_EQUAL_UINT8(1, ride.lastGot[0][3].hops);
+    TEST_ASSERT_EQUAL_UINT8(1, ride.lastGot[3][0].hops);
+  }
+  TEST_ASSERT_EQUAL_UINT32(before + 10 * 2, ride.positionRelays);
+}
+
+// Three cars that all hear each other, with position relays stopped; the
+// middle car drifts out of the front car's range while the third still hears
+// both. The middle car goes two and a half intervals without the front, says
+// so in an early summary, and the third car relays the front's very next
+// position to it: back within an interval of the early summary, two positions
+// missed, and no regular summary needed. The front, which lost the middle car
+// too, does the same the other way.
+void test_when_the_middle_car_drifts_out_of_the_fronts_range_relays_come_back_within_an_interval() {
+  Ride ride({0, 1, 1});
+  const size_t FRONT_CAR = 0, MIDDLE = 1, THIRD = 2;
+  for (int i = 0; i < 4; i++) ride.round();
+  ride.summaries();
+  for (int i = 0; i < 3; i++) ride.round();
+  uint32_t regularSent[3];
+  for (size_t i = 0; i < 3; i++) regularSent[i] = ride.riders[i].reach.summariesSent() - ride.riders[i].reach.earlySent();
+
+  ride.riders[MIDDLE].x = 2;
+  uint32_t missed = 0;
+  bool back = false;
+  for (int round = 0; round < 4 && !back; round++) {
+    const uint32_t frontSentMs = ride.nowMs;
+    ride.round();
+    const Copy& got = ride.lastGot[FRONT_CAR][MIDDLE];
+    if (!got.got) {
+      missed++;
+      continue;
+    }
+    back = true;
+    TEST_ASSERT_EQUAL_UINT8(1, got.hops);
+    TEST_ASSERT_EQUAL_HEX8(Convoy::relayByte(ride.riders[THIRD].id), got.relay);
+    TEST_ASSERT_EQUAL_UINT32(1, ride.riders[MIDDLE].reach.earlySent());
+    TEST_ASSERT_TRUE(frontSentMs - ride.riders[MIDDLE].lastEarlyMs <= INTERVAL_MS);
+  }
+  TEST_ASSERT_TRUE(back);
+  TEST_ASSERT_EQUAL_UINT32(2, missed);
+  TEST_ASSERT_TRUE(ride.lastGot[MIDDLE][FRONT_CAR].got);
+  TEST_ASSERT_EQUAL_UINT8(1, ride.lastGot[MIDDLE][FRONT_CAR].hops);
+  TEST_ASSERT_EQUAL_UINT32(1, ride.riders[FRONT_CAR].reach.earlySent());
+  for (size_t i = 0; i < 3; i++) {
+    TEST_ASSERT_EQUAL_UINT32(regularSent[i], ride.riders[i].reach.summariesSent() - ride.riders[i].reach.earlySent());
+  }
+  // From here the two hear each other through the third car: no repeats, and
+  // nothing more to say early.
+  for (int i = 0; i < 5; i++) {
+    ride.round();
+    TEST_ASSERT_TRUE(ride.everyoneGotEveryone());
+  }
+  TEST_ASSERT_EQUAL_UINT32(1, ride.riders[MIDDLE].reach.earlySent());
+  TEST_ASSERT_EQUAL_UINT32(1, ride.riders[FRONT_CAR].reach.earlySent());
+
+  // Back in range: once the next summaries claim it again, the relays stop.
+  ride.riders[MIDDLE].x = 1;
+  for (int i = 0; i < 5; i++) ride.round();
+  ride.summaries();
+  const uint32_t before = ride.positionRelays;
+  for (int i = 0; i < 5; i++) ride.round();
+  TEST_ASSERT_EQUAL_UINT32(before, ride.positionRelays);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_a_summary_round_trips);
+  RUN_TEST(test_the_steady_and_early_flags_round_trip);
   RUN_TEST(test_ages_go_in_quarter_seconds);
   RUN_TEST(test_an_entry_reads_as_the_app_shows_cars);
   RUN_TEST(test_the_newest_fix_per_origin_is_kept);
   RUN_TEST(test_a_long_list_goes_on_in_the_next_summary);
   RUN_TEST(test_an_origin_not_heard_for_4_minutes_is_forgotten);
   RUN_TEST(test_a_full_table_forgets_the_origin_heard_longest_ago);
+  RUN_TEST(test_an_origin_is_claimed_steady_after_four_direct_positions_in_a_row);
+  RUN_TEST(test_a_relayed_copy_or_a_missed_position_starts_the_count_again);
+  RUN_TEST(test_a_cars_claims_come_from_its_summaries_and_age_out);
+  RUN_TEST(test_only_a_build_43_summary_from_a_car_we_hear_makes_a_claim);
+  RUN_TEST(test_an_early_summary_changes_what_it_lists_and_leaves_the_clock);
+  RUN_TEST(test_claims_from_a_car_that_stopped_summarising_never_come_back);
+  RUN_TEST(test_a_relay_is_skipped_only_when_every_known_car_claims_the_origin);
+  RUN_TEST(test_the_relay_veto_never_touches_anything_but_a_touge_position);
+  RUN_TEST(test_an_origin_claimed_steady_and_quiet_two_and_a_half_intervals_goes_early);
+  RUN_TEST(test_early_summaries_keep_an_interval_apart_and_stop_once_the_origin_is_heard);
+  RUN_TEST(test_an_origin_claimed_steady_now_coming_through_relays_goes_early);
+  RUN_TEST(test_the_le_report_carries_the_relays_skipped_and_why_the_rest_went);
   RUN_TEST(test_a_summary_that_got_the_origin_through_us_grants_early_relaying);
   RUN_TEST(test_only_evidence_of_delivery_through_us_counts);
   RUN_TEST(test_worse_delivery_through_us_ends_it_at_once);
@@ -605,5 +1405,9 @@ int main(int, char**) {
   RUN_TEST(test_the_cars_that_carry_an_origin_along_the_convoy_are_preferred);
   RUN_TEST(test_the_rear_car_keeps_arriving_at_the_front_when_the_preferred_relay_drops_out);
   RUN_TEST(test_stale_evidence_returns_every_car_to_ordinary_forwarding);
+  RUN_TEST(test_on_the_bench_position_relays_stop_once_the_claims_are_in);
+  RUN_TEST(test_missing_or_stale_claims_keep_stock_relaying);
+  RUN_TEST(test_a_strung_out_convoy_still_carries_every_origin_to_the_far_car);
+  RUN_TEST(test_when_the_middle_car_drifts_out_of_the_fronts_range_relays_come_back_within_an_interval);
   return UNITY_END();
 }

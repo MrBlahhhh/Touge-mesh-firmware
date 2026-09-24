@@ -1,0 +1,33 @@
+--- a/src/mesh/NextHopRouter.h
++++ b/src/mesh/NextHopRouter.h
+@@ -237,3 +237,8 @@
+      *  @return true if we did rebroadcast */
+     bool perhapsRebroadcast(const meshtastic_MeshPacket *p) override;
+ };
++
++/// Touge (core-patches/0013): true to not relay p, a Touge position whose origin every other car the fast lane knows
++/// already hears steadily direct, by their own fresh reach summaries. False for anything else. Null unless the fast
++/// lane sets it.
++extern bool (*tougeRelaySkipHook)(const meshtastic_MeshPacket *p);
+--- a/src/mesh/NextHopRouter.cpp
++++ b/src/mesh/NextHopRouter.cpp
+@@ -26,6 +26,9 @@
+ 
+ NextHopRouter::NextHopRouter() {}
+ 
++// Touge (core-patches/0013): see NextHopRouter.h.
++bool (*tougeRelaySkipHook)(const meshtastic_MeshPacket *p) = nullptr;
++
+ bool NextHopRouter::relayOpaquePacket(const meshtastic_MeshPacket *p)
+ {
+     // Opaque traffic is never admitted to PacketHistory, NodeDB, modules, phone, MQTT, or ACK
+@@ -271,6 +274,9 @@
+                 // on-wire field to fix. M1/M2 instead shrink the blast radius by reducing how often an
+                 // ambiguous next_hop byte is ever learned (sniffReceived) or originated (getNextHop).
+                 if (p->next_hop == NO_NEXT_HOP_PREFERENCE || p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum())) {
++                    // Touge (core-patches/0013): a Touge position nobody the fast lane knows needs relayed.
++                    if (tougeRelaySkipHook && tougeRelaySkipHook(p))
++                        return false;
+                     meshtastic_MeshPacket *tosend = packetPool.allocCopy(*p); // keep a copy because we will be sending it
+                     if (!tosend)
+                         return true;

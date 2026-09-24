@@ -1,11 +1,14 @@
 // Host tests for LoRa positions (SCALE-PLAN 5b and 5c): the identity they
 // carry, and one position per car in the queues. The interval they go out at is
-// measured load now (5d, test_loraload).
+// measured load now (5d, test_loraload). From build 43, how ours goes out:
+// ahead of relays, and unsigned.
 //
-// The TX queue here is a plain FIFO driven by the same rules the core patch
-// applies (core-patches/0010): place() first, then the stock capacity check.
+// The TX queue in the 5c tests is a plain FIFO driven by the same rules the
+// core patch applies (core-patches/0010): place() first, then the stock
+// capacity check.
 
 #include <unity.h>
+#include <algorithm>
 #include <string.h>
 #include <vector>
 #include "lorapos.h"
@@ -296,6 +299,318 @@ void test_under_a_backlog_the_rear_car_keeps_its_turn() {
   TEST_ASSERT_TRUE(busySent > 300 / 7);
 }
 
+// ---- Our position ahead of relays (build 43) -----------------------------------
+//
+// One radio's LoRa TX path as Meshtastic runs it (RadioLibInterface.cpp): the
+// queue in CompareMeshPacketFunc's order; one notification slot for the
+// transmit timer, which notifyLater does not overwrite; a relay at the head
+// drawing its SNR-weighted delay (getTxDelayMsecWeighted, 128 ms plus up to
+// 2 s at the strong signals of a bench) and a packet of ours the contention
+// delay (getTxDelayMsec, 0-56 ms); nothing sent while receiving or sending; and
+// the timer re-armed for the head after every reception and transmission, as
+// the interrupt takes the slot. Build 43 is OWN_POSITION_PRIORITY and, for our
+// position arriving at the head, a pending timer pulled in to its own
+// contention delay (core-patches/0014, notifySooner).
+
+namespace txpath {
+
+const uint32_t AIR_MS = 66;  // an unsigned position on SHORT_FAST
+const uint32_t SLOT_MS = 8;  // RadioInterface::computeSlotTimeMsec on SHORT_FAST
+const uint8_t CW_MIN = 3;
+const uint8_t CW_MAX = 8;
+const uint32_t ROUND_MS = 5000;
+
+struct Packet {
+  uint32_t id = 0;
+  bool ours = false;
+  uint8_t priority = 0;
+  uint32_t queuedMs = 0;
+  uint8_t cw = 0;  // a relay's contention window, from the SNR it was heard at
+};
+
+// CompareMeshPacketFunc (MeshPacketQueue.cpp) without the late window: the
+// higher priority first, and at equal priority another car's before ours.
+bool goesBefore(const Packet& a, const Packet& b) {
+  if (a.priority != b.priority) return a.priority > b.priority;
+  return !a.ours && b.ours;
+}
+
+struct Radio {
+  bool build43 = false;
+  uint32_t rng = 1;
+  std::vector<Packet> queue;
+  bool timerArmed = false;
+  uint32_t timerAtMs = 0;
+  uint32_t receivingUntilMs = 0;
+  bool sending = false;
+  uint32_t sentAtMs = 0;
+  std::vector<uint32_t> ownWaits;
+  uint32_t relaysQueued = 0;
+  uint32_t relaysSent = 0;
+  uint32_t ownLate = 0;
+  uint32_t lastOwnId = 0;
+  uint32_t nextId = 1;
+
+  uint32_t random() {
+    rng = rng * 1103515245u + 12345u;
+    return rng >> 8;
+  }
+  uint32_t contentionMs() { return (random() % (1u << CW_MIN)) * SLOT_MS; }
+  uint32_t headDelayMs() {
+    const Packet& head = queue.front();
+    if (head.ours) return contentionMs();
+    return 2 * CW_MAX * SLOT_MS + (random() % (1u << head.cw)) * SLOT_MS;
+  }
+  // setTransmitDelay: arms the timer for the head, unless one is pending.
+  void armForHead(uint32_t nowMs) {
+    if (queue.empty() || timerArmed) return;
+    timerArmed = true;
+    timerAtMs = nowMs + headDelayMs();
+  }
+  // An RX or TX interrupt takes the one slot; onNotify then re-arms for the head.
+  void interrupt(uint32_t nowMs) {
+    timerArmed = false;
+    armForHead(nowMs);
+  }
+  // RadioLibInterface::send.
+  void send(const Packet& p, uint32_t nowMs) {
+    size_t at = 0;
+    while (at < queue.size() && !goesBefore(p, queue[at])) at++;
+    queue.insert(queue.begin() + at, p);
+    if (build43 && p.ours && at == 0 && timerArmed) {
+      const uint32_t soonMs = contentionMs();
+      if ((int32_t)(timerAtMs - nowMs) > (int32_t)soonMs) {
+        timerAtMs = nowMs + soonMs;
+        return;
+      }
+    }
+    armForHead(nowMs);
+  }
+  void ownPosition(uint32_t nowMs) {
+    for (size_t i = 0; i < queue.size(); i++) {
+      if (queue[i].id == lastOwnId) ownLate++;
+    }
+    Packet p;
+    p.id = nextId++;
+    p.ours = true;
+    // Build 41's own position went at BACKGROUND, as PositionModule's.
+    p.priority = build43 ? OWN_POSITION_PRIORITY : PRIORITY_BACKGROUND;
+    p.queuedMs = nowMs;
+    lastOwnId = p.id;
+    send(p, nowMs);
+  }
+  void relay(uint8_t cw, uint32_t nowMs) {
+    Packet p;
+    p.id = nextId++;
+    p.priority = PRIORITY_DEFAULT;
+    p.queuedMs = nowMs;
+    p.cw = cw;
+    relaysQueued++;
+    send(p, nowMs);
+  }
+  void tick(uint32_t nowMs) {
+    if (sending && nowMs >= sentAtMs + AIR_MS) {
+      sending = false;
+      interrupt(nowMs);
+    }
+    if (!timerArmed || nowMs < timerAtMs) return;
+    timerArmed = false;
+    if (queue.empty()) return;
+    if (nowMs < receivingUntilMs || sending) {
+      armForHead(nowMs);
+      return;
+    }
+    const Packet p = queue.front();
+    queue.erase(queue.begin());
+    if (p.ours) {
+      ownWaits.push_back(nowMs - p.queuedMs);
+    } else {
+      relaysSent++;
+    }
+    sending = true;
+    sentAtMs = nowMs;
+  }
+};
+
+struct Heard {
+  uint32_t atMs = 0;
+  bool toRelay = false;  // a car's position we relay; else another car's relay of one
+  uint8_t cw = 0;
+};
+
+// The bench (build 41): two other cars in direct range, each sending a position
+// every round that we queue a relay for, and each relaying the other's once.
+// Ours goes every round at 1 s into it. Then ten seconds for the queue to drain.
+Radio ride(bool build43, uint32_t seed, uint32_t rounds) {
+  Radio radio;
+  radio.build43 = build43;
+  radio.rng = seed;
+  uint32_t traffic = seed * 31 + 1;
+  auto next = [&traffic]() {
+    traffic = traffic * 1103515245u + 12345u;
+    return traffic >> 8;
+  };
+  std::vector<Heard> starts;
+  for (uint32_t r = 0; r < rounds; r++) {
+    for (int car = 0; car < 2; car++) {
+      Heard position;
+      position.atMs = r * ROUND_MS + next() % ROUND_MS;
+      position.toRelay = true;
+      position.cw = CW_MAX;
+      starts.push_back(position);
+      Heard relayed;
+      relayed.atMs = position.atMs + AIR_MS + 2 * CW_MAX * SLOT_MS + (next() % 256) * SLOT_MS;
+      starts.push_back(relayed);
+    }
+  }
+  std::stable_sort(starts.begin(), starts.end(), [](const Heard& a, const Heard& b) { return a.atMs < b.atMs; });
+
+  std::vector<Heard> ends;
+  size_t nextStart = 0;
+  const uint32_t endMs = rounds * ROUND_MS + 10000;
+  for (uint32_t nowMs = 0; nowMs < endMs; nowMs++) {
+    for (size_t i = 0; i < ends.size();) {
+      if (ends[i].atMs != nowMs) {
+        i++;
+        continue;
+      }
+      const Heard done = ends[i];
+      ends.erase(ends.begin() + i);
+      radio.interrupt(nowMs);
+      if (done.toRelay) radio.relay(done.cw, nowMs);
+    }
+    for (; nextStart < starts.size() && starts[nextStart].atMs <= nowMs; nextStart++) {
+      // Half duplex: a packet that starts while we transmit is lost to us.
+      if (radio.sending) continue;
+      Heard done = starts[nextStart];
+      done.atMs = nowMs + AIR_MS;
+      if (done.atMs > radio.receivingUntilMs) radio.receivingUntilMs = done.atMs;
+      ends.push_back(done);
+    }
+    if (nowMs % ROUND_MS == 1000 && nowMs < rounds * ROUND_MS) radio.ownPosition(nowMs);
+    radio.tick(nowMs);
+  }
+  return radio;
+}
+
+uint32_t countOver(const std::vector<uint32_t>& waits, uint32_t ms) {
+  uint32_t n = 0;
+  for (size_t i = 0; i < waits.size(); i++) n += waits[i] > ms ? 1 : 0;
+  return n;
+}
+
+}  // namespace txpath
+
+// Build 41 on the model: our BACKGROUND position waits behind relays and their
+// SNR delays, as it did on the bench (median 0.6 s, p90 4.5 s, 6.2 s at worst).
+void test_behind_relays_our_position_waited_seconds() {
+  const uint32_t seeds[] = {7, 11, 12345};
+  for (size_t s = 0; s < 3; s++) {
+    const txpath::Radio radio = txpath::ride(false, seeds[s], 120);
+    TEST_ASSERT_EQUAL_UINT32(120, radio.ownWaits.size());
+    // A fifth or more waited over a second, and some were still queued when the
+    // next was due.
+    TEST_ASSERT_TRUE(txpath::countOver(radio.ownWaits, 1000) >= 24);
+    TEST_ASSERT_TRUE(radio.ownLate >= 5);
+  }
+}
+
+// Build 43: ahead of every relay, delayed ones included, our position goes
+// within its contention delay and whatever reception or transmission is under
+// way; none is late. Every relay still goes.
+void test_our_position_leaves_ahead_of_queued_relays_and_relays_still_go() {
+  const uint32_t seeds[] = {7, 11, 12345};
+  for (size_t s = 0; s < 3; s++) {
+    const txpath::Radio radio = txpath::ride(true, seeds[s], 120);
+    TEST_ASSERT_EQUAL_UINT32(120, radio.ownWaits.size());
+    TEST_ASSERT_EQUAL_UINT32(0, txpath::countOver(radio.ownWaits, 400));
+    std::vector<uint32_t> sorted = radio.ownWaits;
+    std::sort(sorted.begin(), sorted.end());
+    TEST_ASSERT_TRUE(sorted[sorted.size() / 2] <= 100);
+    TEST_ASSERT_EQUAL_UINT32(0, radio.ownLate);
+    TEST_ASSERT_TRUE(radio.relaysQueued >= 200);
+    TEST_ASSERT_EQUAL_UINT32(radio.relaysQueued, radio.relaysSent);
+  }
+}
+
+// One packet at a time: ours goes ahead of a relay still waiting out its SNR
+// delay, and the timer that relay started is pulled in to ours. Build 41 left
+// ours behind the relay with the relay's timer running.
+void test_our_position_goes_ahead_of_a_relay_waiting_out_its_delay() {
+  for (int build43 = 0; build43 <= 1; build43++) {
+    txpath::Radio radio;
+    radio.build43 = build43 != 0;
+    radio.rng = 5;
+    // A relay of a strong signal: 128 ms and up before it may go.
+    radio.relay(txpath::CW_MAX, 0);
+    TEST_ASSERT_TRUE(radio.timerArmed);
+    const uint32_t relayDueMs = radio.timerAtMs;
+    TEST_ASSERT_TRUE(relayDueMs >= 2 * txpath::CW_MAX * txpath::SLOT_MS);
+    radio.ownPosition(10);
+    if (build43 == 0) {
+      TEST_ASSERT_FALSE(radio.queue.front().ours);
+      TEST_ASSERT_EQUAL_UINT32(relayDueMs, radio.timerAtMs);
+      continue;
+    }
+    TEST_ASSERT_TRUE(radio.queue.front().ours);
+    TEST_ASSERT_TRUE(radio.timerAtMs <= 10 + 7 * txpath::SLOT_MS);
+    // A relay queued after ours stays behind it and leaves the timer alone.
+    const uint32_t ownDueMs = radio.timerAtMs;
+    radio.relay(txpath::CW_MAX, 12);
+    TEST_ASSERT_TRUE(radio.queue.front().ours);
+    TEST_ASSERT_EQUAL_UINT32(ownDueMs, radio.timerAtMs);
+  }
+  // DEFAULT would not have done: at equal priority Meshtastic sends another
+  // car's packet before ours.
+  txpath::Packet relayed;
+  relayed.priority = PRIORITY_DEFAULT;
+  txpath::Packet ours;
+  ours.ours = true;
+  ours.priority = PRIORITY_DEFAULT;
+  TEST_ASSERT_TRUE(txpath::goesBefore(relayed, ours));
+  ours.priority = OWN_POSITION_PRIORITY;
+  TEST_ASSERT_TRUE(txpath::goesBefore(ours, relayed));
+}
+
+// ---- Our position unsigned (build 43) ------------------------------------------
+
+// Meshtastic's port numbers for the traffic that stays signed.
+static const uint32_t PORT_TEXT = 1;
+static const uint32_t PORT_ROUTING = 5;
+static const uint32_t PORT_ADMIN = 6;
+static const uint32_t PORT_NODEINFO = 4;
+static const uint32_t PORT_PRIVATE = 256;  // our reach summaries
+
+void test_only_our_position_goes_unsigned() {
+  // Our position, broadcast on the ride's keyed channel while the fast lane sends it.
+  TEST_ASSERT_TRUE(sendsUnsigned(PORT_POSITION, true, true, true, false));
+  // Everything else stays signed.
+  const uint32_t signedPorts[] = {PORT_TEXT, PORT_ROUTING, PORT_ADMIN, PORT_NODEINFO, PORT_PRIVATE};
+  for (size_t i = 0; i < sizeof(signedPorts) / sizeof(signedPorts[0]); i++) {
+    TEST_ASSERT_FALSE(sendsUnsigned(signedPorts[i], true, true, true, false));
+  }
+  // A radio in stock mode (no Touge hello) is stock: PositionModule's own
+  // position is signed.
+  TEST_ASSERT_FALSE(sendsUnsigned(PORT_POSITION, true, false, true, false));
+  // A channel anyone can read, a licensed radio, or a position to one node.
+  TEST_ASSERT_FALSE(sendsUnsigned(PORT_POSITION, true, true, false, false));
+  TEST_ASSERT_FALSE(sendsUnsigned(PORT_POSITION, true, true, true, true));
+  TEST_ASSERT_FALSE(sendsUnsigned(PORT_POSITION, false, true, true, false));
+}
+
+void test_only_a_position_on_a_keyed_channel_passes_unsigned_from_a_signer() {
+  TEST_ASSERT_TRUE(passesUnsigned(PORT_POSITION, true, false));
+  // A downgraded text, NodeInfo, summary or admin from a node that signs still drops.
+  const uint32_t signedPorts[] = {PORT_TEXT, PORT_ROUTING, PORT_ADMIN, PORT_NODEINFO, PORT_PRIVATE};
+  for (size_t i = 0; i < sizeof(signedPorts) / sizeof(signedPorts[0]); i++) {
+    TEST_ASSERT_FALSE(passesUnsigned(signedPorts[i], true, false));
+  }
+  // On a public channel anyone can forge a position, so Balanced keeps its rule.
+  TEST_ASSERT_FALSE(passesUnsigned(PORT_POSITION, false, false));
+  // A licensed radio keeps it all.
+  TEST_ASSERT_FALSE(passesUnsigned(PORT_POSITION, true, true));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_the_identity_is_read_from_meshtastics_fields);
@@ -310,5 +625,10 @@ int main(int, char**) {
   RUN_TEST(test_a_note_with_every_place_queued_is_dropped);
   RUN_TEST(test_a_noted_position_knows_how_long_it_has_waited);
   RUN_TEST(test_under_a_backlog_the_rear_car_keeps_its_turn);
+  RUN_TEST(test_behind_relays_our_position_waited_seconds);
+  RUN_TEST(test_our_position_leaves_ahead_of_queued_relays_and_relays_still_go);
+  RUN_TEST(test_our_position_goes_ahead_of_a_relay_waiting_out_its_delay);
+  RUN_TEST(test_only_our_position_goes_unsigned);
+  RUN_TEST(test_only_a_position_on_a_keyed_channel_passes_unsigned_from_a_signer);
   return UNITY_END();
 }

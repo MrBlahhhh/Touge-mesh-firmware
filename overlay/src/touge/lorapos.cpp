@@ -4,6 +4,14 @@
 
 namespace touge {
 
+bool sendsUnsigned(uint32_t portnum, bool broadcast, bool ownsPositions, bool privateChannel, bool licensed) {
+  return portnum == PORT_POSITION && broadcast && ownsPositions && privateChannel && !licensed;
+}
+
+bool passesUnsigned(uint32_t portnum, bool privateChannel, bool licensed) {
+  return portnum == PORT_POSITION && privateChannel && !licensed;
+}
+
 FixId fixIdOf(uint32_t sensorId, uint32_t seqNumber, uint32_t timestamp, int32_t millisAdjust, uint32_t time) {
   Fix measured;
   setMeasured(measured, timestamp, millisAdjust, time);

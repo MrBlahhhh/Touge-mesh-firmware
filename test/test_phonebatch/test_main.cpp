@@ -482,6 +482,28 @@ void test_the_payload_is_found_inside_an_encoded_packet() {
   TEST_ASSERT_EQUAL(-1, findPayload(fromRadio, 20 + n - 1, payload, n));
 }
 
+// FromRadio { packet } as nanopb writes it: field 2, length-delimited, the
+// packet's length as a varint (build 43 builds it by hand for the pre-encoded
+// batch rather than keep a 768-byte FromRadio).
+void test_the_from_radio_header_is_field_2_and_the_packet_length() {
+  uint8_t out[8];
+  TEST_ASSERT_EQUAL(2, fromRadioPacketHeader(0, out, sizeof(out)));
+  TEST_ASSERT_EQUAL_HEX8(0x12, out[0]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, out[1]);
+  TEST_ASSERT_EQUAL(2, fromRadioPacketHeader(127, out, sizeof(out)));
+  TEST_ASSERT_EQUAL_HEX8(0x7F, out[1]);
+  // A full batch's packet is past 127 bytes: two bytes of length.
+  TEST_ASSERT_EQUAL(3, fromRadioPacketHeader(264, out, sizeof(out)));
+  TEST_ASSERT_EQUAL_HEX8(0x12, out[0]);
+  TEST_ASSERT_EQUAL_HEX8(0x88, out[1]);
+  TEST_ASSERT_EQUAL_HEX8(0x02, out[2]);
+  // No room: nothing written that could be sent.
+  TEST_ASSERT_EQUAL(0, fromRadioPacketHeader(264, out, 2));
+  TEST_ASSERT_EQUAL(0, fromRadioPacketHeader(1, out, 0));
+  // The buffer the module keeps holds a full batch with its header and fields.
+  TEST_ASSERT_TRUE(BATCH_FROM_RADIO_MAX >= 3 + 264);
+}
+
 // A ToRadio { packet { to, decoded { port, payload }, id, hop_limit } } as the
 // app writes one, and a want_config, which has no packet id.
 void test_the_packet_id_is_read_out_of_a_dropped_write() {
@@ -1064,6 +1086,7 @@ int main(int, char**) {
   RUN_TEST(test_a_batch_ten_minutes_old_carries_no_position);
   RUN_TEST(test_the_store_drops_a_record_too_old_to_pack);
   RUN_TEST(test_the_payload_is_found_inside_an_encoded_packet);
+  RUN_TEST(test_the_from_radio_header_is_field_2_and_the_packet_length);
   RUN_TEST(test_the_packet_id_is_read_out_of_a_dropped_write);
   RUN_TEST(test_dropped_write_ids_pass_between_tasks_in_order);
   RUN_TEST(test_stalls_through_both_queues_keep_two_batches_and_the_newest);

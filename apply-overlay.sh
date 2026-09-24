@@ -102,9 +102,12 @@ rm -f "$MODULES.bak"
 # per car in the LoRa TX queue (MeshPacketQueue.cpp, with a hook the module sets),
 # 0011 has PositionModule stand down while the module sends the LoRa position, and
 # 0005 ranks queued positions by fix identity. From build 41, 0012 lets the module
-# have a relay go in the ROUTER's early window (RadioInterface.cpp). Without these
-# the fast lane builds but does not carry. Idempotent: a patch that already
-# reverse-applies is in, and is skipped.
+# have a relay go in the ROUTER's early window (RadioInterface.cpp). From build 43,
+# 0013 lets it skip a relay nobody needs (NextHopRouter.cpp), 0014 sends its own
+# position on its own contention delay (RadioLibInterface.cpp, NotifiedWorkerThread),
+# and 0015 sends that position unsigned and lets unsigned positions from signers in
+# (Router.cpp). Without these the fast lane builds but does not carry. Idempotent: a
+# patch that already reverse-applies is in, and is skipped.
 if ls "$HERE"/core-patches/*.patch >/dev/null 2>&1; then
   echo "==> core patches"
   # A copy of each patch as applied, so an edited patch can take the old one out

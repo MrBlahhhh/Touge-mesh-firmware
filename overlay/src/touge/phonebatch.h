@@ -241,6 +241,19 @@ size_t deliverBatch(uint8_t* payload, size_t len, uint32_t nowMs, bool canShrink
 // batch can be readied in place when it is read. -1 if it is not there.
 int findPayload(const uint8_t* fromRadio, size_t len, const uint8_t* payload, size_t payloadLen);
 
+// The start of a FromRadio that holds one MeshPacket of [packetLen] encoded
+// bytes, as nanopb writes it: field 2 (packet) length-delimited, then the
+// length as a varint; the packet's bytes follow. With id 0 left out, as proto3
+// leaves it, that is the whole FromRadio, so the module encodes a pre-encoded
+// batch without a FromRadio struct to build it in. 0 if [cap] is too small.
+size_t fromRadioPacketHeader(size_t packetLen, uint8_t* out, size_t cap);
+
+// The most a FromRadio holding one batch encodes to: 267 bytes with a full
+// payload, from, to, id, rx_time, channel and port around it, and the headers.
+// Sized with room to spare rather than meshtastic_FromRadio_size's 510; a batch
+// that did not fit would take the ordinary queue.
+static const size_t BATCH_FROM_RADIO_MAX = BATCH_MAX_PAYLOAD + 64;
+
 // ---- Writes the radio dropped ------------------------------------------------
 
 // The packet id inside a ToRadio { packet } write: field 1, then the
