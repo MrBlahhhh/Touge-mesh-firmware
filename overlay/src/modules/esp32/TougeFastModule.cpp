@@ -7,11 +7,13 @@
 #include "NodeDB.h"
 #include "RTC.h"
 #include "PhoneAPI.h"
+#include "PositionPrecision.h"
 #include "Router.h"
 #include "main.h"
 #include "touge/cipher.h"
 #if !MESHTASTIC_EXCLUDE_GPS
 #include "gps/GPS.h"
+#include "modules/PositionModule.h"
 #endif
 #include <Preferences.h>
 #include <esp_err.h>
@@ -183,7 +185,12 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // 38: every position carries its fix identity (session per boot, fix sequence, measured time)
 //     on both lanes: frame v3, batch v2 with 32-byte records, and the phone's LoRa position
 //     sent as the radio's own latest fix in sensor_id/seq_number/timestamp(+ms).
-const uint32_t TOUGE_BUILD = 38;
+// 39: the radio sends its car's LoRa position itself, 5 s or the airtime estimate, while a Touge app
+//     has said hello and PositionModule's broadcasts stand down (core-patches/0011); both lanes stop
+//     15 s after the last fix fed; the phone's fix beats the board's GNSS while it keeps writing; the
+//     TX queue and the phone queue keep the newest position per car by fix identity (0010, 0005);
+//     "li" in the lane report. 0001 back to stock's 10 s for on-air positions from a phone.
+const uint32_t TOUGE_BUILD = 39;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -339,6 +346,15 @@ TougeFastModule::TougeFastModule()
 #if TOUGE_HAS_NIMBLE
     // Names each phone write NimBLE drops (core-patches/0007).
     nimbleWriteDroppedHook = &onWriteDropped;
+#endif
+
+    // One position per car in the TX queue (core-patches/0010), and ours sent from here
+    // rather than by PositionModule while loraOwned() (0011).
+    static_assert(TxPositions::TX_QUEUE_LEN >= MAX_TX_QUEUE, "a tag for every position the TX queue can hold");
+    txPositions_.clear();
+    tougeTxPlaceHook = &TougeFastModule::placeTxPacket;
+#if !MESHTASTIC_EXCLUDE_GPS
+    positionBroadcastOwnedHook = &TougeFastModule::ownsPositionBroadcast;
 #endif
 }
 
@@ -536,18 +552,15 @@ void TougeFastModule::beacon(uint32_t nowMs)
 {
     if (!started_) return;
 
-    // No fix means nothing worth sending. The other cars keep the last one they
-    // heard and show it as ageing, which is more useful than a zero.
-    if (!ownFix_.has()) return;
+    // No fix, or none fed for OwnFix::STALE_MS (a board whose phone has gone),
+    // means nothing worth sending. The other cars keep the last one they heard
+    // and show it as ageing, which is more useful than a zero.
+    if (!ownFix_.fresh(nowMs)) return;
     const Fix &fix = ownFix_.fix();
 
     // Two separate questions: is there anything worth saying, and is it our
     // turn to say it? Collapsing them would either give up the slot discipline
     // or let a parked car hold one open.
-    //
-    // A board left on after its phone walked away still beacons its last fix.
-    // A mute on a stale fix time was tried and silenced a board whose phone was
-    // connected, so the fix age goes in the status report ("fix") instead.
 
     // Extra beacons use free slots of our row, never the lease slot, so the two
     // never compete for the same tick.
@@ -745,10 +758,10 @@ meshtastic_Position TougeFastModule::asMeshPosition(const Position &p)
 Fix TougeFastModule::fixOf(const meshtastic_Position &pos)
 {
     Fix fix;
-    if (pos.has_latitude_i && pos.has_longitude_i) {
-        fix.lat = pos.latitude_i;
-        fix.lon = pos.longitude_i;
-    }
+    // Not gated on has_latitude_i: GPS.cpp never sets it, and an absent
+    // coordinate decodes as zero anyway.
+    fix.lat = pos.latitude_i;
+    fix.lon = pos.longitude_i;
     fix.trackE5 = pos.ground_track;
     fix.speedKmh = pos.ground_speed;
     fix.external = pos.location_source == meshtastic_Position_LocSource_LOC_EXTERNAL;
@@ -756,13 +769,39 @@ Fix TougeFastModule::fixOf(const meshtastic_Position &pos)
     return fix;
 }
 
-void TougeFastModule::noteOwnFix()
+bool TougeFastModule::readPosition(const meshtastic_MeshPacket &mp, meshtastic_Position &pos)
 {
-    // localPosition is where the phone's fix lands (PositionModule, from its
-    // local write) and the board's own GNSS fix too (MeshService::onGPSChanged).
-    // The session is drawn on the first fix, long after boot, when the RNG has
-    // the radio's entropy behind it.
-    ownFix_.observe(fixOf(localPosition), esp_random() ^ (uint32_t)esp_timer_get_time());
+    pos = meshtastic_Position_init_default;
+    return pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_Position_msg, &pos);
+}
+
+// The session is drawn on the first fix, long after boot, when the RNG has the
+// radio's entropy behind it.
+static uint32_t fixEntropy()
+{
+    return esp_random() ^ (uint32_t)esp_timer_get_time();
+}
+
+void TougeFastModule::notePhoneFix(const meshtastic_MeshPacket &mp)
+{
+    // Read from the write itself, not from localPosition, which the board's own
+    // GNSS overwrites every second (MeshService::onGPSChanged) and our own LoRa
+    // position overwrites on its loopback.
+    meshtastic_Position pos;
+    if (!readPosition(mp, pos)) return;
+    ownFix_.fromPhone(fixOf(pos), millis(), fixEntropy());
+}
+
+void TougeFastModule::noteGnssFix(uint32_t nowMs)
+{
+#if !MESHTASTIC_EXCLUDE_GPS
+    // GPS::p is the receiver's own solution; it keeps the last one while the
+    // lock is gone, so it counts only with a lock.
+    if (!gps || !gps->hasLock()) return;
+    ownFix_.fromGnss(fixOf(gps->p), nowMs, fixEntropy());
+#else
+    (void)nowMs;
+#endif
 }
 
 meshtastic_Position TougeFastModule::ownLoraPosition() const
@@ -781,8 +820,9 @@ meshtastic_Position TougeFastModule::ownLoraPosition() const
     pos.location_source = fix.external ? meshtastic_Position_LocSource_LOC_EXTERNAL
                                        : meshtastic_Position_LocSource_LOC_INTERNAL;
     // The identity the 2.4 GHz beacon carries (FixId), in Meshtastic's own
-    // fields so relays keep it. time repeats the fix second as the phone's
-    // write always has, since the radio sets its clock from it (PositionModule).
+    // fields so relays keep it. time repeats the fix second: stock apps show a
+    // position's age from it, and radios with no better clock set theirs from
+    // it (PositionModule::trySetRtc).
     pos.sensor_id = id.session;
     pos.seq_number = id.seq;
     pos.timestamp = id.fixSec;
@@ -791,36 +831,113 @@ meshtastic_Position TougeFastModule::ownLoraPosition() const
     return pos;
 }
 
-void TougeFastModule::alterReceived(meshtastic_MeshPacket &mp)
+// ---- Our LoRa position, and one per car in the TX queue (SCALE-PLAN 5b, 5c) ---
+
+bool TougeFastModule::loraOwned() const
 {
-    // Our phone's LoRa position on its way to the air: Router::sendLocal runs
-    // the modules on a broadcast before sending it, and this module runs ahead
-    // of PositionModule (apply-overlay.sh). It goes out as our latest fix under
-    // the same identity as the 2.4 GHz beacon. 5b moves the send itself into
-    // the firmware, and this goes with the phone's write.
-    if (mp.which_payload_variant != meshtastic_MeshPacket_decoded_tag) return;
-    if (mp.decoded.portnum != meshtastic_PortNum_POSITION_APP) return;
-    if (!isFromUs(&mp) || isToUs(&mp)) return;
+    // A stock app on this radio, or a radio handed back to a default channel,
+    // keeps Meshtastic's own position broadcasts. A real key is the fast lane's
+    // test for a ride too (syncChannel).
+    if (!rideAppSeen_ || !ownFix_.has()) return false;
+    return channels.getKey(channels.getPrimaryIndex()).length >= MIN_PSK_BYTES;
+}
 
-    meshtastic_Position sent = meshtastic_Position_init_default;
-    if (!pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_Position_msg, &sent)) return;
-    noteOwnFix();
-    // Usually the fix its local write already gave us, or an older one queued
-    // behind it. The phone's content wins unless ours is known to be newer: a
-    // phone that sends no fix time (a stock Meshtastic app may not) must not
-    // have its position swapped for an older one.
-    const Fix phoneFix = fixOf(sent);
-    if (!ownFix_.has() || !measuredAfter(ownFix_.fix(), phoneFix)) {
-        ownFix_.observe(phoneFix, esp_random() ^ (uint32_t)esp_timer_get_time());
+bool TougeFastModule::ownsPositionBroadcast()
+{
+    return tougeFastModule != nullptr && tougeFastModule->loraOwned();
+}
+
+uint32_t TougeFastModule::carsOnRide() const
+{
+    // Every node heard in the window, on either radio: inject() stamps
+    // last_heard for a 2.4 GHz car. A stranger on the same frequency spends the
+    // same air, so it counts too.
+    uint32_t cars = 1;
+    const NodeNum self = nodeDB->getNodeNum();
+    for (size_t i = 0; i < nodeDB->getNumMeshNodes(); i++) {
+        const meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
+        if (node->num == self || node->last_heard == 0) continue;
+        if (sinceLastSeen(node) < RIDER_DROP_MS / 1000) cars++;
     }
-    if (!ownFix_.has()) return;
+    return cars;
+}
 
-    const meshtastic_Position own = ownLoraPosition();
-    uint8_t encoded[meshtastic_Constants_DATA_PAYLOAD_LEN];
-    const size_t n = pb_encode_to_bytes(encoded, sizeof(encoded), &meshtastic_Position_msg, &own);
-    if (n == 0) return;
-    memcpy(mp.decoded.payload.bytes, encoded, n);
-    mp.decoded.payload.size = (pb_size_t)n;
+void TougeFastModule::sendLoraPosition(uint32_t nowMs)
+{
+    if (!loraOwned() || !ownFix_.fresh(nowMs)) return;
+    if (lastLoraMs_ != 0 && (uint32_t)(nowMs - lastLoraMs_) < loraIntervalMs_) return;
+    // Where PositionModule would send it: the first channel sharing positions.
+    uint8_t channel = 0;
+    if (!findPositionChannel(channel)) return;
+
+    meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p) return;
+    p->to = NODENUM_BROADCAST;
+    p->channel = channel;
+    p->priority = meshtastic_MeshPacket_Priority_BACKGROUND; // as PositionModule's
+    p->decoded.portnum = meshtastic_PortNum_POSITION_APP;
+    const meshtastic_Position pos = ownLoraPosition();
+    p->decoded.payload.size =
+        (pb_size_t)pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), &meshtastic_Position_msg, &pos);
+    if (p->decoded.payload.size == 0) {
+        service->releaseToPool(p);
+        return;
+    }
+
+    // The next gap, from this packet's own airtime on the radio's actual modem
+    // settings and the cars heard lately.
+    RadioInterface *radio = router->getRadioIface();
+    const uint32_t cars = carsOnRide();
+    loraIntervalMs_ = loraIntervalMs(cars, radio ? radio->getPacketTime(p) : 0);
+    lastLoraMs_ = nowMs;
+    const FixId id = ownFix_.id();
+    txPositions_.note(p->from, p->id, id, &TougeFastModule::inTxQueue, nullptr);
+    LOG_INFO("touge: lora position seq=%u, next in %ums for %u cars; tx queue replaced=%u refused=%u", (unsigned)id.seq,
+             (unsigned)loraIntervalMs_, (unsigned)cars, (unsigned)txReplaced_, (unsigned)txRefused_);
+    service->sendToMesh(p, RX_SRC_LOCAL, false);
+}
+
+void TougeFastModule::noteRelayedPosition(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos)
+{
+    // Only one this radio may relay. This module runs before RoutingModule,
+    // whose sniffReceived is what queues the relay, so the note is in first.
+    if (mp.hop_limit == 0) return;
+    const FixId fix = fixIdOf(pos.sensor_id, pos.seq_number, pos.timestamp, pos.timestamp_millis_adjust, pos.time);
+    txPositions_.note(mp.from, mp.id, fix, &TougeFastModule::inTxQueue, nullptr);
+}
+
+bool TougeFastModule::inTxQueue(uint32_t from, uint32_t id, void *ctx)
+{
+    (void)ctx;
+    return router->findInTxQueue(from, id);
+}
+
+TougeTxPlace TougeFastModule::placeTxPacket(const std::vector<meshtastic_MeshPacket *> &queue, const meshtastic_MeshPacket *p,
+                                            size_t &at)
+{
+    if (tougeFastModule == nullptr) return TougeTxPlace::QUEUE;
+    QueuedPacket incoming;
+    incoming.from = p->from;
+    incoming.id = p->id;
+    incoming.hopLimit = p->hop_limit;
+    auto queued = [&queue](size_t i) {
+        QueuedPacket q;
+        q.from = queue[i]->from;
+        q.id = queue[i]->id;
+        q.hopLimit = queue[i]->hop_limit;
+        return q;
+    };
+    switch (tougeFastModule->txPositions_.place(incoming, queue.size(), queued, at)) {
+    case TxPlace::REPLACE:
+        tougeFastModule->txReplaced_++;
+        return TougeTxPlace::REPLACE;
+    case TxPlace::REFUSE:
+        tougeFastModule->txRefused_++;
+        return TougeTxPlace::REFUSE;
+    case TxPlace::QUEUE:
+    default:
+        return TougeTxPlace::QUEUE;
+    }
 }
 
 void TougeFastModule::reassertFastPositions()
@@ -1141,10 +1258,9 @@ bool bleSettled(uint32_t now)
 int32_t TougeFastModule::runOnce()
 {
     if (nodeId_ == 0) nodeId_ = nodeDB->getNodeNum();
-    // Every pass, lane up or not: the LoRa position carries the identity too.
-    noteOwnFix();
-
     uint32_t now = millis();
+    // Every pass, lane up or not: the LoRa position is sent from the same fix.
+    noteGnssFix(now);
 
     // Let Bluetooth win the memory race.
     //
@@ -1190,6 +1306,9 @@ int32_t TougeFastModule::runOnce()
     // Before the channel check: a tablet with no GPS needs the radio's fix
     // whether or not a ride is set up.
     forwardGnssFix(now);
+    // LoRa carries the car whether or not the 2.4 GHz lane came up (a V3 short
+    // of heap runs LoRa only).
+    sendLoraPosition(now);
     if (!started_) {
         // Nothing else to do until there is a channel, but say so: see reportLaneDown.
         reportLaneDown(now, laneDown_);
@@ -1288,7 +1407,6 @@ void TougeFastModule::status(uint32_t nowMs)
     reportLinkStats(nowMs, statusWindowMs);
     logHeap();
 
-    uint32_t nowSec = getValidTime(RTCQualityFromNet);
     const char *clock = rideClock.locked((uint64_t)esp_timer_get_time()) ? "gps"
                         : schedule_.synced()                            ? "beacon"
                                                                         : "free";
@@ -1335,16 +1453,17 @@ void TougeFastModule::status(uint32_t nowMs)
         char js[meshtastic_Constants_DATA_PAYLOAD_LEN];
         int n = snprintf(
             js, sizeof(js),
-            "{\"fl\":{\"up\":1,\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u,\"gi\":%u,\"gg\":%u,\"tf\":%u}}",
+            "{\"fl\":{\"up\":1,\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u,\"gi\":%u,\"gg\":%u,\"tf\":%u,\"li\":%u}}",
             (unsigned)fastRadio.channel(), schedule_.claimed() ? (int)schedule_.slot() : -1,
             (unsigned)schedule_.known(), (unsigned)fastNeighbours(nowMs), clock,
             (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
             (unsigned)TOUGE_BUILD,
-            (unsigned)((nowSec > 0 && localPosition.time > 0 && nowSec > localPosition.time)
-                           ? nowSec - localPosition.time
-                           : 0),
+            // Since a fix was last fed, on the radio's clock: what OwnFix::STALE_MS is judged on.
+            (unsigned)(ownFix_.fedAgeMs(nowMs) / 1000),
             (unsigned)hop_.index(), (unsigned)hop_.generation(),
-            (unsigned)fastRadio.sendFailed());
+            (unsigned)fastRadio.sendFailed(),
+            // Our LoRa position interval, 0 while this radio is not sending them.
+            (unsigned)(loraOwned() && ownFix_.fresh(nowMs) ? loraIntervalMs_ : 0));
         if (n > 0 && (size_t)n < sizeof(js)) {
             meshtastic_MeshPacket *sp = router->allocForSending();
             if (sp) {
@@ -1480,8 +1599,9 @@ bool TougeFastModule::wantPacket(const meshtastic_MeshPacket *p)
 {
     if (!p) return false;
     if (p->which_payload_variant != meshtastic_MeshPacket_decoded_tag) return false;
-    // Our own port for voice, and positions so that a LoRa one cannot overwrite
-    // a fresher 2.4 GHz one. See handleReceived.
+    // Our own port for voice, and positions: the phone's fix, the ones we may
+    // relay, and a LoRa one that must not overwrite a fresher 2.4 GHz one. See
+    // handleReceived.
     return p->decoded.portnum == ourPortNum || p->decoded.portnum == meshtastic_PortNum_POSITION_APP;
 }
 
@@ -1501,8 +1621,16 @@ ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
     // LoRa has to take over without a gap, and a stale position beats none.
     if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
         mp.decoded.portnum == meshtastic_PortNum_POSITION_APP) {
-        // Our own phone's fix comes through here too; only other cars count.
-        if (!isFromUs(&mp)) stats_.lora.rx++;
+        // Our phone's write to this radio: the fix both lanes send.
+        if (isFromUs(&mp) && isToUs(&mp)) {
+            notePhoneFix(mp);
+            return ProcessMessage::CONTINUE;
+        }
+        // Our own LoRa position looping back is neither heard nor relayed.
+        if (isFromUs(&mp)) return ProcessMessage::CONTINUE;
+        stats_.lora.rx++;
+        meshtastic_Position heardPos;
+        if (readPosition(mp, heardPos)) noteRelayedPosition(mp, heardPos);
         const Rider *r = mesh_.find(mp.from);
         if (r && r->via == HEARD_FAST && (uint32_t)(millis() - r->atMs) < FAST_PRECEDENCE_MS) {
             // Not STOP any more, and this is the difference between a car
@@ -1557,6 +1685,9 @@ ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
         }
         hello_ = hello;
         helloSeen_ = true;
+        // Until reboot, so a phone reconnecting does not hand the LoRa position
+        // back to PositionModule in between. See loraOwned.
+        rideAppSeen_ = true;
         return ProcessMessage::STOP;
     }
 

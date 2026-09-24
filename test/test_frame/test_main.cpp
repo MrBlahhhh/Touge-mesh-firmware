@@ -326,7 +326,7 @@ static Fix reading(int32_t lat, uint32_t fixSec, uint16_t fixMs = 0) {
 void test_each_new_fix_takes_the_next_sequence() {
   OwnFix own;
   TEST_ASSERT_FALSE(own.has());
-  own.observe(reading(355000000, 1790000000, 100), 0x12345678);
+  own.fromPhone(reading(355000000, 1790000000, 100), 10000, 0x12345678);
   TEST_ASSERT_TRUE(own.has());
   const FixId first = own.id();
   TEST_ASSERT_EQUAL_UINT32(1, first.seq);
@@ -334,36 +334,92 @@ void test_each_new_fix_takes_the_next_sequence() {
   TEST_ASSERT_EQUAL_UINT32(1790000000, first.fixSec);
   TEST_ASSERT_EQUAL_UINT16(100, first.fixMs);
 
-  // Read again every pass: the same fix, the same name.
-  own.observe(reading(355000000, 1790000000, 100), 0x99999999);
+  // Written again: the same fix, the same name.
+  own.fromPhone(reading(355000000, 1790000000, 100), 11000, 0x99999999);
   TEST_ASSERT_EQUAL_UINT32(1, own.id().seq);
   // A parked car's next fix: same place, measured later.
-  own.observe(reading(355000000, 1790000001, 100), 0x99999999);
+  own.fromPhone(reading(355000000, 1790000001, 100), 12000, 0x99999999);
   TEST_ASSERT_EQUAL_UINT32(2, own.id().seq);
   // The session is drawn once per boot, not per fix.
   TEST_ASSERT_EQUAL_UINT16(first.session, own.id().session);
 }
 
-void test_no_coordinates_is_no_fix_until_one_comes_back() {
+void test_a_write_with_no_coordinates_changes_nothing() {
   OwnFix own;
-  own.observe(reading(355000000, 1790000000), 1);
-  own.observe(reading(0, 1790000001), 1);  // lat 0 and lon set: still a place
-  TEST_ASSERT_TRUE(own.has());
   Fix none;
-  own.observe(none, 1);
+  none.fixSec = 1790000000;
+  own.fromPhone(none, 10000, 1);
   TEST_ASSERT_FALSE(own.has());
-  // Lock back on the very fix we had: not a new one.
-  own.observe(reading(0, 1790000001), 1);
+  own.fromPhone(reading(355000000, 1790000000), 10000, 1);
+  own.fromPhone(reading(0, 1790000001), 11000, 1);  // lat 0 and lon set: still a place
+  TEST_ASSERT_EQUAL_UINT32(2, own.id().seq);
+  // A stock app setting only the clock: the fix stays, and does not count as fed.
+  own.fromPhone(none, 20000, 1);
   TEST_ASSERT_TRUE(own.has());
   TEST_ASSERT_EQUAL_UINT32(2, own.id().seq);
-  own.observe(reading(355000100, 1790000005), 1);
-  TEST_ASSERT_EQUAL_UINT32(3, own.id().seq);
+  TEST_ASSERT_EQUAL_UINT32(9000, own.fedAgeMs(20000));
 }
 
 void test_a_session_is_never_zero() {
   OwnFix own;
-  own.observe(reading(355000000, 1790000000), 0x00010001);
+  own.fromPhone(reading(355000000, 1790000000), 10000, 0x00010001);
   TEST_ASSERT_NOT_EQUAL(0, own.id().session);
+}
+
+// The phone writes at least once a second, a repeat of its last fix when it
+// has no new one, so a repeat keeps the fix fresh.
+void test_a_fix_nobody_feeds_goes_stale() {
+  OwnFix own;
+  TEST_ASSERT_FALSE(own.fresh(10000));
+  own.fromPhone(reading(355000000, 1790000000), 10000, 1);
+  TEST_ASSERT_TRUE(own.fresh(10000 + OwnFix::STALE_MS - 1));
+  TEST_ASSERT_FALSE(own.fresh(10000 + OwnFix::STALE_MS));
+  own.fromPhone(reading(355000000, 1790000000), 24000, 1);
+  TEST_ASSERT_EQUAL_UINT32(1, own.id().seq);
+  TEST_ASSERT_TRUE(own.fresh(24000 + OwnFix::STALE_MS - 1));
+  // Stale is not gone: the fix is still held, it is only not sent.
+  TEST_ASSERT_TRUE(own.has());
+  // Across the millis() wrap.
+  OwnFix wrapped;
+  wrapped.fromPhone(reading(355000000, 1790000000), 0xFFFFF000u, 1);
+  TEST_ASSERT_TRUE(wrapped.fresh(0x00000F00u));
+}
+
+static Fix gnssReading(int32_t lat, uint32_t fixSec) {
+  Fix f = reading(lat, fixSec);
+  f.external = false;
+  return f;
+}
+
+void test_the_phone_fix_beats_the_boards_receiver_while_it_keeps_writing() {
+  OwnFix own;
+  own.fromPhone(reading(355000000, 1790000000), 10000, 1);
+  // The receiver's fix while the phone is writing is not taken.
+  own.fromGnss(gnssReading(355000500, 1790000001), 10500, 1);
+  TEST_ASSERT_TRUE(own.fix().external);
+  TEST_ASSERT_EQUAL_UINT32(1, own.id().seq);
+  own.fromGnss(gnssReading(355000500, 1790000002), 10000 + OwnFix::PHONE_FRESH_MS - 1, 1);
+  TEST_ASSERT_TRUE(own.fix().external);
+  // The phone has gone quiet: the receiver fills in, as a new fix.
+  own.fromGnss(gnssReading(355000600, 1790000003), 10000 + OwnFix::PHONE_FRESH_MS, 1);
+  TEST_ASSERT_FALSE(own.fix().external);
+  TEST_ASSERT_EQUAL_UINT32(2, own.id().seq);
+  // And the phone takes over again the moment it writes.
+  own.fromPhone(reading(355000700, 1790000004), 14000, 1);
+  TEST_ASSERT_TRUE(own.fix().external);
+  TEST_ASSERT_EQUAL_UINT32(3, own.id().seq);
+}
+
+void test_a_receiver_that_stops_producing_fixes_goes_stale() {
+  OwnFix own;
+  own.fromGnss(gnssReading(355000000, 1790000000), 10000, 1);
+  TEST_ASSERT_TRUE(own.fresh(10000));
+  // The same solution read every pass is not news, so it does not keep the fix fresh.
+  own.fromGnss(gnssReading(355000000, 1790000000), 20000, 1);
+  TEST_ASSERT_FALSE(own.fresh(10000 + OwnFix::STALE_MS));
+  own.fromGnss(gnssReading(355000000, 1790000030), 40000, 1);
+  TEST_ASSERT_TRUE(own.fresh(40000));
+  TEST_ASSERT_EQUAL_UINT32(2, own.id().seq);
 }
 
 void test_the_fix_time_comes_from_the_solution_then_the_write() {
@@ -382,13 +438,6 @@ void test_the_fix_time_comes_from_the_solution_then_the_write() {
   setMeasured(f, 0, 400, 1790000009);
   TEST_ASSERT_EQUAL_UINT32(1790000009, f.fixSec);
   TEST_ASSERT_EQUAL_UINT16(0, f.fixMs);
-}
-
-void test_measured_after_needs_both_times() {
-  TEST_ASSERT_TRUE(measuredAfter(reading(1, 1790000000, 2), reading(1, 1790000000, 1)));
-  TEST_ASSERT_FALSE(measuredAfter(reading(1, 1790000000, 1), reading(1, 1790000000, 1)));
-  TEST_ASSERT_FALSE(measuredAfter(reading(1, 1789999999, 999), reading(1, 1790000000, 0)));
-  TEST_ASSERT_FALSE(measuredAfter(reading(1, 1790000000), reading(1, 0)));
 }
 
 void test_position_heading_quantises_to_two_degrees() {
@@ -1358,10 +1407,12 @@ int main(int, char**) {
   RUN_TEST(test_a_rebooted_radio_is_a_new_session);
   RUN_TEST(test_the_same_millisecond_is_not_newer);
   RUN_TEST(test_each_new_fix_takes_the_next_sequence);
-  RUN_TEST(test_no_coordinates_is_no_fix_until_one_comes_back);
+  RUN_TEST(test_a_write_with_no_coordinates_changes_nothing);
   RUN_TEST(test_a_session_is_never_zero);
+  RUN_TEST(test_a_fix_nobody_feeds_goes_stale);
+  RUN_TEST(test_the_phone_fix_beats_the_boards_receiver_while_it_keeps_writing);
+  RUN_TEST(test_a_receiver_that_stops_producing_fixes_goes_stale);
   RUN_TEST(test_the_fix_time_comes_from_the_solution_then_the_write);
-  RUN_TEST(test_measured_after_needs_both_times);
   RUN_TEST(test_dedupe_forwards_a_packet_once);
   RUN_TEST(test_dedupe_forgets_after_the_window);
   RUN_TEST(test_dedupe_survives_more_traffic_than_it_has_slots);

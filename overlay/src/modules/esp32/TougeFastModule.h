@@ -29,6 +29,7 @@
 
 #if defined(ARCH_ESP32) && !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST)
 
+#include "MeshPacketQueue.h"
 #include "SinglePortModule.h"
 #include "concurrency/OSThread.h"
 #include "touge/espnow.h"
@@ -39,6 +40,7 @@
 #include "touge/phonebatch.h"
 #include "touge/ride.h"
 #include "touge/hop.h"
+#include "touge/lorapos.h"
 #include "touge/rideclock.h"
 #include "touge/schedule.h"
 
@@ -53,8 +55,6 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     virtual int32_t runOnce() override;
     virtual bool wantPacket(const meshtastic_MeshPacket *p) override;
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
-    // Stamps our phone's LoRa position with our fix identity on its way out.
-    virtual void alterReceived(meshtastic_MeshPacket &mp) override;
 
   private:
     // Re-derives the fast network when the primary channel's key changes, and
@@ -79,12 +79,43 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // Everything a beacon carries except the name, lease beacon or extra.
     void fillBeacon(touge::Position &p, uint32_t nowMs);
 
-    // Our own fix and the identity both lanes send it under (SCALE-PLAN 5a).
-    // noteOwnFix reads it from localPosition; see touge/ownfix.h.
-    void noteOwnFix();
+    // Our own fix and the identity both lanes send it under (SCALE-PLAN 5a):
+    // the phone's from its writes, the receiver's read every pass while the
+    // phone is quiet. See touge/ownfix.h.
+    void notePhoneFix(const meshtastic_MeshPacket &mp);
+    void noteGnssFix(uint32_t nowMs);
     static touge::Fix fixOf(const meshtastic_Position &pos);
+    static bool readPosition(const meshtastic_MeshPacket &mp, meshtastic_Position &pos);
     meshtastic_Position ownLoraPosition() const;
     touge::OwnFix ownFix_;
+
+    // ---- Our LoRa position, and the TX queue's one per car (SCALE-PLAN 5b, 5c)
+    //
+    // This radio sends its car's LoRa position from ownFix_, every
+    // loraIntervalMs_, while loraOwned(); PositionModule's own broadcasts stand
+    // down meanwhile (core-patches/0011). See touge/lorapos.h.
+    void sendLoraPosition(uint32_t nowMs);
+    // A Touge app has said hello since boot, the primary channel is a ride, and
+    // there is a fix, fresh or not.
+    bool loraOwned() const;
+    // This car and every node heard on either radio within RIDER_DROP_MS.
+    uint32_t carsOnRide() const;
+    // A position from another car that we may relay, noted for the TX queue.
+    void noteRelayedPosition(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos);
+    // The hooks in core-patches/0010 and 0011.
+    static bool ownsPositionBroadcast();
+    static TougeTxPlace placeTxPacket(const std::vector<meshtastic_MeshPacket *> &queue, const meshtastic_MeshPacket *p,
+                                      size_t &at);
+    static bool inTxQueue(uint32_t from, uint32_t id, void *ctx);
+    touge::TxPositions txPositions_;
+    uint32_t lastLoraMs_ = 0;
+    // The gap after our last LoRa position, 0 before the first; reported as "li".
+    uint32_t loraIntervalMs_ = 0;
+    // What the TX queue did with positions: took an older one's place, or
+    // turned away one its car already had newer queued.
+    uint32_t txReplaced_ = 0;
+    uint32_t txRefused_ = 0;
+    bool rideAppSeen_ = false;
 
     // The receiver's own fix to the phone, about 1 Hz, so a tablet with no GPS
     // can navigate on it. See touge/gnssfix.h.

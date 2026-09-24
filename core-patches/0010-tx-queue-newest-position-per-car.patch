@@ -1,0 +1,65 @@
+--- a/src/mesh/MeshPacketQueue.h
++++ b/src/mesh/MeshPacketQueue.h
+@@ -46,4 +46,13 @@
+ 
+     /* Attempt to find a packet from this queue. Return true if it was found. */
+     bool find(const NodeNum from, const PacketId id);
+-};
+\ No newline at end of file
++};
++
++/// Touge (core-patches/0010): where a packet goes when it is a position from a car that already has
++/// one queued. QUEUE: the stock rules. REPLACE: it takes the queued one's place (index at) and turn.
++/// REFUSE: the queued one is newer, so enqueue returns false and the caller releases this one. The
++/// queue holds packets already encrypted, so the fast lane keeps which are positions, and whose.
++/// Null unless the fast lane sets it.
++enum class TougeTxPlace : uint8_t { QUEUE, REPLACE, REFUSE };
++extern TougeTxPlace (*tougeTxPlaceHook)(const std::vector<meshtastic_MeshPacket *> &queue, const meshtastic_MeshPacket *p,
++                                        size_t &at);
+\ No newline at end of file
+--- a/src/mesh/MeshPacketQueue.cpp
++++ b/src/mesh/MeshPacketQueue.cpp
+@@ -32,6 +32,10 @@
+ 
+ MeshPacketQueue::MeshPacketQueue(size_t _maxLen) : maxLen(_maxLen) {}
+ 
++// Touge (core-patches/0010): see MeshPacketQueue.h.
++TougeTxPlace (*tougeTxPlaceHook)(const std::vector<meshtastic_MeshPacket *> &queue, const meshtastic_MeshPacket *p,
++                                 size_t &at) = nullptr;
++
+ bool MeshPacketQueue::empty()
+ {
+     return queue.empty();
+@@ -69,6 +73,32 @@
+ /** enqueue a packet, return false if full */
+ bool MeshPacketQueue::enqueue(meshtastic_MeshPacket *p, bool *dropped)
+ {
++    // Touge (core-patches/0010): one position per car. A newer one keeps the older one's turn, so the
++    // queue goes round the cars however often each sends; in place only where the two sort the same.
++    if (tougeTxPlaceHook) {
++        size_t at = 0;
++        const TougeTxPlace place = tougeTxPlaceHook(queue, p, at);
++        if (place == TougeTxPlace::REFUSE) {
++            if (dropped) {
++                *dropped = false;
++            }
++            return false;
++        }
++        if (place == TougeTxPlace::REPLACE && at < queue.size()) {
++            meshtastic_MeshPacket *older = queue[at];
++            const bool sameOrder = !CompareMeshPacketFunc(p, older) && !CompareMeshPacketFunc(older, p);
++            packetPool.release(older);
++            if (sameOrder) {
++                queue[at] = p;
++                if (dropped) {
++                    *dropped = false;
++                }
++                return true;
++            }
++            queue.erase(queue.begin() + at);
++        }
++    }
++
+     // no space - try to replace a lower priority packet in the queue
+     if (queue.size() >= maxLen) {
+         bool replaced = replaceLowerPriorityPacket(p);

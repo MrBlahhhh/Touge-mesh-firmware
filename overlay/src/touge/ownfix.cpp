@@ -24,28 +24,34 @@ void setMeasured(Fix& fix, uint32_t timestamp, int32_t millisAdjust, uint32_t ti
   fix.fixMs = (uint16_t)(ms % 1000);
 }
 
-bool measuredAfter(const Fix& a, const Fix& b) {
-  if (a.fixSec == 0 || b.fixSec == 0) return false;
-  return a.fixSec != b.fixSec ? a.fixSec > b.fixSec : a.fixMs > b.fixMs;
+void OwnFix::fromPhone(const Fix& reading, uint32_t nowMs, uint32_t entropy) {
+  // A write with no coordinates (a stock app setting only the clock) says
+  // nothing about where the car is.
+  if (!take(reading, entropy)) return;
+  fedMs_ = nowMs;
+  phoneFedMs_ = nowMs;
+  phoneFed_ = true;
 }
 
-void OwnFix::observe(const Fix& reading, uint32_t entropy) {
-  if (reading.lat == 0 && reading.lon == 0) {
-    has_ = false;
-    return;
-  }
+void OwnFix::fromGnss(const Fix& reading, uint32_t nowMs, uint32_t entropy) {
+  if (phoneFed_ && (uint32_t)(nowMs - phoneFedMs_) < PHONE_FRESH_MS) return;
+  const uint32_t seqBefore = seq_;
+  if (!take(reading, entropy)) return;
+  if (seq_ != seqBefore) fedMs_ = nowMs;
+}
+
+bool OwnFix::take(const Fix& reading, uint32_t entropy) {
+  if (reading.lat == 0 && reading.lon == 0) return false;
+  has_ = true;
   // The same fix read again, on the next pass or back after a lost lock.
-  if (seq_ != 0 && sameFix(reading, fix_)) {
-    has_ = true;
-    return;
-  }
+  if (seq_ != 0 && sameFix(reading, fix_)) return true;
   if (session_ == 0) {
     session_ = (uint16_t)(entropy ^ (entropy >> 16));
     if (session_ == 0) session_ = 1;
   }
   fix_ = reading;
   seq_++;
-  has_ = true;
+  return true;
 }
 
 FixId OwnFix::id() const {

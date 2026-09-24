@@ -1,0 +1,79 @@
+#include "lorapos.h"
+
+#include "ownfix.h"
+
+namespace touge {
+
+uint32_t loraIntervalMs(uint32_t cars, uint32_t airtimeMs) {
+  if (cars < 1) cars = 1;
+  const uint64_t wanted = (uint64_t)cars * cars * airtimeMs * 100 / LORA_POSITION_SHARE_PCT;
+  if (wanted <= LORA_TARGET_MS) return LORA_TARGET_MS;
+  // Past the cap the ride is bigger than the preset carries, and it runs over
+  // its share rather than going quiet.
+  if (wanted >= LORA_MAX_MS) return LORA_MAX_MS;
+  return (uint32_t)wanted;
+}
+
+FixId fixIdOf(uint32_t sensorId, uint32_t seqNumber, uint32_t timestamp, int32_t millisAdjust, uint32_t time) {
+  Fix measured;
+  setMeasured(measured, timestamp, millisAdjust, time);
+  FixId fix;
+  // Our sessions are 16 bits. A wider sensor_id is somebody else's use of the
+  // field, not a session.
+  fix.session = sensorId <= 0xFFFF ? (uint16_t)sensorId : 0;
+  fix.seq = seqNumber;
+  fix.fixSec = measured.fixSec;
+  fix.fixMs = measured.fixMs;
+  return fix;
+}
+
+FixRank rankQueued(const FixId& incoming, const FixId& queued) {
+  if (incoming.session == 0 || queued.session == 0) return FixRank::NEWER;
+  return rankFix(incoming, queued);
+}
+
+void TxPositions::clear() {
+  for (size_t i = 0; i < SLOTS; i++) tags_[i] = Tag();
+}
+
+void TxPositions::note(uint32_t from, uint32_t id, const FixId& fix, InQueue inQueue, void* ctx) {
+  if (fix.session == 0) return;
+  Tag* tag = nullptr;
+  for (size_t i = 0; i < SLOTS && tag == nullptr; i++) {
+    if (tags_[i].fix.session != 0 && tags_[i].from == from && tags_[i].id == id) tag = &tags_[i];
+  }
+  for (size_t i = 0; i < SLOTS && tag == nullptr; i++) {
+    if (tags_[i].fix.session == 0) tag = &tags_[i];
+  }
+  // Sent, replaced, or never queued: its place is free.
+  for (size_t i = 0; i < SLOTS && tag == nullptr; i++) {
+    if (!inQueue(tags_[i].from, tags_[i].id, ctx)) tag = &tags_[i];
+  }
+  if (tag == nullptr) return;
+  tag->from = from;
+  tag->id = id;
+  tag->fix = fix;
+}
+
+const FixId* TxPositions::find(uint32_t from, uint32_t id) const {
+  for (size_t i = 0; i < SLOTS; i++) {
+    if (tags_[i].fix.session != 0 && tags_[i].from == from && tags_[i].id == id) return &tags_[i].fix;
+  }
+  return nullptr;
+}
+
+TxPlace TxPositions::placeAgainst(const FixId& incoming, uint8_t incomingHops, const FixId& held, uint8_t heldHops) {
+  switch (rankFix(incoming, held)) {
+    case FixRank::NEWER:
+      return TxPlace::REPLACE;
+    case FixRank::SAME:
+      // The same fix sent twice (a parked phone repeats its last one): keep the
+      // copy that can still travel further.
+      return incomingHops > heldHops ? TxPlace::REPLACE : TxPlace::REFUSE;
+    case FixRank::OLDER:
+    default:
+      return TxPlace::REFUSE;
+  }
+}
+
+}  // namespace touge

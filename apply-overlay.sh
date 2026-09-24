@@ -98,7 +98,10 @@ rm -f "$MODULES.bak"
 # TougeFastModule links against. From build 33, 0008 makes a button hold (4 s from build 35)
 # shut the board down without waiting for release. From build 37, 0009 gives an
 # S3 without PSRAM (the V3) 16 phone-queue places, not 32 (mesh-pb-constants.h),
-# for the internal RAM BLE needs beside Wi-Fi. Without these
+# for the internal RAM BLE needs beside Wi-Fi. From build 39, 0010 keeps one position
+# per car in the LoRa TX queue (MeshPacketQueue.cpp, with a hook the module sets),
+# 0011 has PositionModule stand down while the module sends the LoRa position, and
+# 0005 ranks queued positions by fix identity. Without these
 # the fast lane builds but does not carry. Idempotent: a patch that already
 # reverse-applies is in, and is skipped.
 if ls "$HERE"/core-patches/*.patch >/dev/null 2>&1; then

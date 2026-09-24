@@ -35,7 +35,7 @@
 +    /// the fast lane's delivery counters.
 +    int toPhoneQueueUsed() { return toPhoneQueue.numUsed(); }
 +    int toPhoneQueueFree() { return toPhoneQueue.numFree(); }
-+    uint32_t tougePositionsReplaced = 0; // a car's queued position superseded by its newer one
++    uint32_t tougePositionsReplaced = 0; // one of a car's two positions dropped for its newer fix
 +    uint32_t tougePositionsEvicted = 0;  // oldest queued position dropped to make room
 +    uint32_t tougePhoneDropped = 0;      // packet lost to a full queue with no position to evict
 +    /// Touge: whether a packet is still waiting in the phone queue, so the fast lane can tell a
@@ -59,22 +59,27 @@
      /// returns 0 to allow further processing
 --- a/src/mesh/MeshService.cpp
 +++ b/src/mesh/MeshService.cpp
-@@ -479,6 +479,77 @@
+@@ -479,6 +479,88 @@
      }
  }
  
-+// Touge (core-patches/0005): a decoded position, and which lane it came in on. The 2.4 GHz
-+// lane hands positions over with both hop fields zero; a LoRa one carries its hop budget.
++// Touge (core-patches/0005): a decoded position, and the fix it names (touge/lorapos.h).
 +#ifndef ARCH_PORTDUINO
++#include "touge/lorapos.h"
++
 +static bool isPhonePosition(const meshtastic_MeshPacket *q)
 +{
 +    return q && q->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
 +           q->decoded.portnum == meshtastic_PortNum_POSITION_APP;
 +}
 +
-+static bool isFastLanePosition(const meshtastic_MeshPacket *q)
++static bool phonePositionFix(const meshtastic_MeshPacket *q, touge::FixId &fix)
 +{
-+    return q->hop_start == 0 && q->hop_limit == 0;
++    meshtastic_Position pos = meshtastic_Position_init_default;
++    if (!pb_decode_from_bytes(q->decoded.payload.bytes, q->decoded.payload.size, &meshtastic_Position_msg, &pos))
++        return false;
++    fix = touge::fixIdOf(pos.sensor_id, pos.seq_number, pos.timestamp, pos.timestamp_millis_adjust, pos.time);
++    return true;
 +}
 +#endif
 +
@@ -84,17 +89,23 @@
 +    (void)p;
 +    return false;
 +#else
-+    if (!isPhonePosition(p))
++    touge::FixId incoming;
++    if (!isPhonePosition(p) || !phonePositionFix(p, incoming))
 +        return false;
 +    for (int i = 0; i < toPhoneQueue.numUsed(); i++) {
 +        meshtastic_MeshPacket *&queued = toPhoneQueue.at(i);
-+        // Same car, same lane: the app ranks the lanes itself, so a LoRa copy must not
-+        // take the place of a fast-lane one.
-+        if (!isPhonePosition(queued) || queued->from != p->from || isFastLanePosition(queued) != isFastLanePosition(p))
++        touge::FixId held;
++        if (!isPhonePosition(queued) || queued->from != p->from || !phonePositionFix(queued, held))
 +            continue;
++        tougePositionsReplaced++;
++        // By fix identity, not arrival: a late copy of an older fix is dropped and the newer one
++        // keeps its place. Without an identity (a stock sender) the later arrival wins.
++        if (touge::rankQueued(incoming, held) == touge::FixRank::OLDER) {
++            releaseToPool(p);
++            return true;
++        }
 +        releaseToPool(queued);
 +        queued = p;
-+        tougePositionsReplaced++;
 +        return true;
 +    }
 +    return false;
@@ -137,7 +148,7 @@
  void MeshService::sendToPhone(meshtastic_MeshPacket *p)
  {
      perhapsDecode(p);
-@@ -503,6 +574,11 @@
+@@ -503,6 +585,11 @@
  #endif
  #endif
  
@@ -149,7 +160,7 @@
      if (toPhoneQueue.numFree() == 0) {
          // ROUTING_APP is the phone's only delivery confirmation, so it displaces the oldest like
          // text does. Gate the variant: decoded.portnum aliases encrypted.size in the union.
-@@ -513,8 +589,13 @@
+@@ -513,8 +600,13 @@
              meshtastic_MeshPacket *d = toPhoneQueue.dequeuePtr(0);
              if (d)
                  releaseToPool(d);

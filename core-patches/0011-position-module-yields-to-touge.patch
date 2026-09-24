@@ -1,0 +1,39 @@
+--- a/src/modules/PositionModule.h
++++ b/src/modules/PositionModule.h
+@@ -120,4 +120,9 @@
+     bool hasTraveledOverThreshold;
+ };
+ 
+-extern PositionModule *positionModule;
+\ No newline at end of file
++extern PositionModule *positionModule;
++
++/// Touge (core-patches/0011): true while the fast lane sends this node's LoRa position itself, so the
++/// periodic and smart broadcasts stand down instead of adding a second one. Replies to a position
++/// request still go. Null unless the fast lane sets it.
++extern bool (*positionBroadcastOwnedHook)();
+\ No newline at end of file
+--- a/src/modules/PositionModule.cpp
++++ b/src/modules/PositionModule.cpp
+@@ -24,6 +24,9 @@
+ 
+ PositionModule *positionModule;
+ 
++// Touge (core-patches/0011): see PositionModule.h.
++bool (*positionBroadcastOwnedHook)() = nullptr;
++
+ PositionModule::PositionModule()
+     : ProtobufModule("position", meshtastic_PortNum_POSITION_APP, &meshtastic_Position_msg), concurrency::OSThread("Position")
+ {
+@@ -400,6 +403,11 @@
+ 
+ bool PositionModule::sendOurPosition()
+ {
++    // Touge (core-patches/0011): not sent, so the cadence is not stamped; stock resumes on the next
++    // pass once the fast lane lets go.
++    if (positionBroadcastOwnedHook && positionBroadcastOwnedHook())
++        return false;
++
+     bool requestReplies = currentGeneration != radioGeneration;
+ 
+     // If we changed channels, ask everyone else for their latest info

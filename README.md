@@ -145,6 +145,36 @@ Meshtastic's `sensor_id`, `seq_number`, `timestamp` and
 `timestamp_millis_adjust`, so the phone knows a fix heard on both lanes is one
 fix, and an older one arriving late is older (`rankFix` in `touge/frame.h`).
 
+## The LoRa position
+
+From build 39 the radio sends its car's LoRa position itself (SCALE-PLAN 5b);
+the phone only writes its fix to its own radio, which never goes on air.
+
+- **Which fix.** The phone's, from its write (at least once a second); the
+  board's own GNSS fills in once the phone has not written for 3 s. Both lanes
+  stop 15 s after the last write or new GNSS fix, counted on the radio's clock
+  (`touge/ownfix.h`).
+- **How often.** Every 5 s, longer when the group is more than the modem preset
+  carries: cars x cars x the packet's airtime held under 30 % of the channel,
+  capped at 20 s (`loraIntervalMs` in `touge/lorapos.h`). The lane report
+  carries it as `li`.
+- **When.** Only while a Touge app has said hello since boot and the primary
+  channel has a real key. A stock app on a Touge radio, or a radio handed back
+  to a default channel, keeps Meshtastic's own position broadcasts. While the
+  radio sends, PositionModule's periodic and smart broadcasts stand down
+  (core-patches/0011); replies to a position request still go.
+- **What.** A standard Meshtastic Position on the first channel sharing
+  positions, BACKGROUND priority like PositionModule's: coordinates, speed,
+  track, source, `time`, and the fix identity above. Stock nodes and apps read
+  it as an ordinary position.
+
+The LoRa TX queue keeps one position per car (5c, core-patches/0010). It holds
+packets already encrypted, so the module notes each position with an identity
+as it goes to the router, keyed by origin and packet id. A newer one takes the
+older one's place and turn, so the queue goes round the cars; a late older copy
+is refused. Text, control and positions without an identity keep the stock
+rules. The phone queue (0005) ranks queued positions by the same identity.
+
 The payload is AES-256-CTR under a key derived from the channel PSK. The packet
 id is half the nonce, which is why it is 32 bits and why the counter is kept in
 NVS: counting up from zero after a reboot would replay nonces and hand anyone

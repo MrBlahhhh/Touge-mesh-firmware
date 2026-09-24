@@ -6,16 +6,15 @@ index f97a89a..47a6c7a 100644
          return false;
      } else if (IS_ONE_OF(p.decoded.portnum, meshtastic_PortNum_POSITION_APP, meshtastic_PortNum_WAYPOINT_APP,
                           meshtastic_PortNum_ALERT_APP, meshtastic_PortNum_TELEMETRY_APP) &&
-+               // Touge: a position addressed to this node is the phone keeping its own radio's fix
-+               // current for the 2.4 GHz beacon - it is local, never goes on air, and at 1 Hz it is
-+               // the whole reason the fast lane has a fresh position. Rate-limiting it rejected 1 Hz
-+               // of packets and sent a queue-status back for each, which overflowed the to-phone
-+               // queue and dropped the fast lane. So own-position feeds are never rate limited, and
-+               // the on-air broadcast is limited to 5 s rather than 10.
++               // Touge: a position addressed to this node is the phone handing its own radio the fix
++               // both lanes send - it is local, never goes on air, and comes at 1 Hz or faster.
++               // Rate-limiting it rejected most of them and sent a queue-status back for each, which
++               // overflowed the to-phone queue and dropped the fast lane. So own-position feeds are
++               // never rate limited. The Touge app sends no on-air position from build 39 (the radio
++               // does), so on-air ones keep stock's 10 s.
 +               !isToUs(&p) &&
                 lastPortNumToRadio[p.decoded.portnum] &&
--               Throttle::isWithinTimespanMs(lastPortNumToRadio[p.decoded.portnum], TEN_SECONDS_MS)) {
-+               Throttle::isWithinTimespanMs(lastPortNumToRadio[p.decoded.portnum], FIVE_SECONDS_MS)) {
+                Throttle::isWithinTimespanMs(lastPortNumToRadio[p.decoded.portnum], TEN_SECONDS_MS)) {
          // TODO: [Issue #6700] Make this rate limit throttling scale up / down with the preset
          LOG_WARN("Rate limit portnum %d", p.decoded.portnum);
          meshtastic_QueueStatus qs = router->getQueueStatus();
