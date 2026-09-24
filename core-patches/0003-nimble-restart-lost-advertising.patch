@@ -1,0 +1,55 @@
+diff --git a/src/nimble/NimbleBluetooth.cpp b/src/nimble/NimbleBluetooth.cpp
+--- a/src/nimble/NimbleBluetooth.cpp
++++ b/src/nimble/NimbleBluetooth.cpp
+@@ -235,6 +235,8 @@
+             }
+         }
+ 
++        restartAdvertisingIfDark();
++
+         while (runOnceHasWorkToDo()) {
+             /*
+               PROCESS fromPhoneQueue BEFORE toPhoneQueue:
+@@ -259,10 +261,42 @@
+             runOnceHandleToPhoneQueue(); // push data from getFromRadio to onRead
+         }
+ 
++        // Touge: onDisconnect (NimBLE task) wakes this thread with setIntervalFromNow(0), but if that
++        // lands while runOnce is executing, OSThread::run overwrites it with the value returned here
++        // and the advertising restart is never serviced: the radio goes dark until it reboots. A
++        // phone tearing the link down mid-read makes that likely, since onDisconnect runs the moment
++        // the pending onRead returns, while this loop is still preloading. Re-check, and wake once a
++        // second while no phone is connected so a lost wakeup costs a second.
++        if (pendingStartAdvertising)
++            return 0;
++        if (!checkIsConnected())
++            return ADVERTISING_CHECK_MS;
++
+         // the run is triggered via NimbleBluetoothToRadioCallback and NimbleBluetoothFromRadioCallback
+         return INT32_MAX;
+     }
+ 
++    static constexpr int32_t ADVERTISING_CHECK_MS = 1000;
++    uint8_t darkChecks = 0;
++
++    // Touge: the backstop for any lost restart. No connection and no advertising means no phone can
++    // ever reach this radio again. Two checks in a row, a second apart, so the moment between a
++    // connect stopping advertising and BLEServer counting the connection is not mistaken for it.
++    void restartAdvertisingIfDark()
++    {
++        if (!nimbleBluetooth || !bleServer || nimbleBluetooth->isDeInit || !ble_hs_synced())
++            return;
++        if (bleServer->getConnectedCount() > 0 || ble_gap_adv_active()) {
++            darkChecks = 0;
++            return;
++        }
++        if (++darkChecks < 2)
++            return;
++        darkChecks = 0;
++        LOG_WARN("BLE: no connection and not advertising; restarting advertising");
++        nimbleBluetooth->startAdvertising();
++    }
++
+     virtual void onConfigStart() override
+     {
+         LOG_INFO("BLE onConfigStart");
