@@ -29,6 +29,21 @@ static PhoneRecord car(uint32_t node, uint32_t frameId, uint32_t heardMs) {
   return r;
 }
 
+// A receive callback can stamp heardMs a few ms after the loop took the nowMs
+// it packs with. That negative age wrapped to 65.5 s, and the phone threw away
+// every fresh 2.4 GHz position as older than LoRa.
+void test_a_record_heard_after_the_pack_time_is_age_zero() {
+  PhoneRecord in[1] = {car(0x33, 1, 1005)};
+  uint8_t buf[BATCH_MAX_PAYLOAD];
+  size_t n = encodeBatch(in, 1, 1, 1000, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_UINT8(0, buf[BATCH_HEADER + 20]);
+  TEST_ASSERT_EQUAL_UINT8(0, buf[BATCH_HEADER + 21]);
+  BatchHeader h;
+  PhoneRecord out[1];
+  TEST_ASSERT_TRUE(decodeBatch(buf, n, h, out, 1));
+  TEST_ASSERT_EQUAL_UINT32(1000, out[0].heardMs);
+}
+
 void test_a_batch_round_trips_every_field() {
   PhoneRecord in[3] = {car(0xb03436ae, 7, 900), car(0x11, 0xFFFFFFF0, 950), car(0x22, 1, 1000)};
   in[1].lat = -1;
@@ -498,6 +513,7 @@ void test_a_stalled_reader_gets_the_newest_not_the_backlog() {
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_a_batch_round_trips_every_field);
+  RUN_TEST(test_a_record_heard_after_the_pack_time_is_age_zero);
   RUN_TEST(test_a_known_batch_encodes_to_the_pinned_bytes);
   RUN_TEST(test_the_first_byte_cannot_be_json_or_voice);
   RUN_TEST(test_a_truncated_batch_is_rejected_whole);

@@ -31,8 +31,12 @@ void encodeRecord(const PhoneRecord& r, uint32_t nowMs, uint8_t* b) {
   put32(b + 12, r.frameId);
   put16(b + 16, r.headingCdeg);
   put16(b + 18, r.speedDkmh);
-  const uint32_t age = nowMs - r.heardMs;
-  put16(b + 20, age > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)age);
+  // Signed: nowMs is the loop's timestamp, taken before a receive callback in
+  // the same pass can stamp heardMs a few ms later. Unsigned, that negative
+  // age wrapped and saturated to 65.5 s, and the phone threw away every fresh
+  // 2.4 GHz position as older than LoRa.
+  const int32_t age = (int32_t)(nowMs - r.heardMs);
+  put16(b + 20, age <= 0 ? (uint16_t)0 : age > 0xFFFF ? (uint16_t)0xFFFF : (uint16_t)age);
   b[22] = (uint8_t)r.rssi;
   b[23] = (uint8_t)((r.external ? 0x01 : 0) | ((r.lane & 0x03) << 1) | ((r.hopsAway & 0x0F) << 4));
 }

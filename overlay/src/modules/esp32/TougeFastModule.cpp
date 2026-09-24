@@ -161,7 +161,8 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // 29: early beacons keep the 1 s deadline, early phone positions are held, and km/h + track e5 both ways.
 // 30: 1 s 32-slot leased schedule (frame v2); positions to the phone in newest-wins batches
 //     (0xC1) once the app says hello, fs/fq link counters, core-patches/0005-0007.
-const uint32_t TOUGE_BUILD = 30;
+// 31: batch record ages clamp at zero instead of wrapping to 65.5 s.
+const uint32_t TOUGE_BUILD = 31;
 
 // How long a board hunts before giving up and waiting at home.
 //
