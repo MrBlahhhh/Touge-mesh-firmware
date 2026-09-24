@@ -112,8 +112,8 @@ packet on the same port, over the BLE link it already has open.
 ## What is on the wire
 
 A position frame is 89 bytes: a 14-byte header, a 67-byte body and an 8-byte
-tag, plus the name every 30 s. Frame version 3, from build 38; boards on
-another version drop it.
+tag, plus the name every 30 s. Frame version 4, from build 40, which reads two
+flag bits the election now depends on; boards on another version drop it.
 
 ```
 header  0      magic 'T'
@@ -127,9 +127,9 @@ body    0..7   lat, lon as int32 at 1e7
         8      heading, two-degree steps
         9      speed, mph
         10     battery percent
-        11     flags: fix, phone's fix, GPS-locked clock, extra beacon
+        11     flags: fix, phone's fix, GPS-locked clock, extra beacon, fit to keep time
         12     channel belief (hop index and generation)
-        13..17 reference car, its hops and whether it is GPS-locked
+        13..17 reference car, its hops, whether it is GPS-locked and fit to keep time
         18     leased slot
         19..22 lease and schedule generations
         23..54 slot map: who was heard in each of the 32 slots
@@ -257,6 +257,22 @@ one relayed by a neighbour carries that neighbour's forwarding jitter. Good to
 a few milliseconds against a 27 ms slot, and it keeps the ride working in a
 tunnel, or on a board with no receiver fitted at all.
 
+Because only direct copies count, the reference has to be a car the ride hears
+well. From build 40 each car says in every beacon whether it is **fit to keep
+time**: a link is solid when, in 6 of the last 8 seconds, it heard that
+neighbour's lease beacon and the beacon's slot map showed it back, and a car
+is fit when at least half the cars it hears are on solid links. Once fit, a
+third keeps it, and either change needs 3 s on end. Among cars equally locked
+or unlocked a fit one wins, then the lowest node number. Every car ranks the
+flags the candidates advertise themselves, so they agree, and among fit cars
+the order never moves. Before build 40 the lowest node number won outright,
+which on the bench gave the job to the moto's deliberately weak radio.
+
+A count of how many radios hear each car was tried first and failed in the
+host simulation: while a ride powers on or two groups meet, every count climbs
+several points a second, each car ranked whoever it heard from last highest,
+and parents changed with every beacon, so nobody synced.
+
 ### Mixed rides, which is the normal case
 
 Some cars will have a GNSS receiver on the board and some will only have a
@@ -267,17 +283,19 @@ getting it wrong is worse than having no schedule:
 take the cycle from their pulse; cars without take it from the reference's
 beacons. If the reference is itself free-running, those two groups end up on
 cycles that have nothing to do with each other, and they collide *every time*
-rather than occasionally. So a locked car always wins the job and the lowest
-node number only breaks the tie. Every beacon carries a flag saying whether the
-sender's clock is locked, which is how everyone agrees on the choice.
+rather than occasionally. So a locked car always wins the job, and fitness,
+then the lowest node number, only break the tie. Every beacon carries a flag saying
+whether the sender's clock is locked, which is how everyone agrees on the
+choice.
 
 **The reference is therefore not always slot zero.** It used to be, back when
 it was simply the lowest number. Now a locked car can outrank a lower-numbered
 free-running one, so its beacon marks its own slot rather than the cycle start,
 and `syncTo` subtracts `referenceSlot` to recover the boundary.
 
-If nobody on the ride has a fix, the lowest number takes it and everyone
-free-runs together, which is consistent because none of them has anything
+If nobody on the ride has a fix, the lowest-numbered fit car takes it (the
+lowest number outright while nobody is fit yet, at power-on) and everyone
+follows its beacons, which is consistent because none of them has anything
 better to agree on.
 
 Cardo's DMC does this (US10277748) with a leader election and a designated

@@ -26,9 +26,12 @@ enum FrameType : uint8_t {
 
 static const uint8_t FRAME_MAGIC = 0x54; // 'T', same as the app's VoicePacket
 // 2 from build 30: a whole-byte slot and two lease generations. 3 from build
-// 38: every position carries its fix identity (FixId). Boards on different
+// 38: every position carries its fix identity (FixId). 4 from build 40: the
+// same bytes, but flag bits saying whether the sender, and its reference, are
+// fit to keep time (Schedule::fitToKeepTime), which the reference election now
+// reads; a build 39 radio would elect differently. Boards on different
 // versions drop each other's frames; every radio is flashed together.
-static const uint8_t FRAME_VERSION = 3;
+static const uint8_t FRAME_VERSION = 4;
 static const size_t FRAME_HEADER = 14;
 
 // ESP-NOW tops out at 250 bytes and is the tightest of the two radios, so it
@@ -148,6 +151,9 @@ struct Position {
   // Rides in a flag bit that build 30 and 31 left zero; they read it as a
   // copy that has already used up its hops. See schedule.h.
   bool extra = false;
+  // Whether this car hears the ride well enough to keep time for it: see
+  // Schedule::fitToKeepTime. Flag 0x20.
+  bool fitToKeepTime = false;
   // Which transmit slot this car leases, or SLOT_NONE. A whole byte since
   // version 2; the old nibble capped the schedule at fifteen.
   uint8_t slot = SLOT_NONE;
@@ -198,18 +204,21 @@ struct Position {
   // other and counting to infinity when the reference goes away.
   uint32_t refId = 0;
   uint8_t refHops = REF_UNREACHABLE;
-  // Whether that reference is disciplined by its own GPS. Travels with the id
-  // because the rule is "locked beats unlocked, then lowest number", and a car
-  // relaying the claim has to relay what makes it good.
+  // Whether that reference is disciplined by its own GPS, and fit to keep
+  // time. Both travel with the id because the rule is "locked, then fit, then
+  // lowest number", and a car relaying the claim has to relay what makes it
+  // good.
   bool refLocked = false;
+  bool refFit = false;
   // Carried only now and then. A name on every ping is pure airtime, and the
   // roster on the other end only needs to learn it once.
   char name[16] = {0};
 };
 
-// Body, version 3: 0-7 lat, lon | 8 heading | 9 speed | 10 battery | 11 flags
-// | 12 hop | 13-16 reference | 17 its hops and lock | 18 slot | 19-22 lease and
-// schedule generations | 23-54 slot map | 55-66 fix identity | 67.. name.
+// Body, version 4: 0-7 lat, lon | 8 heading | 9 speed | 10 battery | 11 flags
+// | 12 hop | 13-16 reference | 17 its hops, lock and fitness | 18 slot | 19-22
+// lease and schedule generations | 23-54 slot map | 55-66 fix identity | 67..
+// name.
 static const size_t POSITION_MIN = 23 + SLOT_MAP_LEN + FIX_ID_LEN;
 
 size_t encodePosition(const Position& p, uint8_t* out, size_t cap);

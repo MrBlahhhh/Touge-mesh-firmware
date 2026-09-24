@@ -190,7 +190,11 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     15 s after the last fix fed; the phone's fix beats the board's GNSS while it keeps writing; the
 //     TX queue and the phone queue keep the newest position per car by fix identity (0010, 0005);
 //     "li" in the lane report. 0001 back to stock's 10 s for on-air positions from a phone.
-const uint32_t TOUGE_BUILD = 39;
+// 40: the reference must be fit to keep time (most of its links working both ways, flag bits in frame
+//     v4) before the lowest node number counts; a radio that hears the ride poorly listens longer and
+//     claims on older maps, a second lost lease backs off, silence from neighbours heard poorly drowns
+//     no lease, and a lease no slot map has shown for 20 s is given up.
+const uint32_t TOUGE_BUILD = 40;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -727,6 +731,9 @@ void TougeFastModule::fillBeacon(Position &p, uint32_t nowMs)
     p.refId = schedule_.referenceId();
     p.refHops = schedule_.hopsToReference();
     p.refLocked = schedule_.referenceLocked();
+    // Whether we, and the reference, hear the ride well enough to keep time.
+    p.fitToKeepTime = schedule_.announceFit();
+    p.refFit = schedule_.referenceFit();
 
     uint8_t battery = powerStatus ? (uint8_t)powerStatus->getBatteryChargePercent() : 255;
     p.batteryPct = battery;
@@ -1138,10 +1145,10 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
                 const uint8_t hopsAway = p.extra ? 0 : (uint8_t)(FAST_HOPS - f.hops);
                 mesh_.note(f.src, p, HEARD_FAST, rx.rssi, hopsAway, nowMs, rx.chan);
                 // Lease beacons heard directly only: the slot map says who got
-                // through in which slot. A forward says nothing about that, and
-                // an extra was not sent in the slot it names, so counting it
-                // could make a clashed lease look heard.
-                if (f.hops == FAST_HOPS && !p.extra) schedule_.heardSlot(p.slot, f.src, nowMs);
+                // through in which slot, and the link record how well. A forward
+                // says nothing about that, and an extra was not sent in the slot
+                // it names, so counting it could make a clashed lease look heard.
+                if (f.hops == FAST_HOPS && !p.extra) schedule_.heardBeacon(f.src, p, nowMs);
                 // A newer belief about the channel wins, wherever it comes
                 // from. Only acted on after the tag has already passed, so a
                 // stranger cannot walk the ride off its channel.
@@ -1424,11 +1431,12 @@ void TougeFastModule::status(uint32_t nowMs)
         snprintf(slotText, sizeof(slotText), "none@g%u", (unsigned)schedule_.generation());
     }
 
-    LOG_INFO("touge: ch=%u slot=%s/%u known=%u ref=%08x%s +%uhop via=%08x clock=%s fast=%u "
+    LOG_INFO("touge: ch=%u slot=%s/%u known=%u ref=%08x%s +%uhop fit=%u/%u via=%08x clock=%s fast=%u "
              "suppressed=%u dropped=%u txfail=%u(%d) txpwr=%ddBm",
              (unsigned)fastRadio.channel(), slotText, (unsigned)MAX_SLOTS,
              (unsigned)schedule_.known(), (unsigned)schedule_.referenceId(),
              schedule_.weAreReference() ? " (us)" : "", (unsigned)schedule_.hopsToReference(),
+             (unsigned)schedule_.fitToKeepTime(), (unsigned)schedule_.referenceFit(),
              (unsigned)schedule_.parentId(), clock, (unsigned)fastNeighbours(nowMs),
              (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
              (unsigned)fastRadio.sendFailed(), fastRadio.lastSendError(),

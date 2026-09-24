@@ -70,6 +70,34 @@
 // others plus us). At the old 250 ms cycle a car's slot came round four times
 // a second and it used one of them, so the nine slots there were really 36
 // transmit chances of which 27 went unused. This spends them.
+//
+// ## Who keeps the clock
+//
+// Without GPS one car's beacons mark the second for everyone, and only copies
+// heard straight from it count, so it has to be a car the ride hears well.
+// Lowest node number alone gave the job to the moto's deliberately weak radio
+// on the bench (builds 38 and 39), heard at -82 to -91 dBm. So each car says in
+// every beacon whether it is fit to keep time (fitToKeepTime): whether most of
+// its links work both ways. The reference is a GPS-locked car first, then a
+// fit one, then the lowest node number. Each term is the candidate's own
+// advertised flag, so every car ranks the same facts, and among fit cars the
+// order is fixed, as it always was.
+//
+// A count ("the car heard by the most radios") was tried first and failed in
+// the host simulation: while a ride powers on or two groups merge, every car's
+// count climbs several points a second, so each car ranked the one it heard
+// last highest, parents changed with every beacon, and a car's parent's
+// beacon never reached it as its parent. Cars stayed on the wrong clock.
+//
+// ## A car that hears the ride poorly
+//
+// The same radio claimed slots others held, lost them, and claimed again: its
+// view of which slots were taken came from maps it had mostly missed. A car
+// whose own reception is poor (see hearingPoorly) listens longer, trusts older
+// maps, and waits while a neighbour's map is overdue, and when it loses a
+// lease it listens again rather than moving straight to another slot. Any car
+// that listens again after a second lease lost before settling waits a random
+// extra, so two that keep landing together stop doing so.
 
 #include <stdint.h>
 #include <stddef.h>
@@ -132,6 +160,29 @@ static const uint32_t HEARD_WINDOW_MS = SCHEDULE_MS + SCHEDULE_MS / 2;
 static const uint32_t CLASH_PATIENCE_MS = 2 * HEARD_WINDOW_MS;
 static const uint32_t ESTABLISHED_LEASE_MS = 10000;
 
+// Seconds of lease beacons remembered per slot, one bit each: whether we heard
+// it, and whether its slot map showed us back. Fitness and hearing quality are
+// read from these.
+static const uint8_t LINK_SECONDS = 8;
+
+// A link is solid when it worked both ways in this many of the last
+// LINK_SECONDS. A radio heard one frame in two manages about one in three.
+static const uint8_t SOLID_LINK_SECONDS = 6;
+
+// How long the link record must say otherwise before a car becomes, or stops
+// being, fit to keep time.
+static const uint32_t FIT_HOLD_MS = 3 * SCHEDULE_MS;
+
+/**
+ * Hearing well is at least three in four of the lease beacons due from the
+ * cars we hear at all (hearingPoorly). Below that, a neighbour's latest map is
+ * often a few seconds old, so a car claiming a slot goes on maps up to this
+ * old instead of HEARD_WINDOW_MS, and waits while a leased neighbour's is
+ * older still. Three beacons.
+ */
+static const uint32_t MAP_TRUST_MS = 3 * SCHEDULE_MS;
+
+
 /** A car's one-byte tag in slot maps. Never 0, which means nobody. */
 uint8_t slotTag(uint32_t id);
 
@@ -166,6 +217,29 @@ static const uint32_t JOIN_LISTEN_MS = 2 * SCHEDULE_MS + 500;
 
 static_assert(JOIN_LISTEN_MS >= 2 * SCHEDULE_MS, "listen through two beacons from everyone");
 
+/**
+ * A lease no slot map has shown for this long is given up, and the car rejoins
+ * as a newcomer. The ride lets a lease lapse after LEASE_MS without hearing its
+ * holder; a car that kept its own past that would come back with the older
+ * lease and move whoever had taken the slot. Two thirds of it, because a weak
+ * car with one neighbour sees a map showing it only about one second in four.
+ */
+static const uint32_t UNHEARD_MS = LEASE_MS * 2 / 3;
+
+/**
+ * From the second lease lost before it settled, a listen before the next claim
+ * gets a random extra of up to a second per loss, capped here, so a car that
+ * keeps misjudging the slot map stops grabbing slots and two cars that keep
+ * landing on one slot stop meeting there.
+ */
+static const uint32_t BACKOFF_MAX_MS = 6000;
+
+static_assert(UNHEARD_MS > ESTABLISHED_LEASE_MS && UNHEARD_MS < LEASE_MS,
+              "a lease settles before it can go unheard, and is given up before the ride lapses it");
+static_assert(MAP_TRUST_MS > HEARD_WINDOW_MS && MAP_TRUST_MS < REFERENCE_LAPSE_MS,
+              "an older map than the slot map window, from a car still in the vote");
+static_assert(JOIN_LISTEN_MS + BACKOFF_MAX_MS < 65536, "a backed-off listen must fit listenMs_");
+
 /** Where slot `slot` opens, in ms from the start of the schedule. */
 uint32_t slotStartMs(uint8_t slot);
 
@@ -190,23 +264,29 @@ class Schedule {
    * free slots in node-number order: every car with the same roster computes
    * the same assignment, so 25 cars joining together land on 25 slots
    * without colliding first. A slot is free when no car we hear holds it and
-   * no neighbour's slot map shows anyone in it.
+   * no neighbour's slot map shows anyone in it. A car that hears the ride
+   * poorly listens twice as long first and reads older maps; a car that
+   * listens again after a second lease lost before it settles backs off.
    *
    * When rosters differ that can still put two cars on one slot, and they
    * never hear each other. So a holder also reads its own slot in its
    * neighbours' slot maps: if they hear somebody else there more than us, or
    * nobody at all, it gives the slot up and listens again as a joiner. Its
    * unleased beacons stop everybody's extras and put it back in the queue,
-   * where the cars it clashed with now see it and rank it.
+   * where the cars it clashed with now see it and rank it. "Nobody" only
+   * counts from neighbours we hear well: one we hear poorly most likely hears
+   * us poorly too, and its silence would move a weak car off a slot it has
+   * to itself.
    */
   void rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders,
                uint32_t nowMs);
 
   /**
-   * A position frame arrived straight from `senderId` (not forwarded),
-   * advertising `slot`. Feeds the slot map.
+   * A lease beacon arrived straight from `senderId` (not forwarded, not an
+   * extra). Feeds the slot map and the per-slot record of how well we hear
+   * that car and whether its map shows us.
    */
-  void heardSlot(uint8_t slot, uint32_t senderId, uint32_t nowMs);
+  void heardBeacon(uint32_t senderId, const Position& p, uint32_t nowMs);
 
   /** Who we heard in each slot within HEARD_WINDOW_MS, as slot tags. */
   void fillSlotMap(uint32_t nowMs, uint8_t map[SLOT_MAP_LEN]) const;
@@ -263,6 +343,27 @@ class Schedule {
   bool weAreReference() const { return known_ > 0 && referenceId_ == selfId_; }
 
   /**
+   * Whether we hear the ride well enough to keep time for it: at least one
+   * link solid both ways (SOLID_LINK_SECONDS), and solid links at least half
+   * of the cars we hear. Once fit, a third keeps it, and either change needs
+   * FIT_HOLD_MS on end, so a link coming and going does not flip it. Re-read
+   * at every rebuild. In the host sim, without the hold, a radio heard one
+   * frame in two won it on a lucky second and kept the clock for 2.5 s.
+   */
+  bool fitToKeepTime() const { return fit_; }
+
+  /**
+   * The same, for a beacon about to go out. Our own vote ranks us on what we
+   * last put on the air, which is what every other car ranks us on.
+   */
+  bool announceFit() {
+    announcedFit_ = fit_;
+    return fit_;
+  }
+  // The reference's, as we know it: ours, or what it or a neighbour advertised.
+  bool referenceFit() const { return referenceFit_; }
+
+  /**
    * Pin the schedule to a beacon heard directly from the parent.
    *
    * @param senderSlot the slot the beacon itself advertises. Taken from the
@@ -316,15 +417,31 @@ class Schedule {
   void chooseParent(const Rider* riders, size_t maxRiders, uint32_t nowMs);
   void planExtras(const Rider* riders, size_t maxRiders, uint32_t nowMs);
 
+  // Listen again before the next claim, longer after repeated losses.
+  void listenAgain(uint32_t nowMs);
+  // Re-reads fit_ from the link record.
+  void updateFitness(uint32_t nowMs);
+  // Under three in four of the lease beacons due from the cars we hear at all.
+  bool hearingPoorly(uint32_t nowMs) const;
+  // The same for one car, on `slot`; false when we have no record of it there.
+  bool hearsPoorly(uint8_t slot, uint32_t id, uint32_t nowMs) const;
+
   uint32_t selfId_ = 0;
   uint32_t referenceId_ = 0;
   bool referenceLocked_ = false;
+  bool referenceFit_ = false;
+  bool fit_ = false;
+  bool announcedFit_ = false;
+  // When the link record last agreed with fit_ (FIT_HOLD_MS).
+  uint32_t fitSettledMs_ = 0;
   uint32_t parentId_ = 0;
   uint8_t refHops_ = REF_UNREACHABLE;
   bool leasedInEarshot_ = false;
 
   uint8_t slot_ = SLOT_NONE;
   uint32_t leasedAtMs_ = 0;
+  // When a slot map last showed us on our slot, directly or relayed.
+  uint32_t lastHeardUsMs_ = 0;
   // Since when the slot maps have said somebody else is on our slot.
   bool clashing_ = false;
   uint32_t clashSinceMs_ = 0;
@@ -334,18 +451,29 @@ class Schedule {
   // ride's outright, since a wrap-safe compare against its own zero is
   // meaningless once the ride is more than 32768 leases in.
   bool genKnown_ = false;
-  // When we first heard another car since last being alone.
+  // Leases lost in a row before one settled, and how long the listen that
+  // follows runs before a claim (JOIN_LISTEN_MS plus any backoff).
+  uint8_t strikes_ = 0;
+  uint16_t listenMs_ = JOIN_LISTEN_MS;
+  // When we first heard another car since last being alone, or since we last
+  // gave up a lease: the listen runs from here.
   uint32_t firstHeardMs_ = 0;
   bool heardAnyone_ = false;
 
   uint32_t slotHeardMs_[MAX_SLOTS] = {};
   uint8_t slotHeardTag_[MAX_SLOTS] = {}; // 0 until somebody is heard there
+  // The last LINK_SECONDS of each slot's lease beacons, newest in bit 0 as of
+  // slotHeardMs_: heard at all, and heard with its map showing us.
+  uint8_t slotSeen_[MAX_SLOTS] = {};
+  uint8_t slotMutual_[MAX_SLOTS] = {};
 
   // Some car in earshot is unleased or has lost its slot. Set by settleLease.
   bool someoneWaiting_ = false;
   uint32_t extraMask_ = 0;
 
   uint8_t sharedBlock_ = 0;
+  // High bits of the last draw, for the backoff jitter.
+  uint16_t spareRandom_ = 0;
   uint32_t sharedOffsetMs_ = 0;
 
   uint8_t known_ = 0;

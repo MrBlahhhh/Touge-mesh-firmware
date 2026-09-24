@@ -104,14 +104,17 @@ size_t encodePosition(const Position& p, uint8_t* out, size_t cap) {
   out[9] = p.speedMph;
   out[10] = p.batteryPct;
   // Flags. The high nibble was the slot in version 1; 0x10 marks an extra
-  // beacon since build 32 and the rest is zero.
+  // beacon since build 32, 0x20 a car fit to keep time since build 40, and
+  // the rest is zero.
   out[11] = (uint8_t)((p.hasFix ? 0x01 : 0) | (p.phoneAttached ? 0x02 : 0) |
-                      (p.clockLocked ? 0x04 : 0) | (p.extra ? 0x10 : 0));
+                      (p.clockLocked ? 0x04 : 0) | (p.extra ? 0x10 : 0) |
+                      (p.fitToKeepTime ? 0x20 : 0));
   out[12] = p.hop;
   put32(out + 13, p.refId);
-  // The hop count in the low nibble, whether that reference is GPS-locked in
-  // the next bit up. Both are about the same claim, so they travel together.
-  out[17] = (uint8_t)((p.refHops & 0x0F) | (p.refLocked ? 0x10 : 0));
+  // The hop count in the low nibble, then whether that reference is GPS-locked
+  // and whether it is fit to keep time. All about the same claim, so they
+  // travel together.
+  out[17] = (uint8_t)((p.refHops & 0x0F) | (p.refLocked ? 0x10 : 0) | (p.refFit ? 0x20 : 0));
   out[18] = p.slot;
   put16(out + 19, p.leaseGen);
   put16(out + 21, p.schedGen);
@@ -136,10 +139,12 @@ bool decodePosition(const uint8_t* in, size_t len, Position& out) {
   out.phoneAttached = (in[11] & 0x02) != 0;
   out.clockLocked = (in[11] & 0x04) != 0;
   out.extra = (in[11] & 0x10) != 0;
+  out.fitToKeepTime = (in[11] & 0x20) != 0;
   out.hop = in[12];
   out.refId = get32(in + 13);
   out.refHops = (uint8_t)(in[17] & 0x0F);
   out.refLocked = (in[17] & 0x10) != 0;
+  out.refFit = (in[17] & 0x20) != 0;
   out.slot = in[18];
   out.leaseGen = get16(in + 19);
   out.schedGen = get16(in + 21);

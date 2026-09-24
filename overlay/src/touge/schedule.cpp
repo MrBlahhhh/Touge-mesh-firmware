@@ -17,12 +17,20 @@ uint8_t slotTag(uint32_t id) {
 
 namespace {
 
-// Locked beats unlocked; among equals, the lowest node number wins. A locked
-// car has to keep time, or the cars following their own pulse and the cars
-// following the reference's beacons end up on unrelated clocks.
-bool betterReference(bool aLocked, uint32_t aId, bool bLocked, uint32_t bId) {
-  if (aLocked != bLocked) return aLocked;
-  return aId < bId;
+// A car in the running to keep time, by its own advertised flags.
+struct Candidate {
+  bool locked;
+  bool fit;
+  uint32_t id;
+};
+
+// Locked beats unlocked: a locked car has to keep time, or the cars following
+// their own pulse and the cars following the reference's beacons end up on
+// unrelated clocks. Then a car that hears the ride well, then the lowest number.
+bool betterReference(const Candidate& a, const Candidate& b) {
+  if (a.locked != b.locked) return a.locked;
+  if (a.fit != b.fit) return a.fit;
+  return a.id < b.id;
 }
 
 // Which of two claims on one slot keeps it: the older lease, then the lower
@@ -34,6 +42,25 @@ bool claimBeats(uint16_t aGen, uint32_t aId, uint16_t bGen, uint32_t bId) {
 
 bool liveLease(const Rider& r, uint32_t selfId, uint32_t nowMs) {
   return r.used && r.id != selfId && (uint32_t)(nowMs - r.atMs) < LEASE_MS;
+}
+
+// A slot's beacon record lined up with now, `sinceMs` after its last beacon:
+// one beacon counts missing only once it is a quarter second overdue, so a
+// read just before it lands does not see a gap.
+uint8_t upToNow(uint8_t bits, uint32_t sinceMs) {
+  const uint32_t graceMs = SCHEDULE_MS / 4;
+  if (sinceMs <= SCHEDULE_MS + graceMs) return bits;
+  const uint32_t missed = (sinceMs - graceMs) / SCHEDULE_MS;
+  return missed >= LINK_SECONDS ? 0 : (uint8_t)(bits << missed);
+}
+
+// Seconds the record covers, from its oldest beacon to now.
+uint8_t spanOf(uint8_t bits) { return bits == 0 ? 0 : (uint8_t)(32 - __builtin_clz((unsigned)bits)); }
+
+// Under three in four heard, over at least two seconds of record.
+bool poorRecord(uint8_t bits) {
+  const uint8_t span = spanOf(bits);
+  return span >= 2 && __builtin_popcount(bits) * 4 < span * 3;
 }
 
 } // namespace
@@ -53,6 +80,8 @@ void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, si
 
 void Schedule::electReference(bool selfLocked, const Rider* riders, size_t maxRiders,
                               uint32_t nowMs) {
+  updateFitness(nowMs);
+
   // The best reference anyone knows of, not only the best one we can hear. The
   // head's claim reaches the tail one hop per beacon through the cars between,
   // so a convoy past radio range still converges on one timekeeper.
@@ -62,16 +91,16 @@ void Schedule::electReference(bool selfLocked, const Rider* riders, size_t maxRi
   // marks no point in the second. Without this the lowest node number kept the
   // job through a reboot while it listened for its lease, nobody could sync to
   // it, and the rest synced to each other in loops. When nobody qualifies (a
-  // car park switching on) the old rule applies to everyone.
-  // Neighbours go on naming a reference that has rebooted until they hear it
-  // themselves, so a belief naming a car we can hear to be unleased, or us
-  // while we are unleased, does not count either.
-  auto unfit = [&](uint32_t id) {
-    if (id == selfId_) return !selfLocked && !claimed();
+  // car park switching on) every car stands.
+  //
+  // A neighbour's word about a car we hear ourselves (or about us) is older
+  // news than that car's own beacon, so only the beacon counts. That also
+  // keeps out a rebooted reference that neighbours still name while it listens.
+  auto current = [&](uint32_t id) {
+    if (id == selfId_) return true;
     for (size_t i = 0; i < maxRiders; i++) {
       const Rider& r = riders[i];
-      if (r.used && r.id == id && (uint32_t)(nowMs - r.atMs) < REFERENCE_LAPSE_MS)
-        return !r.pos.clockLocked && r.pos.slot >= MAX_SLOTS;
+      if (r.used && r.id == id && (uint32_t)(nowMs - r.atMs) < REFERENCE_LAPSE_MS) return true;
     }
     return false;
   };
@@ -79,8 +108,7 @@ void Schedule::electReference(bool selfLocked, const Rider* riders, size_t maxRi
   for (int pass = 0; pass < 2; pass++) {
     const bool leasedOnly = pass == 0;
     bool found = !leasedOnly || selfLocked || claimed();
-    uint32_t bestId = selfId_;
-    bool bestLocked = selfLocked;
+    Candidate best{selfLocked, announcedFit_, selfId_};
 
     for (size_t i = 0; i < maxRiders; i++) {
       const Rider& r = riders[i];
@@ -94,23 +122,21 @@ void Schedule::electReference(bool selfLocked, const Rider* riders, size_t maxRi
       // already say, or itself.
       if (leasedOnly && !r.pos.clockLocked && r.pos.slot >= MAX_SLOTS) continue;
 
-      if (!found || betterReference(r.pos.clockLocked, r.id, bestLocked, bestId)) {
-        bestLocked = r.pos.clockLocked;
-        bestId = r.id;
+      const Candidate itself{r.pos.clockLocked, r.pos.fitToKeepTime, r.id};
+      if (!found || betterReference(itself, best)) {
+        best = itself;
         found = true;
       }
       // Past the hop cap a route is not believed; see MAX_REF_HOPS.
-      if (r.pos.refId != 0 && r.pos.refHops < MAX_REF_HOPS &&
-          !(leasedOnly && unfit(r.pos.refId)) &&
-          betterReference(r.pos.refLocked, r.pos.refId, bestLocked, bestId)) {
-        bestLocked = r.pos.refLocked;
-        bestId = r.pos.refId;
-      }
+      if (r.pos.refId == 0 || r.pos.refHops >= MAX_REF_HOPS || current(r.pos.refId)) continue;
+      const Candidate belief{r.pos.refLocked, r.pos.refFit, r.pos.refId};
+      if (betterReference(belief, best)) best = belief;
     }
 
     if (!found) continue;
-    referenceId_ = bestId;
-    referenceLocked_ = bestLocked;
+    referenceId_ = best.id;
+    referenceLocked_ = best.locked;
+    referenceFit_ = best.fit;
     return;
   }
 }
@@ -122,6 +148,7 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
   uint32_t holder[MAX_SLOTS] = {};
   uint16_t holderGen[MAX_SLOTS] = {};
   uint8_t live = 0;
+  const uint8_t ourTag = slotTag(selfId_);
 
   for (size_t i = 0; i < maxRiders; i++) {
     const Rider& r = riders[i];
@@ -129,6 +156,9 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
     live++;
     if (!genKnown_ || leaseOlder(schedGen_, r.pos.schedGen)) schedGen_ = r.pos.schedGen;
     genKnown_ = true;
+    // Any map showing us on our slot, relayed or not, is somebody hearing us.
+    if (claimed() && r.pos.slotMap[slot_] == ourTag && (int32_t)(r.atMs - lastHeardUsMs_) > 0)
+      lastHeardUsMs_ = r.atMs;
 
     const uint8_t s = r.pos.slot;
     if (s >= MAX_SLOTS) continue;
@@ -158,28 +188,40 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
   if (!heardAnyone_) {
     heardAnyone_ = true;
     firstHeardMs_ = nowMs;
+    listenMs_ = JOIN_LISTEN_MS;
   }
+
+  // A car that hears the ride poorly has older maps from its neighbours and
+  // may not have caught every car yet, so it claims on maps up to
+  // MAP_TRUST_MS old, and waits while a leased neighbour's is older still.
+  const bool poor = hearingPoorly(nowMs);
+  const uint32_t mapTrustMs = poor ? MAP_TRUST_MS : HEARD_WINDOW_MS;
+  bool mapOverdue = false;
 
   // What the cars we hear directly report hearing in each slot. A slot any of
   // them hears is busy even if its holder is out of our own range. And our own
   // slot, as they report it, is the only way to learn that somebody we cannot
   // hear is transmitting on top of us.
-  const uint8_t ourTag = slotTag(selfId_);
   uint32_t reportedBusy = 0;
-  uint8_t judges = 0;
+  uint8_t wellHeardJudges = 0;
   uint8_t hearUs = 0;
   uint8_t hearOther = 0;
   uint8_t otherTag = 0;
   for (size_t i = 0; i < maxRiders; i++) {
     const Rider& r = riders[i];
     if (!liveLease(r, selfId_, nowMs) || r.hopsAway != 0) continue;
-    if ((uint32_t)(nowMs - r.atMs) >= HEARD_WINDOW_MS) continue;
+    const uint32_t ageMs = nowMs - r.atMs;
+    if (ageMs >= mapTrustMs) {
+      if (poor && r.pos.slot < MAX_SLOTS && ageMs < REFERENCE_LAPSE_MS) mapOverdue = true;
+      continue;
+    }
     for (uint8_t s = 0; s < MAX_SLOTS; s++)
       if (r.pos.slotMap[s] != 0) reportedBusy |= 1u << s;
+    if (ageMs >= HEARD_WINDOW_MS) continue;
     // Only a map covering a whole window since we took the slot can say
-    // whether our beacons landed.
+    // whether our beacons landed; the neighbours with one judge our slot.
     if (!claimed() || (int32_t)(r.atMs - leasedAtMs_) < (int32_t)HEARD_WINDOW_MS) continue;
-    judges++;
+    if (!hearsPoorly(r.pos.slot, r.id, nowMs)) wellHeardJudges++;
     const uint8_t tag = r.pos.slotMap[slot_];
     if (tag == ourTag) {
       hearUs++;
@@ -195,30 +237,41 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
     // Somebody else on our slot gets through to more of our neighbours than we
     // do; on a tie the higher tag yields, so exactly one of a pair moves. Or
     // nobody gets through at all, which is what three cars on one slot look
-    // like. Two judges at least, so one neighbour's lost frame moves nobody.
+    // like: two judges at least, so one neighbour's lost frame moves nobody,
+    // and ones we hear well, since a car we hear poorly misses us as often.
     const bool clash = hearOther > hearUs ||
                        (hearOther > 0 && hearOther == hearUs && otherTag < ourTag) ||
-                       (judges >= 2 && hearUs == 0 && hearOther == 0);
+                       (wellHeardJudges >= 2 && hearUs == 0 && hearOther == 0);
     if (clash && !clashing_) clashSinceMs_ = nowMs;
     clashing_ = clash;
     const bool established = (uint32_t)(nowMs - leasedAtMs_) >= ESTABLISHED_LEASE_MS;
     const bool drowned =
         clash && (!established || (uint32_t)(nowMs - clashSinceMs_) >= CLASH_PATIENCE_MS);
-    if (!outranked && !drowned) return;
-    clashing_ = false;
-    if (drowned) {
-      // Give the slot up and listen again as a joiner. Our unleased beacons
-      // stop everybody's extras and show the cars we clashed with that we
-      // need a slot, so the queue ranks us instead of both of us picking the
-      // same free slot again. Moving straight to another slot landed in some
-      // car's extras, where the clash hid again.
-      slot_ = SLOT_NONE;
-      firstHeardMs_ = nowMs;
+    const bool unheard = (uint32_t)(nowMs - lastHeardUsMs_) >= UNHEARD_MS;
+    if (!outranked && !drowned && !unheard) {
+      // Settled and heard: whatever went wrong before is behind us.
+      if (established && !clash && (int32_t)(lastHeardUsMs_ - leasedAtMs_) > 0) strikes_ = 0;
       return;
     }
-    // Outranked: the cars that outrank us already know we need a slot, so
-    // move now without listening again.
-  } else if ((uint32_t)(nowMs - firstHeardMs_) < JOIN_LISTEN_MS) {
+    clashing_ = false;
+    slot_ = SLOT_NONE;
+    if (strikes_ < 255) strikes_++;
+    // Outranked, with a good view: the cars that outrank us already know we
+    // need a slot, so move now without listening again. That is what settles
+    // a merge, however many times it takes: listening instead stops everyone's
+    // extras, and the extras are how the other half of a hidden clash learns
+    // it has one (host sim: a merge went from 5 s to over 10). A poor listener
+    // most likely landed there for want of a view, so it listens again, as
+    // does any car on a drowned or unheard slot: our unleased beacons show
+    // the cars we clashed with that we need a slot, so the queue ranks us
+    // instead of both of us picking the same free slot again. Moving straight
+    // to another slot landed in some car's extras, where the clash hid again.
+    if (drowned || unheard || poor) {
+      listenAgain(nowMs);
+      return;
+    }
+  } else if ((uint32_t)(nowMs - firstHeardMs_) < listenMs_ + (poor ? JOIN_LISTEN_MS : 0) ||
+             mapOverdue) {
     return; // still learning who holds what
   }
   slot_ = SLOT_NONE;
@@ -251,6 +304,7 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
 
   slot_ = freeSlots[pick];
   leasedAtMs_ = nowMs;
+  lastHeardUsMs_ = nowMs;
   // One past anything we have heard of, so every lease we could clash with
   // is older than ours and keeps its slot.
   leaseGen_ = (uint16_t)(schedGen_ + 1);
@@ -358,10 +412,83 @@ bool Schedule::inExtraSlot(uint32_t nowMs) const {
   return inExtraSlotAtPhase((uint32_t)(nowMs - epochMs_) % SCHEDULE_MS);
 }
 
-void Schedule::heardSlot(uint8_t slot, uint32_t senderId, uint32_t nowMs) {
-  if (slot >= MAX_SLOTS) return;
-  slotHeardMs_[slot] = nowMs;
-  slotHeardTag_[slot] = slotTag(senderId);
+void Schedule::heardBeacon(uint32_t senderId, const Position& p, uint32_t nowMs) {
+  const uint8_t s = p.slot;
+  if (s >= MAX_SLOTS) return;
+  const uint8_t tag = slotTag(senderId);
+  // Whole beacons since the last one in this slot, so the gaps are misses.
+  const uint32_t beacons = (nowMs - slotHeardMs_[s] + SCHEDULE_MS / 2) / SCHEDULE_MS;
+  if (slotHeardTag_[s] != tag || beacons >= LINK_SECONDS) {
+    slotSeen_[s] = 0;
+    slotMutual_[s] = 0;
+  } else {
+    slotSeen_[s] = (uint8_t)(slotSeen_[s] << beacons);
+    slotMutual_[s] = (uint8_t)(slotMutual_[s] << beacons);
+  }
+  slotSeen_[s] |= 1;
+  if (claimed() && p.slotMap[slot_] == slotTag(selfId_)) slotMutual_[s] |= 1;
+  slotHeardMs_[s] = nowMs;
+  slotHeardTag_[s] = tag;
+}
+
+void Schedule::updateFitness(uint32_t nowMs) {
+  uint8_t heard = 0;
+  uint8_t solid = 0;
+  for (uint8_t s = 0; s < MAX_SLOTS; s++) {
+    const uint32_t sinceMs = nowMs - slotHeardMs_[s];
+    // A car heard at least twice in the window. One that has just left still
+    // counts for a few seconds, against us, which errs the safe way.
+    if (__builtin_popcount(upToNow(slotSeen_[s], sinceMs)) < 2) continue;
+    heard++;
+    if (__builtin_popcount(upToNow(slotMutual_[s], sinceMs)) >= SOLID_LINK_SECONDS) solid++;
+  }
+  // Half of them solid to become fit, a third to stay fit.
+  const bool shouldBeFit = solid > 0 && solid * (fit_ ? 3 : 2) >= heard;
+  if (shouldBeFit == fit_) {
+    fitSettledMs_ = nowMs;
+    return;
+  }
+  // Either way only after FIT_HOLD_MS on end. A radio heard one frame in two
+  // has runs where a few links look solid at once, and must not win on one.
+  // And when two groups meet, cars on the same slot numbers reset each other's
+  // records for a few seconds; a group that lost fitness on that alone handed
+  // the clock to the other half at once, before the hidden clashes had been
+  // found (host sim: 912 leased-slot collisions against 96).
+  if ((uint32_t)(nowMs - fitSettledMs_) < FIT_HOLD_MS) return;
+  fit_ = shouldBeFit;
+  fitSettledMs_ = nowMs;
+}
+
+bool Schedule::hearingPoorly(uint32_t nowMs) const {
+  uint32_t heard = 0;
+  uint32_t due = 0;
+  for (uint8_t s = 0; s < MAX_SLOTS; s++) {
+    const uint8_t seen = upToNow(slotSeen_[s], nowMs - slotHeardMs_[s]);
+    // One beacon says nothing about the ones in between, and a slot silent for
+    // three seconds has been left, which says nothing about our hearing.
+    if (spanOf(seen) < 2 || (seen & 0x07) == 0) continue;
+    heard += (uint32_t)__builtin_popcount(seen);
+    due += spanOf(seen);
+  }
+  return heard * 4 < due * 3;
+}
+
+bool Schedule::hearsPoorly(uint8_t slot, uint32_t id, uint32_t nowMs) const {
+  if (slot >= MAX_SLOTS || slotHeardTag_[slot] != slotTag(id)) return false;
+  return poorRecord(upToNow(slotSeen_[slot], nowMs - slotHeardMs_[slot]));
+}
+
+void Schedule::listenAgain(uint32_t nowMs) {
+  firstHeardMs_ = nowMs;
+  uint32_t listenMs = JOIN_LISTEN_MS;
+  // The first loss is the ordinary newcomer's yield. From the second before a
+  // lease settles, a random extra of up to a second per loss so far.
+  if (strikes_ > 1) {
+    uint32_t spreadMs = (uint32_t)(strikes_ - 1) * SCHEDULE_MS;
+    if (spreadMs > BACKOFF_MAX_MS) spreadMs = BACKOFF_MAX_MS;
+    listenMs += spareRandom_ % spreadMs;
+  }
+  listenMs_ = (uint16_t)listenMs;
 }
 
 void Schedule::fillSlotMap(uint32_t nowMs, uint8_t map[SLOT_MAP_LEN]) const {
@@ -415,6 +542,7 @@ bool Schedule::inSlotAtPhase(uint32_t phaseMs) const {
 void Schedule::drawSharedTurn(uint32_t random) {
   sharedBlock_ = (uint8_t)(random % BLOCKS);
   sharedOffsetMs_ = (random / BLOCKS) % SHARED_SPREAD_MS;
+  spareRandom_ = (uint16_t)(random >> 16);
 }
 
 bool Schedule::inSlot(uint32_t nowMs) const {
