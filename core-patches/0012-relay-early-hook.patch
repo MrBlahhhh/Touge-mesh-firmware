@@ -1,0 +1,37 @@
+--- a/src/mesh/RadioInterface.h
++++ b/src/mesh/RadioInterface.h
+@@ -341,5 +341,10 @@
+ 
+ std::unique_ptr<RadioInterface> initLoRa();
+ 
++/// Touge (core-patches/0012): true to relay p in the ROUTER's early window rather than the ordinary one. Other
++/// nodes still relay in theirs if they have not heard this copy first, so it only chooses who usually goes first.
++/// Null unless the fast lane sets it.
++extern bool (*tougeRelayEarlyHook)(const meshtastic_MeshPacket *p);
++
+ /// Debug printing for packets
+ void printPacket(const char *prefix, const meshtastic_MeshPacket *p);
+--- a/src/mesh/RadioInterface.cpp
++++ b/src/mesh/RadioInterface.cpp
+@@ -844,6 +844,9 @@
+     return (2 * CWmax * slotTimeMsec) + pow_of_2(CWsize) * slotTimeMsec;
+ }
+ 
++// Touge (core-patches/0012): see RadioInterface.h.
++bool (*tougeRelayEarlyHook)(const meshtastic_MeshPacket *p) = nullptr;
++
+ /** Returns true if we should rebroadcast early like a ROUTER */
+ bool RadioInterface::shouldRebroadcastEarlyLikeRouter(meshtastic_MeshPacket *p)
+ {
+@@ -852,6 +855,11 @@
+         return true;
+     }
+ 
++    // Touge (core-patches/0012): a car the fast lane's evidence shows delivers this origin further.
++    if (tougeRelayEarlyHook && tougeRelayEarlyHook(p)) {
++        return true;
++    }
++
+     return false;
+ }
+ 

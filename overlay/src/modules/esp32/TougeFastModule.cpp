@@ -8,7 +8,9 @@
 #include "RTC.h"
 #include "PhoneAPI.h"
 #include "PositionPrecision.h"
+#include "RadioLibInterface.h"
 #include "Router.h"
+#include "airtime.h"
 #include "main.h"
 #include "touge/cipher.h"
 #if !MESHTASTIC_EXCLUDE_GPS
@@ -194,7 +196,10 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     v4) before the lowest node number counts; a radio that hears the ride poorly listens longer and
 //     claims on older maps, a second lost lease backs off, silence from neighbours heard poorly drowns
 //     no lease, and a lease no slot map has shown for 20 s is given up.
-const uint32_t TOUGE_BUILD = 40;
+// 41: the LoRa interval follows the channel's measured busy share, not cars x cars, on a send grid spread by
+//     rank; own-position TX accounting, queue waits and drops ("ll", "lt"); reach summaries (0xC3) say which
+//     origins reach each car and how old ("le"); relays chosen on that evidence go early (core-patches/0012).
+const uint32_t TOUGE_BUILD = 41;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -313,6 +318,12 @@ uint8_t speedToMph(float metresPerSecond) {
 void onWriteDropped(const uint8_t *toRadio, size_t len);
 #endif
 
+uint32_t txQueueDepth()
+{
+    const meshtastic_QueueStatus qs = router->getQueueStatus();
+    return qs.maxlen > qs.free ? qs.maxlen - qs.free : 0;
+}
+
 } // namespace
 
 TougeFastModule::TougeFastModule()
@@ -360,6 +371,14 @@ TougeFastModule::TougeFastModule()
 #if !MESHTASTIC_EXCLUDE_GPS
     positionBroadcastOwnedHook = &TougeFastModule::ownsPositionBroadcast;
 #endif
+
+    // The LoRa lane measured, and relays chosen on evidence (5d-5f). loraTxWatch_
+    // registered itself with the radio driver as it was constructed.
+    loraLoad_.reset();
+    reach_.clear();
+    relayPrefs_.clear();
+    if (RadioLibInterface::instance) txGoodSeen_ = RadioLibInterface::instance->txGood;
+    tougeRelayEarlyHook = &TougeFastModule::relayEarly;
 }
 
 size_t TougeFastModule::fastNeighbours(uint32_t nowMs) const
@@ -854,34 +873,43 @@ bool TougeFastModule::ownsPositionBroadcast()
     return tougeFastModule != nullptr && tougeFastModule->loraOwned();
 }
 
-uint32_t TougeFastModule::carsOnRide() const
+void TougeFastModule::loraRoster(uint32_t &cars, uint32_t &rank) const
 {
     // Every node heard in the window, on either radio: inject() stamps
     // last_heard for a 2.4 GHz car. A stranger on the same frequency spends the
-    // same air, so it counts too.
-    uint32_t cars = 1;
+    // same air, so it takes a share too.
+    cars = 1;
+    rank = 0;
     const NodeNum self = nodeDB->getNodeNum();
     for (size_t i = 0; i < nodeDB->getNumMeshNodes(); i++) {
         const meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
         if (node->num == self || node->last_heard == 0) continue;
-        if (sinceLastSeen(node) < RIDER_DROP_MS / 1000) cars++;
+        if (sinceLastSeen(node) >= RIDER_DROP_MS / 1000) continue;
+        cars++;
+        if (node->num < self) rank++;
     }
-    return cars;
 }
 
 void TougeFastModule::sendLoraPosition(uint32_t nowMs)
 {
     if (!loraOwned() || !ownFix_.fresh(nowMs)) return;
-    if (lastLoraMs_ != 0 && (uint32_t)(nowMs - lastLoraMs_) < loraIntervalMs_) return;
+    // The first as soon as there is a fix, then on the send grid.
+    if (lastLoraMs_ != 0 && (int32_t)(nowMs - nextLoraMs_) < 0) return;
     // Where PositionModule would send it: the first channel sharing positions.
     uint8_t channel = 0;
     if (!findPositionChannel(channel)) return;
 
+    // The last one still queued now this one is due: it lost its turn.
+    const bool previousLate = lastOwnPositionId_ != 0 && router->findInTxQueue(nodeId_, lastOwnPositionId_);
     meshtastic_MeshPacket *p = router->allocForSending();
     if (!p) return;
     p->to = NODENUM_BROADCAST;
     p->channel = channel;
-    p->priority = meshtastic_MeshPacket_Priority_BACKGROUND; // as PositionModule's
+    // BACKGROUND, as PositionModule's. Relayed positions queue at DEFAULT and
+    // go first, so under a backlog ours could wait behind them for good; after
+    // one missed its turn, the next goes ahead of them (5d). Local only: the
+    // priority is not on the air.
+    p->priority = previousLate ? meshtastic_MeshPacket_Priority_RELIABLE : meshtastic_MeshPacket_Priority_BACKGROUND;
     p->decoded.portnum = meshtastic_PortNum_POSITION_APP;
     const meshtastic_Position pos = ownLoraPosition();
     p->decoded.payload.size =
@@ -891,26 +919,41 @@ void TougeFastModule::sendLoraPosition(uint32_t nowMs)
         return;
     }
 
-    // The next gap, from this packet's own airtime on the radio's actual modem
-    // settings and the cars heard lately.
-    RadioInterface *radio = router->getRadioIface();
-    const uint32_t cars = carsOnRide();
-    loraIntervalMs_ = loraIntervalMs(cars, radio ? radio->getPacketTime(p) : 0);
+    // The interval the measured load allows (5d), and when the next one falls
+    // on the grid: on UTC from our fix when there is one, which every car shares.
+    loraLoad_.judge(loraBusyPermille(), nowMs);
+    const uint32_t intervalMs = loraLoad_.intervalMs();
+    uint32_t cars = 1;
+    uint32_t rank = 0;
+    loraRoster(cars, rank);
+    uint64_t clockMs = nowMs;
+    ownFix_.utcMs(nowMs, clockMs); // left on the radio's clock when the fix has no time
+    const uint64_t dueAt = nextLoraSendAt(clockMs + intervalMs / 2, intervalMs, rank, cars, esp_random());
+    nextLoraMs_ = nowMs + (uint32_t)(dueAt - clockMs);
     lastLoraMs_ = nowMs;
+
     const FixId id = ownFix_.id();
-    txPositions_.note(p->from, p->id, id, &TougeFastModule::inTxQueue, nullptr);
-    LOG_INFO("touge: lora position seq=%u, next in %ums for %u cars; tx queue replaced=%u refused=%u", (unsigned)id.seq,
-             (unsigned)loraIntervalMs_, (unsigned)cars, (unsigned)txReplaced_, (unsigned)txRefused_);
+    loraLoad_.ownQueued(previousLate);
+    txPositions_.note(p->from, p->id, id, nowMs, &TougeFastModule::inTxQueue, nullptr);
+    lastOwnPositionId_ = p->id;
+    LOG_INFO("touge: lora position seq=%u every %ums, next in %ums, share %u of %u%s", (unsigned)id.seq,
+             (unsigned)intervalMs, (unsigned)(nextLoraMs_ - nowMs), (unsigned)rank, (unsigned)cars,
+             previousLate ? ", last one late" : "");
     service->sendToMesh(p, RX_SRC_LOCAL, false);
+    loraLoad_.queueDepth(txQueueDepth());
+
+    // A reach summary with every REACH_EVERY_POSITIONS-th, staggered by rank so
+    // the cars' summaries fall in different rounds.
+    if (++lorasSent_ % REACH_EVERY_POSITIONS == rank % REACH_EVERY_POSITIONS) sendReachSummary(nowMs);
 }
 
-void TougeFastModule::noteRelayedPosition(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos)
+void TougeFastModule::noteRelayedPosition(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos, uint32_t nowMs)
 {
     // Only one this radio may relay. This module runs before RoutingModule,
     // whose sniffReceived is what queues the relay, so the note is in first.
     if (mp.hop_limit == 0) return;
     const FixId fix = fixIdOf(pos.sensor_id, pos.seq_number, pos.timestamp, pos.timestamp_millis_adjust, pos.time);
-    txPositions_.note(mp.from, mp.id, fix, &TougeFastModule::inTxQueue, nullptr);
+    txPositions_.note(mp.from, mp.id, fix, nowMs, &TougeFastModule::inTxQueue, nullptr);
 }
 
 bool TougeFastModule::inTxQueue(uint32_t from, uint32_t id, void *ctx)
@@ -936,15 +979,203 @@ TougeTxPlace TougeFastModule::placeTxPacket(const std::vector<meshtastic_MeshPac
     };
     switch (tougeFastModule->txPositions_.place(incoming, queue.size(), queued, at)) {
     case TxPlace::REPLACE:
-        tougeFastModule->txReplaced_++;
+        tougeFastModule->loraLoad_.counts().replaced++;
         return TougeTxPlace::REPLACE;
     case TxPlace::REFUSE:
-        tougeFastModule->txRefused_++;
+        tougeFastModule->loraLoad_.counts().refused++;
         return TougeTxPlace::REFUSE;
     case TxPlace::QUEUE:
     default:
         return TougeTxPlace::QUEUE;
     }
+}
+
+// ---- The LoRa lane measured, and relays chosen on evidence (SCALE-PLAN 5d-5f) ---
+
+uint32_t TougeFastModule::loraBusyPermille()
+{
+    return airTime ? (uint32_t)(airTime->channelUtilizationPercent() * 10.0f + 0.5f) : 0;
+}
+
+void TougeFastModule::LoraTxWatch::packetReleased(RadioInterface *iface, const meshtastic_MeshPacket *p)
+{
+    if (tougeFastModule != nullptr && iface != nullptr && p != nullptr) tougeFastModule->noteLoraReleased(iface, p);
+}
+
+void TougeFastModule::noteLoraReleased(RadioInterface *iface, const meshtastic_MeshPacket *p)
+{
+    const uint32_t nowMs = millis();
+    loraLoad_.queueDepth(txQueueDepth());
+    // completeSending counts a transmission before it releases the packet; a
+    // cancelled, dropped or replaced one is released with the count unmoved.
+    const RadioLibInterface *radio = RadioLibInterface::instance;
+    if (radio == nullptr || radio->txGood == txGoodSeen_) return;
+    txGoodSeen_ = radio->txGood;
+
+    const uint32_t airtimeMs = iface->getPacketTime(p);
+    uint32_t waitedMs = LORA_WAIT_UNKNOWN;
+    const bool position = txPositions_.waited(p->from, p->id, nowMs, waitedMs);
+    if (isFromUs(p)) {
+        LoraTx kind = LoraTx::OWN_OTHER;
+        if (position) {
+            kind = LoraTx::OWN_POSITION;
+        } else if (p->id == lastReachId_) {
+            kind = LoraTx::OWN_SUMMARY;
+            waitedMs = nowMs - reachQueuedMs_;
+        }
+        loraLoad_.sent(kind, airtimeMs, waitedMs, false, nowMs);
+        return;
+    }
+    // What relayEarly answered when the delay was drawn, give or take a grant
+    // that changed while it waited.
+    const bool early = position && relayPrefs_.preferred(p->from, nowMs);
+    loraLoad_.sent(LoraTx::RELAY, airtimeMs, waitedMs, early, nowMs);
+}
+
+bool TougeFastModule::relayEarly(const meshtastic_MeshPacket *p)
+{
+    if (tougeFastModule == nullptr || p == nullptr || isFromUs(p)) return false;
+    // Positions only, the traffic the evidence is about: only they are noted.
+    if (tougeFastModule->txPositions_.find(p->from, p->id) == nullptr) return false;
+    return tougeFastModule->relayPrefs_.preferred(p->from, millis());
+}
+
+void TougeFastModule::noteLoraReach(const meshtastic_MeshPacket &mp, const meshtastic_Position &pos, uint32_t nowMs)
+{
+    // LoRa only, the lane the summaries measure. A 2.4 GHz car never comes
+    // through here (inject() writes NodeDB directly), and MQTT is not LoRa.
+    if (mp.transport_mechanism != meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA) return;
+    const FixId fix = fixIdOf(pos.sensor_id, pos.seq_number, pos.timestamp, pos.timestamp_millis_adjust, pos.time);
+    uint32_t ageMs = UINT32_MAX;
+    uint64_t utcMs = 0;
+    if (fix.fixSec != 0 && ownFix_.utcMs(nowMs, utcMs)) {
+        const uint64_t fixUtcMs = (uint64_t)fix.fixSec * 1000 + fix.fixMs;
+        // A fix a shade ahead of our clock is our own fix's delivery delay
+        // (under a second from a phone), not the future.
+        const uint64_t age = utcMs > fixUtcMs ? utcMs - fixUtcMs : 0;
+        ageMs = age < UINT32_MAX ? (uint32_t)age : UINT32_MAX - 1;
+    }
+    const int8_t hops = getHopsAway(mp);
+    reach_.heard(mp.from, fix, ageMs, hops < 0 ? REACH_HOPS_UNKNOWN : (uint8_t)hops, (uint8_t)mp.relay_node, nowMs);
+}
+
+void TougeFastModule::noteReachSummary(const meshtastic_MeshPacket &mp)
+{
+    if (mp.transport_mechanism != meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA) return;
+    const uint8_t *payload = mp.decoded.payload.bytes;
+    const size_t len = mp.decoded.payload.size;
+    size_t entries = 0;
+    uint8_t flags = 0;
+    if (!decodeReachHeader(payload, len, entries, flags)) return;
+    reach_.noteSummaryHeard();
+    logReach("from", mp.from, payload, len);
+
+    const uint32_t nowMs = millis();
+    const uint32_t intervalMs = loraLoad_.intervalMs();
+    // Worse delivery: the far car went three of our intervals without the origin.
+    const uint32_t maxSinceS = 3 * intervalMs / 1000;
+    // A grant outlasts one missed summary, not two.
+    const uint32_t holdMs = REACH_EVERY_POSITIONS * intervalMs * 5 / 2;
+    // nodeDB, not nodeId_: a summary can arrive before the first pass sets it.
+    const NodeNum self = nodeDB->getNodeNum();
+    const uint8_t selfByte = nodeDB->getLastByteOfNodeNum(self);
+    ReachEntry e;
+    for (size_t i = 0; decodeReachEntry(payload, len, i, e); i++) {
+        const bool weHearIt = reach_.heardWithin(e.origin, 3 * intervalMs, nowMs);
+        switch (relayPrefs_.consider(e, mp.from, self, selfByte, weHearIt, maxSinceS, holdMs, nowMs)) {
+        case RelayPrefs::Verdict::GRANTED:
+            LOG_INFO("touge: lora relay early for %08x: %08x had it %u hops on, first via us", (unsigned)e.origin,
+                     (unsigned)mp.from, (unsigned)e.hops);
+            break;
+        case RelayPrefs::Verdict::WITHDRAWN:
+            LOG_INFO("touge: lora relay ordinary for %08x: %08x had it via us, %ums old, %us ago", (unsigned)e.origin,
+                     (unsigned)mp.from, (unsigned)reachAgeMs(e.ageQ), (unsigned)e.sinceS);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+void TougeFastModule::sendReachSummary(uint32_t nowMs)
+{
+    meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p) return;
+    const size_t len = reach_.takeSummary(nowMs, p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes));
+    if (len == 0) {
+        service->releaseToPool(p);
+        return;
+    }
+    p->to = NODENUM_BROADCAST;
+    p->channel = channels.getPrimaryIndex();
+    p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
+    p->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
+    p->decoded.payload.size = (pb_size_t)len;
+    lastReachId_ = p->id;
+    reachQueuedMs_ = nowMs;
+    logReach("sent", nodeId_, p->decoded.payload.bytes, len);
+    // Our phone gets ours as it gets every other car's. A copy made now, while
+    // it is still decoded: sendToMesh's copy for the phone is taken after the
+    // router has encrypted the packet.
+    if (service->api_state != MeshService::STATE_DISCONNECTED) {
+        meshtastic_MeshPacket *mine = router->allocForSending();
+        if (mine) {
+            *mine = *p;
+            service->sendToPhone(mine);
+        }
+    }
+    service->sendToMesh(p, RX_SRC_LOCAL, false);
+}
+
+void TougeFastModule::logReach(const char *what, uint32_t reporter, const uint8_t *payload, size_t len)
+{
+    size_t entries = 0;
+    uint8_t flags = 0;
+    if (!decodeReachHeader(payload, len, entries, flags)) return;
+    // Meshtastic cuts a log line at 159 characters: three entries a line.
+    const size_t PER_LINE = 3;
+    char line[160];
+    size_t at = 0;
+    ReachEntry e;
+    for (size_t i = 0; decodeReachEntry(payload, len, i, e); i++) {
+        if (i % PER_LINE == 0) {
+            const int n = snprintf(line, sizeof(line), "touge: lora reach %s %08x:", what, (unsigned)reporter);
+            at = n > 0 ? (size_t)n : 0;
+        }
+        char entry[40];
+        if (formatReachEntry(e, entry, sizeof(entry)) > 0) {
+            const int n = snprintf(line + at, sizeof(line) - at, " %s", entry);
+            if (n > 0 && (size_t)n < sizeof(line) - at) at += (size_t)n;
+        }
+        const bool last = i + 1 == entries;
+        if (i % PER_LINE == PER_LINE - 1 || last) {
+            LOG_INFO("%s%s", line, last && (flags & REACH_MORE) ? " +more" : "");
+        }
+    }
+}
+
+void TougeFastModule::reportLora(uint32_t nowMs)
+{
+    if (service == nullptr || router == nullptr) return;
+    LoraTxCounts &counts = loraLoad_.counts();
+    if (RadioLibInterface::instance) counts.dropped = RadioLibInterface::instance->txDrop;
+    counts.cancelled = router->txRelayCanceled;
+    const bool sending = loraOwned() && ownFix_.fresh(nowMs);
+    const uint32_t txPermille = airTime ? (uint32_t)(airTime->utilizationTXPercent() * 10.0f + 0.5f) : 0;
+    LoraWindow w = loraLoad_.takeWindow(sending, loraBusyPermille(), txPermille);
+    w.originsHeard = (uint32_t)reach_.count(nowMs);
+    w.preferredFor = (uint32_t)relayPrefs_.count(nowMs);
+
+    // The same keys on serial and to the phone (touge/kvline.h). Not queued
+    // while no phone is connected, like the other reports.
+    const bool phone = service->api_state != MeshService::STATE_DISCONNECTED;
+    char text[BATCH_MAX_PAYLOAD];
+    if (formatLoraWindow(w, false, text, sizeof(text)) > 0) LOG_INFO("touge: lora %s", text);
+    if (phone) queueJsonToPhone(text, formatLoraWindow(w, true, text, sizeof(text)));
+    if (formatLoraTx(counts, false, text, sizeof(text)) > 0) LOG_INFO("touge: lora %s", text);
+    if (phone) queueJsonToPhone(text, formatLoraTx(counts, true, text, sizeof(text)));
+    if (formatLoraReach(reach_, relayPrefs_, false, text, sizeof(text)) > 0) LOG_INFO("touge: lora %s", text);
+    if (phone) queueJsonToPhone(text, formatLoraReach(reach_, relayPrefs_, true, text, sizeof(text)));
 }
 
 void TougeFastModule::reassertFastPositions()
@@ -1412,6 +1643,7 @@ void TougeFastModule::status(uint32_t nowMs)
     const uint32_t statusWindowMs = nowMs - lastStatusMs_;
     lastStatusMs_ = nowMs;
     reportLinkStats(nowMs, statusWindowMs);
+    reportLora(nowMs);
     logHeap();
 
     const char *clock = rideClock.locked((uint64_t)esp_timer_get_time()) ? "gps"
@@ -1471,7 +1703,7 @@ void TougeFastModule::status(uint32_t nowMs)
             (unsigned)hop_.index(), (unsigned)hop_.generation(),
             (unsigned)fastRadio.sendFailed(),
             // Our LoRa position interval, 0 while this radio is not sending them.
-            (unsigned)(loraOwned() && ownFix_.fresh(nowMs) ? loraIntervalMs_ : 0));
+            (unsigned)(loraOwned() && ownFix_.fresh(nowMs) ? loraLoad_.intervalMs() : 0));
         if (n > 0 && (size_t)n < sizeof(js)) {
             meshtastic_MeshPacket *sp = router->allocForSending();
             if (sp) {
@@ -1638,7 +1870,11 @@ ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
         if (isFromUs(&mp)) return ProcessMessage::CONTINUE;
         stats_.lora.rx++;
         meshtastic_Position heardPos;
-        if (readPosition(mp, heardPos)) noteRelayedPosition(mp, heardPos);
+        if (readPosition(mp, heardPos)) {
+            const uint32_t nowMs = millis();
+            noteRelayedPosition(mp, heardPos, nowMs);
+            noteLoraReach(mp, heardPos, nowMs);
+        }
         const Rider *r = mesh_.find(mp.from);
         if (r && r->via == HEARD_FAST && (uint32_t)(millis() - r->atMs) < FAST_PRECEDENCE_MS) {
             // Not STOP any more, and this is the difference between a car
@@ -1681,7 +1917,12 @@ ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
     // reached here, the test below failed, and push-to-talk audio from the
     // phone was never transmitted at all. isFromUs is the idiomatic check and
     // treats zero as ourselves, which is exactly what it is for.
-    if (!isFromUs(&mp)) return ProcessMessage::CONTINUE;
+    if (!isFromUs(&mp)) {
+        // Another car's reach summary (5e), evidence for our relays (5f). Let
+        // through, so Meshtastic relays it and hands it to the phone.
+        noteReachSummary(mp);
+        return ProcessMessage::CONTINUE;
+    }
     if (!isToUs(&mp)) return ProcessMessage::CONTINUE;
 
     // The phone saying it reads batches. Local only: never transmitted.
@@ -2026,6 +2267,8 @@ void TougeFastModule::reportLaneDown(uint32_t nowMs, LaneDown why)
     lastStatusMs_ = nowMs;
     // A board whose lane is down for want of heap is the one this line is for.
     logHeap();
+    // LoRa carries on without the 2.4 GHz lane, and so do its numbers.
+    reportLora(nowMs);
     if (service == nullptr || router == nullptr || service->api_state == MeshService::STATE_DISCONNECTED) return;
     char js[BATCH_MAX_PAYLOAD];
     queueJsonToPhone(js, formatLaneDown(TOUGE_BUILD, why, js, sizeof(js)));

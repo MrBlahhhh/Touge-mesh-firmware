@@ -1,13 +1,14 @@
 #pragma once
 //
-// LoRa positions: when this car's goes out, and how the queues keep one per car
+// LoRa positions: the identity they carry, and how the queues keep one per car
 // (SCALE-PLAN 5b and 5c).
 //
 // The radio sends its car's LoRa position itself, from the fix it holds
-// (ownfix.h), every loraIntervalMs. Meshtastic's two queues that hold other
-// cars' positions, the one to the air and the one to the phone, keep only the
-// newest position per origin, judged by fix identity (rankFix), so a backlog
-// carries each car's latest fix rather than its history.
+// (ownfix.h), at the interval the measured load allows (loraload.h).
+// Meshtastic's two queues that hold other cars' positions, the one to the air
+// and the one to the phone, keep only the newest position per origin, judged by
+// fix identity (rankFix), so a backlog carries each car's latest fix rather
+// than its history.
 //
 // Platform-free: the module and the core patches read the packets and hand
 // over plain numbers.
@@ -17,23 +18,6 @@
 #include "frame.h"
 
 namespace touge {
-
-// ---- When this car's LoRa position goes out (5b) ---------------------------
-
-// The target, and the longest the airtime estimate may stretch it to. Twenty
-// seconds is the most the app's dead reckoning can still place a car across.
-static const uint32_t LORA_TARGET_MS = 5000;
-static const uint32_t LORA_MAX_MS = 20000;
-// The share of the channel a ride's positions may use; the rest carries text,
-// relays from further down the road, and Meshtastic's own housekeeping.
-static const uint32_t LORA_POSITION_SHARE_PCT = 30;
-
-// Time between this car's LoRa positions with [cars] on the ride (this one
-// included), each position taking [airtimeMs] on the air. Every car's position
-// is heard and relayed by every other car, so one round is about cars x cars
-// transmissions. The same estimate the app paced its own LoRa write with until
-// build 39 (Convoy.kt); 5d replaces it with measured load.
-uint32_t loraIntervalMs(uint32_t cars, uint32_t airtimeMs);
 
 // The identity a Meshtastic Position carries: sensor_id is the session,
 // seq_number the sequence, and the fix time is timestamp plus its millisecond
@@ -83,14 +67,17 @@ class TxPositions {
 
   void clear();
 
-  // A position on its way to the TX queue. One with no identity (a stock
-  // sender's) is not noted, and the queue treats it the stock way. A full table
-  // reuses the place of a packet no longer queued; with every place queued the
-  // note is dropped, which leaves that position to the stock rules.
-  void note(uint32_t from, uint32_t id, const FixId& fix, InQueue inQueue, void* ctx);
+  // A position on its way to the TX queue at [nowMs]. One with no identity (a
+  // stock sender's) is not noted, and the queue treats it the stock way. A full
+  // table reuses the place of a packet no longer queued; with every place
+  // queued the note is dropped, which leaves that position to the stock rules.
+  void note(uint32_t from, uint32_t id, const FixId& fix, uint32_t nowMs, InQueue inQueue, void* ctx);
 
   // The identity noted for a packet, or null.
   const FixId* find(uint32_t from, uint32_t id) const;
+  // How long since a packet was noted, which for one leaving the queue is its
+  // wait there (5d). False if it was not noted.
+  bool waited(uint32_t from, uint32_t id, uint32_t nowMs, uint32_t& waitedMs) const;
 
   // Where [incoming] goes in a queue of [count] packets, [at](i) giving the
   // i-th. On REPLACE, [index] is the one it replaces.
@@ -117,6 +104,7 @@ class TxPositions {
     uint32_t from = 0;
     uint32_t id = 0;
     FixId fix;  // session 0: an empty place
+    uint32_t notedMs = 0;
   };
   Tag tags_[SLOTS];
 };
