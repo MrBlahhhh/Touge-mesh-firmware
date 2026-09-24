@@ -39,6 +39,17 @@ built image would be an empty file system anyway.
 Every file is checked against the manifest's sha256 after download and before
 anything is written, and against its md5 on the flash after writing.
 
+**Reset and the port.** Reading the chip puts it in the ROM bootloader, where
+it has no Bluetooth. The page resets it back into its firmware and closes the
+port as soon as the chip is read, after a flash (good or failed), when the
+flash dialog closes, and on leaving the page (best effort, never mid-write).
+Flashing opens the port again, which puts it back in the bootloader; it reuses
+the port picked at Connect when exactly one granted port has the same USB IDs,
+otherwise it asks again. The reset is a `CustomReset` with `D0|R1|W200|R0|W200`
+(EN low with GPIO0 high), which works on the V3's USB-UART bridge and the V4's
+native USB. esptool-js 0.7.0's own `after("hard_reset")` only drops RTS, which
+is already low, so it doesn't reset anything.
+
 ## Publishing a build
 
 1. Build in the Meshtastic checkout with a plain `pio run -e heltec-v3` and

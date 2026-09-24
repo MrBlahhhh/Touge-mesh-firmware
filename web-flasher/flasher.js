@@ -4,10 +4,18 @@
 
 // Pinned to an exact version: a flasher that changes under us between two
 // visits is the last thing that should happen to a radio.
-import { ESPLoader, Transport } from "https://cdn.jsdelivr.net/npm/esptool-js@0.7.0/bundle.js";
+import { CustomReset, ESPLoader, Transport } from "https://cdn.jsdelivr.net/npm/esptool-js@0.7.0/bundle.js";
 
 const BAUD_FLASH = 921600;
 const BAUD_ROM = 115200;
+
+// Pulse EN with GPIO0 left high, so the chip boots its firmware. RTS drives EN
+// and DTR drives GPIO0 on both the V3's USB-UART bridge and the V4's native
+// USB-Serial/JTAG, so one sequence covers both. esptool-js 0.7.0's HardReset
+// (what loader.after("hard_reset") runs) only drops RTS and never raises it;
+// both of its bootloader resets finish with RTS already low, so on its own it
+// resets nothing and the radio stayed in the ROM bootloader.
+const RUN_FIRMWARE_RESET = "D0|R1|W200|R0|W200";
 
 // Same table as flash-all.ps1. The USB ID is never used: it only says who made
 // the USB bridge, and every other ESP32 on the bench has one of the same two.
@@ -49,9 +57,11 @@ const state = {
   pickedManually: false,
   chip: null,          // { name, flashMB, psramMB, mac } once read
   port: null,
+  portInfo: null,      // USB IDs of the last port picked, to find it again for the flash
   transport: null,
   loader: null,
   busy: false,
+  writing: false,      // erasing or writing flash: never reset the chip then
 };
 
 const $ = (id) => document.getElementById(id);
@@ -71,11 +81,27 @@ const terminal = {
 
 // ---------------------------------------------------------------- serial
 
-async function openLoader() {
-  if (state.loader) return state.loader;
+// The port picked at Connect, found again for the flash so the user isn't
+// asked twice. Only when exactly one granted port has those USB IDs; the V4
+// re-enumerates when it resets, so the old SerialPort object can't be kept.
+async function findPort() {
+  if (state.portInfo) {
+    const granted = await navigator.serial.getPorts();
+    const same = granted.filter((port) => {
+      const info = port.getInfo();
+      return info.usbVendorId === state.portInfo.usbVendorId && info.usbProductId === state.portInfo.usbProductId;
+    });
+    if (same.length === 1) return same[0];
+  }
   // No USB filter on purpose: the chip check decides what this is, not the
   // bridge vendor, so every port is offered.
-  state.port = await navigator.serial.requestPort();
+  return navigator.serial.requestPort();
+}
+
+async function openLoader() {
+  if (state.loader) return state.loader;
+  state.port = await findPort();
+  state.portInfo = state.port.getInfo();
   state.transport = new Transport(state.port, false);
   state.loader = new ESPLoader({
     transport: state.transport,
@@ -88,28 +114,37 @@ async function openLoader() {
     // moves to the fast baud rate.
     await state.loader.main();
   } catch (err) {
-    await closeLoader();
+    await releaseRadio();
     throw err;
   }
   state.port.addEventListener("disconnect", onUnplugged);
   return state.loader;
 }
 
-async function closeLoader() {
+// Resets the radio back into its firmware and closes the port. main() leaves
+// the chip in the ROM bootloader (or the stub), with no Bluetooth, until
+// something resets it, so every path that opened the port ends here.
+async function releaseRadio() {
   const transport = state.transport;
+  // Unhooked first: the V4 drops off USB while it resets, and that isn't
+  // the user unplugging it.
   if (state.port) state.port.removeEventListener("disconnect", onUnplugged);
   state.loader = null;
   state.transport = null;
   state.port = null;
-  if (transport) {
-    try { await transport.disconnect(); } catch { /* already gone */ }
-  }
+  if (!transport) return;
+  try {
+    await new CustomReset(transport, RUN_FIRMWARE_RESET).reset();
+    log("Radio restarted into its firmware.");
+  } catch { /* port never opened, or already gone */ }
+  try { await transport.disconnect(); } catch { /* already gone */ }
 }
 
 function onUnplugged() {
   state.loader = null;
   state.transport = null;
   state.port = null;
+  state.portInfo = null;
   state.chip = null;
   if (!state.pickedManually) state.boardKey = null;
   log("Radio unplugged.");
@@ -136,9 +171,14 @@ async function connectAndDetect() {
   $("device-error").hidden = true;
   render();
   try {
-    await closeLoader();
+    await releaseRadio();
+    // Connect always offers the port list, in case it's a different radio.
+    state.portInfo = null;
     const loader = await openLoader();
     state.chip = await readChip(loader);
+    // Detection only needs the bootloader for a moment. Flashing reconnects,
+    // which resets it back into the bootloader.
+    await releaseRadio();
     const detected = boardForChip(state.chip);
     log(`Chip ${state.chip.name}, ${state.chip.flashMB} MB flash, ${state.chip.psramMB} MB PSRAM -> ${detected || "unknown"}`);
     if (detected) {
@@ -147,7 +187,6 @@ async function connectAndDetect() {
     } else if (!state.pickedManually) {
       state.boardKey = null;
       showDeviceError(`Not a Heltec V3 or V4 (${chipText(state.chip)}). Nothing flashed. If you're sure what it is, use "I know what this is".`);
-      await closeLoader();
     }
   } catch (err) {
     if (err && err.name === "NotFoundError") {
@@ -156,6 +195,7 @@ async function connectAndDetect() {
       showDeviceError(`Couldn't talk to the radio: ${messageOf(err)}. See "If it won't connect" below.`);
       log(String(err && err.stack || err));
     }
+    await releaseRadio();
   } finally {
     state.busy = false;
     render();
@@ -320,6 +360,7 @@ async function startFlash() {
       images.push(await download(file));
     }
 
+    state.writing = true;
     if (mode === "fresh") {
       setStage("Erasing the whole flash (up to a minute)", null);
       wroteSomething = true;
@@ -343,6 +384,7 @@ async function startFlash() {
         setStage(`Writing ${shortName(files[fileIndex])}`, overall);
       },
     });
+    state.writing = false;
 
     for (const [i, image] of images.entries()) {
       setStage(`Verifying ${shortName(files[i])}`, null);
@@ -354,8 +396,7 @@ async function startFlash() {
     }
 
     setStage("Restarting the radio", 1);
-    await loader.after("hard_reset");
-    await closeLoader();
+    await releaseRadio();
     state.chip = null;
     setStage("Done", 1);
     showResult(true, mode === "fresh"
@@ -373,7 +414,10 @@ async function startFlash() {
       : `Flashing failed partway: ${escapeHtml(reason)} The radio may not start until it's flashed again. Unplug it, plug it back in and run it again; if it won't connect, hold BOOT while plugging in.`);
     setStage(nothing ? "Stopped" : "Failed", null);
     $("progress").classList.remove("indeterminate");
-    await closeLoader();
+    state.writing = false;
+    // Reset even after a failed write: a half-written radio is no worse off
+    // booting, and a refused one comes straight back up on its old firmware.
+    await releaseRadio();
   } finally {
     state.busy = false;
     $("flash-choices").querySelectorAll("input").forEach((input) => { input.disabled = false; });
@@ -440,7 +484,9 @@ function shortName(file) {
 function render() {
   const board = state.boardKey ? BOARDS[state.boardKey] : null;
   const release = state.release;
-  const connected = !!state.loader;
+  // The port is closed again once the chip is read, so "connected" means a
+  // radio has been read, not that the port is open.
+  const connected = !!state.chip;
 
   $("step-device").classList.toggle("ready", !!board);
   $("device-picked").hidden = !board;
@@ -528,6 +574,12 @@ function init() {
     });
   });
   $("flash-dialog").addEventListener("cancel", (event) => { if (state.busy) event.preventDefault(); });
+  // Nothing should still hold the port once the dialog closes, but if it does,
+  // hand the radio back rather than leave it in the bootloader.
+  $("flash-dialog").addEventListener("close", () => { if (!state.busy) releaseRadio(); });
+  // Best effort on the way out: the page may be gone before the reset lands.
+  // Never mid-write, where a reset would boot a half-written image.
+  window.addEventListener("pagehide", () => { if (!state.writing) releaseRadio(); });
   render();
   loadReleases();
 }
