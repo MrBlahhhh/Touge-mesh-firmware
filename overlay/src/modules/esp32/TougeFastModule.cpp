@@ -806,9 +806,11 @@ void TougeFastModule::alterReceived(meshtastic_MeshPacket &mp)
     if (!pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_Position_msg, &sent)) return;
     noteOwnFix();
     // Usually the fix its local write already gave us, or an older one queued
-    // behind it. Newer only if that write was lost or has not landed yet.
+    // behind it. The phone's content wins unless ours is known to be newer: a
+    // phone that sends no fix time (a stock Meshtastic app may not) must not
+    // have its position swapped for an older one.
     const Fix phoneFix = fixOf(sent);
-    if (!ownFix_.has() || measuredAfter(phoneFix, ownFix_.fix())) {
+    if (!ownFix_.has() || !measuredAfter(ownFix_.fix(), phoneFix)) {
         ownFix_.observe(phoneFix, esp_random() ^ (uint32_t)esp_timer_get_time());
     }
     if (!ownFix_.has()) return;
