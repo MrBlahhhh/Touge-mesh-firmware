@@ -3,6 +3,119 @@
     "sourceRepo":  "https://github.com/MrBlahhhh/Touge-mesh-firmware",
     "releases":  [
                      {
+                         "build":  36,
+                         "date":  "2026-09-24",
+                         "bench":  false,
+                         "notes":  "Build 36: 4 s button hold powers off, positions stamped and expired on the radio, dropped writes named, radio always reports its firmware. Flash every radio in the group and update the Touge app: it needs build 36.",
+                         "sourceCommit":  "4882af464709b89090ea69443bbd8984aa6c11e9",
+                         "meshtasticVersion":  "2.8.1.d971d50",
+                         "meshtasticCommit":  "d971d507c472770eecb8c001467cddd94a6333fe",
+                         "boards":  {
+                                        "heltec-v3":  {
+                                                          "partitionTable":  {
+                                                                                 "offset":  "0x8000",
+                                                                                 "size":  3072,
+                                                                                 "md5":  "801ba71678a964614657a6d8fbc6baca"
+                                                                             },
+                                                          "partitions":  {
+                                                                             "nvs":  "0x9000",
+                                                                             "otadata":  "0xe000",
+                                                                             "app0":  "0x10000",
+                                                                             "app1":  "0x340000",
+                                                                             "spiffs":  "0x670000",
+                                                                             "coredump":  "0x7f0000"
+                                                                         },
+                                                          "update":  [
+                                                                         {
+                                                                             "what":  "app",
+                                                                             "path":  "firmware/36/heltec-v3/firmware-heltec-v3-2.8.1.d971d50.bin",
+                                                                             "offset":  "0x10000",
+                                                                             "size":  2285280,
+                                                                             "md5":  "9b687e1e1f13e963a566fc332fe8e9a4",
+                                                                             "sha256":  "a5d59b504ab0c289e0d3900e785dad34a1528302f476dae9d91bc5ea40b812d8"
+                                                                         },
+                                                                         {
+                                                                             "what":  "otadata",
+                                                                             "path":  "firmware/36/heltec-v3/otadata-boot-app0.bin",
+                                                                             "offset":  "0xe000",
+                                                                             "size":  8192,
+                                                                             "md5":  "e6327541e2dc394ca2c3b3280ac0f39f",
+                                                                             "sha256":  "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0"
+                                                                         }
+                                                                     ],
+                                                          "fresh":  [
+                                                                        {
+                                                                            "what":  "factory",
+                                                                            "path":  "firmware/36/heltec-v3/firmware-heltec-v3-2.8.1.d971d50.factory.bin",
+                                                                            "offset":  "0x0",
+                                                                            "size":  2350816,
+                                                                            "md5":  "e096bab9fec8e4c4bc34144f9ff57ea2",
+                                                                            "sha256":  "de2dc132bbb652dc97c5223ebce8d4f71de4eef9600f22114eeeca562c861b1c"
+                                                                        },
+                                                                        {
+                                                                            "what":  "littlefs",
+                                                                            "path":  "firmware/36/heltec-v3/littlefs-heltec-v3-2.8.1.d971d50.bin",
+                                                                            "offset":  "0x670000",
+                                                                            "size":  1572864,
+                                                                            "md5":  "c900897a6bfa8512b5bbabbb811cc313",
+                                                                            "sha256":  "c14da3552c3bd7ca1c2c60b2356b826d2a715a8b65b324906eb4b423a8c5b623"
+                                                                        }
+                                                                    ]
+                                                      },
+                                        "heltec-v4":  {
+                                                          "partitionTable":  {
+                                                                                 "offset":  "0x8000",
+                                                                                 "size":  3072,
+                                                                                 "md5":  "118cbdbfce82eb12bbdeb7c59af2fce8"
+                                                                             },
+                                                          "partitions":  {
+                                                                             "nvs":  "0x9000",
+                                                                             "otadata":  "0xe000",
+                                                                             "app0":  "0x10000",
+                                                                             "app1":  "0x650000",
+                                                                             "spiffs":  "0xc90000",
+                                                                             "coredump":  "0xff0000"
+                                                                         },
+                                                          "update":  [
+                                                                         {
+                                                                             "what":  "app",
+                                                                             "path":  "firmware/36/heltec-v4/firmware-heltec-v4-2.8.1.d971d50.bin",
+                                                                             "offset":  "0x10000",
+                                                                             "size":  2302560,
+                                                                             "md5":  "7256211bfe23d3155a680e0cf2738bf2",
+                                                                             "sha256":  "2a99a0d5fe19056cbe05319522faa5e97f3c441433f6c3f0a60cec91112f2ab1"
+                                                                         },
+                                                                         {
+                                                                             "what":  "otadata",
+                                                                             "path":  "firmware/36/heltec-v4/otadata-boot-app0.bin",
+                                                                             "offset":  "0xe000",
+                                                                             "size":  8192,
+                                                                             "md5":  "e6327541e2dc394ca2c3b3280ac0f39f",
+                                                                             "sha256":  "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0"
+                                                                         }
+                                                                     ],
+                                                          "fresh":  [
+                                                                        {
+                                                                            "what":  "factory",
+                                                                            "path":  "firmware/36/heltec-v4/firmware-heltec-v4-2.8.1.d971d50.factory.bin",
+                                                                            "offset":  "0x0",
+                                                                            "size":  2368096,
+                                                                            "md5":  "24193a9eb27ade0064bebfdcbf8f8ff5",
+                                                                            "sha256":  "3dfa3c968ba00773c7d3731ada37a778ea543f34e4f906d15385d9c50b811c0c"
+                                                                        },
+                                                                        {
+                                                                            "what":  "littlefs",
+                                                                            "path":  "firmware/36/heltec-v4/littlefs-heltec-v4-2.8.1.d971d50.bin",
+                                                                            "offset":  "0xc90000",
+                                                                            "size":  3538944,
+                                                                            "md5":  "b3e5f863b17350bf809757c57fee8435",
+                                                                            "sha256":  "6300fee8c33ee9b146d0ecfd9e0a26f8dd06c0e59f38647cafa96070a79f1114"
+                                                                        }
+                                                                    ]
+                                                      }
+                                    }
+                     },
+                     {
                          "build":  34,
                          "date":  "2026-09-24",
                          "bench":  false,
