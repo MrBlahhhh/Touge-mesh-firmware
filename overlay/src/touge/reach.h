@@ -72,11 +72,9 @@ static const uint32_t REACH_EVERY_POSITIONS = 12;
 
 // Heard steadily direct: the last four positions of an origin reached us first
 // directly, none missed in between (more than one and a half intervals apart),
-// the latest within one and a half intervals and its fix under ten seconds old
-// on arrival. Four is 20 s at 5 s; a link that drops one position in ten gets
-// there two times in three.
+// the latest within one and a half intervals. Four is 20 s at 5 s; a link that
+// drops one position in ten gets there two times in three.
 static const uint8_t REACH_STEADY_FIXES = 4;
-static const uint32_t REACH_DIRECT_MAX_AGE_MS = 10000;
 
 // Early summaries (build 43), in our own intervals. An origin our last summary
 // called steady goes in one when it has been quiet two and a half intervals

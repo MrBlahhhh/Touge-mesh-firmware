@@ -299,13 +299,15 @@ void test_a_relayed_copy_or_a_missed_position_starts_the_count_again() {
   atMs = hearPositions(reach, ORIGIN, 3, atMs + INTERVAL_MS, 0, seq);
   TEST_ASSERT_TRUE(summaryEntry(reach, ORIGIN, atMs, e));
   TEST_ASSERT_TRUE(e.steady);
-  // Direct, but a fix twelve seconds old on arrival is not a link to count on.
+  // Direct and regular with a fix twelve seconds old on arrival is still
+  // steady: the age is the origin's GPS, which a relay would carry unchanged
+  // (build 44; indoors every fix arrived 20-30 s old and no relay was skipped).
   Reach late;
   late.clear();
   uint32_t lateSeq = 0;
   atMs = hearPositions(late, ORIGIN, 5, 1000, 0, lateSeq, 12000);
   TEST_ASSERT_TRUE(summaryEntry(late, ORIGIN, atMs, e));
-  TEST_ASSERT_FALSE(e.steady);
+  TEST_ASSERT_TRUE(e.steady);
 }
 
 // A one-entry summary about [origin] as a car would send it.

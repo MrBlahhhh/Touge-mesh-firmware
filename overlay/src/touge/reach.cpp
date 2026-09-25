@@ -206,8 +206,11 @@ size_t Reach::count(uint32_t nowMs) const {
 }
 
 bool Reach::steady(const Slot& s, uint32_t intervalMs, uint32_t nowMs) const {
+  // Not the fix's age: that is how stale the origin's GPS is, which a relay
+  // cannot improve (build 44; indoors every fix arrived 20-30 s old and no
+  // relay was ever skipped).
   return (s.state & STREAK) >= REACH_STEADY_FIXES && s.hops == 0 &&
-         (uint32_t)(nowMs - s.heardMs) <= intervalMs * 3 / 2 && reachAgeMs(s.ageQ) <= REACH_DIRECT_MAX_AGE_MS;
+         (uint32_t)(nowMs - s.heardMs) <= intervalMs * 3 / 2;
 }
 
 ReachEntry Reach::entryOf(const Slot& s, uint32_t intervalMs, uint32_t nowMs) const {

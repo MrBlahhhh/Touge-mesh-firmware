@@ -47,20 +47,20 @@ bool liveLease(const Rider& r, uint32_t selfId, uint32_t nowMs) {
 // A slot's beacon record lined up with now, `sinceMs` after its last beacon:
 // one beacon counts missing only once it is a quarter second overdue, so a
 // read just before it lands does not see a gap.
-uint8_t upToNow(uint8_t bits, uint32_t sinceMs) {
+uint16_t upToNow(uint16_t bits, uint32_t sinceMs) {
   const uint32_t graceMs = SCHEDULE_MS / 4;
   if (sinceMs <= SCHEDULE_MS + graceMs) return bits;
   const uint32_t missed = (sinceMs - graceMs) / SCHEDULE_MS;
-  return missed >= LINK_SECONDS ? 0 : (uint8_t)(bits << missed);
+  return missed >= LINK_SECONDS ? 0 : (uint16_t)(bits << missed);
 }
 
 // Seconds the record covers, from its oldest beacon to now.
-uint8_t spanOf(uint8_t bits) { return bits == 0 ? 0 : (uint8_t)(32 - __builtin_clz((unsigned)bits)); }
+uint8_t spanOf(uint16_t bits) { return bits == 0 ? 0 : (uint8_t)(32 - __builtin_clz((unsigned)bits)); }
 
-// Under three in four heard, over at least two seconds of record.
-bool poorRecord(uint8_t bits) {
+// Under half heard, over at least four seconds of record (see MAP_TRUST_MS).
+bool poorRecord(uint16_t bits) {
   const uint8_t span = spanOf(bits);
-  return span >= 2 && __builtin_popcount(bits) * 4 < span * 3;
+  return span >= 4 && __builtin_popcount(bits) * 2 < span;
 }
 
 } // namespace
@@ -422,8 +422,8 @@ void Schedule::heardBeacon(uint32_t senderId, const Position& p, uint32_t nowMs)
     slotSeen_[s] = 0;
     slotMutual_[s] = 0;
   } else {
-    slotSeen_[s] = (uint8_t)(slotSeen_[s] << beacons);
-    slotMutual_[s] = (uint8_t)(slotMutual_[s] << beacons);
+    slotSeen_[s] = (uint16_t)(slotSeen_[s] << beacons);
+    slotMutual_[s] = (uint16_t)(slotMutual_[s] << beacons);
   }
   slotSeen_[s] |= 1;
   if (claimed() && p.slotMap[slot_] == slotTag(selfId_)) slotMutual_[s] |= 1;
@@ -438,9 +438,15 @@ void Schedule::updateFitness(uint32_t nowMs) {
     const uint32_t sinceMs = nowMs - slotHeardMs_[s];
     // A car heard at least twice in the window. One that has just left still
     // counts for a few seconds, against us, which errs the safe way.
-    if (__builtin_popcount(upToNow(slotSeen_[s], sinceMs)) < 2) continue;
+    const int seen = __builtin_popcount(upToNow(slotSeen_[s], sinceMs));
+    if (seen < 2) continue;
     heard++;
-    if (__builtin_popcount(upToNow(slotMutual_[s], sinceMs)) >= SOLID_LINK_SECONDS) solid++;
+    // Of the beacons we heard, half showed us: both ways, without needing both
+    // in the same second. A stricter count to become fit than to stay fit
+    // (FIT_SEEN_SECONDS, SOLID_SEEN_SECONDS).
+    const int mutual = __builtin_popcount(upToNow(slotMutual_[s], sinceMs));
+    const int need = fit_ ? SOLID_SEEN_SECONDS : FIT_SEEN_SECONDS;
+    if (seen >= need && mutual * 2 >= seen) solid++;
   }
   // Half of them solid to become fit, a third to stay fit.
   const bool shouldBeFit = solid > 0 && solid * (fit_ ? 3 : 2) >= heard;
@@ -463,14 +469,17 @@ bool Schedule::hearingPoorly(uint32_t nowMs) const {
   uint32_t heard = 0;
   uint32_t due = 0;
   for (uint8_t s = 0; s < MAX_SLOTS; s++) {
-    const uint8_t seen = upToNow(slotSeen_[s], nowMs - slotHeardMs_[s]);
+    const uint16_t seen = upToNow(slotSeen_[s], nowMs - slotHeardMs_[s]);
     // One beacon says nothing about the ones in between, and a slot silent for
-    // three seconds has been left, which says nothing about our hearing.
-    if (spanOf(seen) < 2 || (seen & 0x07) == 0) continue;
+    // eight seconds has been left, which says nothing about our hearing. Three,
+    // until build 44: a car heard one beacon in four goes three seconds silent
+    // two times in five, and dropped out of this count just then, taking the
+    // poor listener's caution with it.
+    if (spanOf(seen) < 2 || (seen & 0xFF) == 0) continue;
     heard += (uint32_t)__builtin_popcount(seen);
     due += spanOf(seen);
   }
-  return heard * 4 < due * 3;
+  return heard * 2 < due;
 }
 
 bool Schedule::hearsPoorly(uint8_t slot, uint32_t id, uint32_t nowMs) const {
