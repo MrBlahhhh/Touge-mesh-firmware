@@ -106,7 +106,9 @@ rm -f "$MODULES.bak"
 # 0013 lets it skip a relay nobody needs (NextHopRouter.cpp), 0014 sends its own
 # position on its own contention delay (RadioLibInterface.cpp, NotifiedWorkerThread),
 # and 0015 sends that position unsigned and lets unsigned positions from signers in
-# (Router.cpp). Without these the fast lane builds but does not carry. Idempotent: a
+# (Router.cpp). From build 45, 0016 is upstream's #11940 byte for byte, ahead of its
+# release (RadioLibInterface.h): once the pin includes it, it reverse-applies and is
+# skipped. Without these the fast lane builds but does not carry. Idempotent: a
 # patch that already reverse-applies is in, and is skipped.
 if ls "$HERE"/core-patches/*.patch >/dev/null 2>&1; then
   echo "==> core patches"

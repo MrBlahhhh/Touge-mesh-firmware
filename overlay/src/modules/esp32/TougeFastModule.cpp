@@ -211,7 +211,10 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     attached really sees (35-50 % each way on the bench): a solid link is heard in 5 of 16 s with half of
 //     those showing us back; a poor listener hears under half. A relay is skipped on direct, steady
 //     reception alone, not the fix's age.
-const uint32_t TOUGE_BUILD = 44;
+// 45: core-patches/0016, upstream's #11940 ahead of its release: a RadioLib error code is no longer read as a
+//     packet's airtime (one bad sample read 7158 % busy, stopped LoRa sends for up to an hour, and would have
+//     wrecked the 5d load figures).
+const uint32_t TOUGE_BUILD = 45;
 
 // How long a board hunts before giving up and waiting at home.
 //

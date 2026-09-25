@@ -1,6 +1,6 @@
 # Touge fast mesh
 
-A Meshtastic module plus fifteen core patches for the Heltec WiFi LoRa 32 V3 and
+A Meshtastic module plus sixteen core patches for the Heltec WiFi LoRa 32 V3 and
 V4 (ESP32-S3). It adds an ESP-NOW lane on the S3's 2.4 GHz radio for positions
 and voice, and from build 39 sends the car's LoRa position itself. The build
 number is `TOUGE_BUILD` in `TougeFastModule.cpp`.
@@ -54,6 +54,7 @@ null unless the module sets them; the other patches change behaviour directly.
 | 0013 | `NextHopRouter.*` | `tougeRelaySkipHook`: don't relay a Touge position whose origin every other car's fresh reach summary says it hears steadily direct |
 | 0014 | `NotifiedWorkerThread.*`, `RadioLibInterface.*` | `tougeTxSoonHook`: our own LoRa position, at the head of the queue, goes on its own contention delay instead of what is left of a relay's SNR-weighted one (`notifySooner`) |
 | 0015 | `Router.*` | `tougeSendUnsignedHook`, `tougeAcceptUnsignedHook`: our own position goes unsigned on a keyed channel, and an unsigned position from a node known to sign passes the Balanced check |
+| 0016 | `RadioLibInterface.h` | Upstream #11940, unreleased: a RadioLib error code is no longer read as a packet's airtime |
 
 ## Host tests
 
