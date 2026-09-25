@@ -162,20 +162,36 @@ static const uint32_t ESTABLISHED_LEASE_MS = 10000;
 
 // Seconds of lease beacons remembered per slot, one bit each: whether we heard
 // it, and whether its slot map showed us back. Fitness and hearing quality are
-// read from these.
-static const uint8_t LINK_SECONDS = 8;
+// read from these. Sixteen, not eight, from build 44: at real loss rates eight
+// seconds held too few beacons to tell a good link from a bad one.
+static const uint8_t LINK_SECONDS = 16;
 
-// A link is solid when it worked both ways in this many of the last
-// LINK_SECONDS. A radio heard one frame in two manages about one in three.
-static const uint8_t SOLID_LINK_SECONDS = 6;
+// A link is solid when we heard its lease beacon in at least this many of the
+// last LINK_SECONDS, and at least half of those showed us back. On the
+// 2026-09-24 bench, with a phone on every radio (BLE shares the 2.4 GHz
+// radio), good links lost 35-50 % of beacons each way and the bad radio 65-80 %;
+// requiring both ways in the same second, six of eight, left no car fit and
+// the lowest node number, the bad radio, keeping time. At 40 % loss a link
+// passes this about nine times in ten, at 75 % about once in twenty.
+static const uint8_t SOLID_SEEN_SECONDS = 5;
+
+// To become fit, rather than stay fit, a link has to be heard in ten of the
+// sixteen seconds. Every fit car outranks the unfit, and among the fit the
+// lowest node number wins, so a weak radio fit by luck takes the clock: in the
+// host sim at 75 % loss, five of sixteen named it reference 16 % of the time,
+// eight of sixteen 2 %. A link at 40 % loss is at ten or more about one second
+// in two, so a good car becomes fit within seconds and stays on the lower bar;
+// at 75 % loss, about one second in 1300.
+static const uint8_t FIT_SEEN_SECONDS = 10;
 
 // How long the link record must say otherwise before a car becomes, or stops
 // being, fit to keep time.
 static const uint32_t FIT_HOLD_MS = 3 * SCHEDULE_MS;
 
 /**
- * Hearing well is at least three in four of the lease beacons due from the
- * cars we hear at all (hearingPoorly). Below that, a neighbour's latest map is
+ * Hearing well is at least half of the lease beacons due from the cars we hear
+ * at all (hearingPoorly; three in four until build 44, which every radio with a
+ * phone attached fell short of). Below that, a neighbour's latest map is
  * often a few seconds old, so a car claiming a slot goes on maps up to this
  * old instead of HEARD_WINDOW_MS, and waits while a leased neighbour's is
  * older still. Three beacons.
@@ -344,8 +360,8 @@ class Schedule {
 
   /**
    * Whether we hear the ride well enough to keep time for it: at least one
-   * link solid both ways (SOLID_LINK_SECONDS), and solid links at least half
-   * of the cars we hear. Once fit, a third keeps it, and either change needs
+   * solid link (SOLID_SEEN_SECONDS), and solid links at least half of the cars
+   * we hear. Once fit, a third keeps it, and either change needs
    * FIT_HOLD_MS on end, so a link coming and going does not flip it. Re-read
    * at every rebuild. In the host sim, without the hold, a radio heard one
    * frame in two won it on a lucky second and kept the clock for 2.5 s.
@@ -464,8 +480,8 @@ class Schedule {
   uint8_t slotHeardTag_[MAX_SLOTS] = {}; // 0 until somebody is heard there
   // The last LINK_SECONDS of each slot's lease beacons, newest in bit 0 as of
   // slotHeardMs_: heard at all, and heard with its map showing us.
-  uint8_t slotSeen_[MAX_SLOTS] = {};
-  uint8_t slotMutual_[MAX_SLOTS] = {};
+  uint16_t slotSeen_[MAX_SLOTS] = {};
+  uint16_t slotMutual_[MAX_SLOTS] = {};
 
   // Some car in earshot is unleased or has lost its slot. Set by settleLease.
   bool someoneWaiting_ = false;

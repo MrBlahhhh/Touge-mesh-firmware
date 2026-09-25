@@ -771,16 +771,16 @@ void test_fitness_needs_half_the_links_solid_both_ways_and_a_third_to_keep_it() 
     touch(r, now);
     s.heardBeacon(200, beaconOn(4, 0, 100), now);
     s.heardBeacon(300, beaconOn(8), now);
-    if (k > 8) s.heardBeacon(400, beaconOn(12), now);
+    if (k > 12) s.heardBeacon(400, beaconOn(12), now);
     if (k > 14) {
       s.heardBeacon(600, beaconOn(16), now);
       s.heardBeacon(700, beaconOn(20), now);
     }
     s.rebuild(100, false, r, ROSTER, now);
-    // 200 is solid after six seconds both ways, one of the two cars we hear,
-    // and that has to hold for FIT_HOLD_MS.
-    if (k == 7) TEST_ASSERT_FALSE(s.fitToKeepTime());
-    if (k == 8) TEST_ASSERT_TRUE(s.fitToKeepTime());
+    // 200 is solid once heard in FIT_SEEN_SECONDS with its map showing us, one
+    // of the two cars we hear, and that has to hold for FIT_HOLD_MS.
+    if (k == 11) TEST_ASSERT_FALSE(s.fitToKeepTime());
+    if (k == 12) TEST_ASSERT_TRUE(s.fitToKeepTime());
     // One solid of three keeps it.
     if (k == 14) TEST_ASSERT_TRUE(s.fitToKeepTime());
     // One of five does not, once that has held for FIT_HOLD_MS: five heard
@@ -811,21 +811,23 @@ void test_fitness_needs_half_the_links_solid_both_ways_and_a_third_to_keep_it() 
 // ---- A radio that hears the ride poorly -------------------------------------
 
 void test_a_car_that_hears_the_ride_poorly_listens_twice_as_long() {
-  // Two leased cars heard one beacon in two, as the moto's radio heard the
-  // others on the bench.
+  // Two leased cars heard one beacon in four, as the moto's radio heard the
+  // others on the bench (20-35 %).
   Rider r[ROSTER] = {};
   addLeased(r, 0, 500, 0, 1);
   addLeased(r, 1, 700, 4, 1);
   Schedule s;
   const uint32_t first = 1000;
   for (uint32_t now = first; now <= first + 2 * JOIN_LISTEN_MS; now += 500) {
-    if ((now - first) % 2000 == 0) {
+    if ((now - first) % 4000 == 0) {
       touch(r, now);
       s.heardBeacon(500, beaconOn(0), now);
       s.heardBeacon(700, beaconOn(4), now);
     }
     s.rebuild(300, false, r, ROSTER, now);
-    if (now < first + 2 * JOIN_LISTEN_MS) TEST_ASSERT_FALSE(s.claimed());
+    char at[40];
+    snprintf(at, sizeof(at), "claimed %u ms after the first beacon", (unsigned)(now - first));
+    if (now < first + 2 * JOIN_LISTEN_MS) TEST_ASSERT_FALSE_MESSAGE(s.claimed(), at);
   }
   TEST_ASSERT_EQUAL_UINT8(8, s.slot());
 
@@ -891,20 +893,20 @@ void test_a_second_lost_lease_backs_off_before_claiming_again() {
 
 void test_silence_from_neighbours_heard_poorly_does_not_drown_a_lease() {
   // test_a_drowned_lease_listens_again_before_reclaiming, but we hear both
-  // neighbours one beacon in two, so their silence about us says little.
+  // neighbours one beacon in three, so their silence about us says little.
   Rider r[ROSTER] = {};
   addLeased(r, 0, 100, 0, 1);
   addLeased(r, 1, 900, 8, 1);
   Schedule s;
   const uint32_t joined = join(s, 300, r);
   TEST_ASSERT_TRUE(s.claimed());
-  for (uint32_t k = 1; k <= 3; k += 2) {
+  for (uint32_t k = 1; k <= 7; k += 3) {
     const uint32_t at = joined + k * SCHEDULE_MS;
     s.heardBeacon(100, beaconOn(0), at);
     s.heardBeacon(900, beaconOn(8), at);
   }
-  touch(r, joined + 3 * SCHEDULE_MS);
-  s.rebuild(300, false, r, ROSTER, joined + 3 * SCHEDULE_MS + 100);
+  touch(r, joined + 7 * SCHEDULE_MS);
+  s.rebuild(300, false, r, ROSTER, joined + 7 * SCHEDULE_MS + 100);
   TEST_ASSERT_TRUE(s.claimed());
 }
 
@@ -1708,11 +1710,12 @@ double framesPerSecond(const World& w) {
 // What watch() saw, sampled every 100 ms: how long `car` shared a slot with a
 // car it could collide with (in all, and the longest stretch), how long it held
 // a slot, how long the ride named more than one reference, how long any car
-// named `car`, and how many times each car's reference changed.
+// named `car` (and how long a car other than `car` did: the ones that would
+// take their clock from it), and how many times each car's reference changed.
 struct Watch {
   size_t car = SIZE_MAX;
   uint32_t sharedMs = 0, longestSharedMs = 0, stretchMs = 0, leasedMs = 0;
-  uint32_t splitMs = 0, namedCarMs = 0;
+  uint32_t splitMs = 0, namedCarMs = 0, namedByOthersMs = 0;
   std::vector<uint32_t> lastRef, refChanges;
 
   uint32_t mostRefChanges() const {
@@ -1743,13 +1746,16 @@ void watch(World& w, Watch& out, uint32_t forMs) {
     if (out.stretchMs > out.longestSharedMs) out.longestSharedMs = out.stretchMs;
 
     uint32_t named = 0;
-    bool split = false, namesCar = false;
+    bool split = false, namesCar = false, othersNameCar = false;
     for (size_t k = 0; k < n; k++) {
       if (!w.cars[k].on) continue;
       const uint32_t ref = w.cars[k].sched.referenceId();
       if (named == 0) named = ref;
       else if (ref != named) split = true;
-      if (out.car < n && ref == w.cars[out.car].id) namesCar = true;
+      if (out.car < n && ref == w.cars[out.car].id) {
+        namesCar = true;
+        if (k != out.car) othersNameCar = true;
+      }
       if (ref != out.lastRef[k]) {
         out.refChanges[k]++;
         out.lastRef[k] = ref;
@@ -1757,6 +1763,7 @@ void watch(World& w, Watch& out, uint32_t forMs) {
     }
     if (split) out.splitMs += 100;
     if (namesCar) out.namedCarMs += 100;
+    if (othersNameCar) out.namedByOthersMs += 100;
   }
 }
 
@@ -2154,8 +2161,10 @@ void test_sim_extras_cut_the_age_of_a_1hz_phone_fix() {
 // ---- A weak radio, simulated ------------------------------------------------
 //
 // The bench on 2026-09-24: the moto's radio heard at -82 to -91 dBm, the other
-// two at about -50, with the lowest node number of the three. Modelled as a car
-// whose links lose half their frames each way, forwards included.
+// two at about -50, with the lowest node number of the three. With a phone on
+// every radio (BLE shares the 2.4 GHz radio) the good links lost 35-50 % of
+// beacons each way and the moto's 65-80 %. Modelled as 40 % and 75 %, each
+// way, forwards included.
 
 static const uint32_t WEAK_ID = 0x0FFFFFFFu; // below every id World draws
 
@@ -2173,7 +2182,9 @@ void test_sim_a_weak_radio_keeps_to_a_free_slot_and_off_the_clock() {
   const size_t cars = 6, weak = 0;
   World w(cars, 51);
   w.cars[weak].id = WEAK_ID;
-  for (size_t j = 1; j < cars; j++) w.setLoss(weak, j, 50);
+  for (size_t j = 1; j < cars; j++) w.setLoss(weak, j, 75);
+  for (size_t a = 1; a < cars; a++)
+    for (size_t b = a + 1; b < cars; b++) w.setLoss(a, b, 40);
   sim::bootAll(w, 0, cars);
   w.run(30000);
   TEST_ASSERT_TRUE_MESSAGE(w.settled(), "every car, the weak one too, on a slot of its own");
@@ -2217,15 +2228,17 @@ void test_sim_a_weak_radio_keeps_to_a_free_slot_and_off_the_clock() {
 }
 
 void test_sim_the_bench_three_radios_with_the_weak_one_lowest() {
-  // The moto hears the Samsung's radio at half its frames and the V3 not at
-  // all; the Samsung's radio and the V3 hear each other well. On builds 38 and
-  // 39 the moto kept the clock, the V3 took it two hops away, and the moto
-  // came up on the V3's slot.
+  // The moto hears the Samsung's radio at a quarter of its frames and the V3
+  // not at all; the Samsung's radio and the V3 lose 40 %, as good links with a
+  // phone attached do. On builds 38 and 39 the moto kept the clock, the V3 took
+  // it two hops away, and the moto came up on the V3's slot; on build 43, with
+  // no car fit at these rates, the moto kept it again.
   const size_t moto = 0, samsung = 1, v3 = 2;
   World w(3, 52);
   w.cars[moto].id = WEAK_ID;
   w.setLink(moto, v3, false);
-  w.setLoss(moto, samsung, 50);
+  w.setLoss(moto, samsung, 75);
+  w.setLoss(samsung, v3, 40);
   sim::bootAll(w, 0, 3);
   w.run(30000);
   TEST_ASSERT_TRUE(w.settled());
@@ -2237,22 +2250,33 @@ void test_sim_the_bench_three_radios_with_the_weak_one_lowest() {
   sim::watch(w, seen, forMs);
   reportWatch("the bench", seen, forMs);
   TEST_ASSERT_TRUE(seen.longestSharedMs <= 2000);
-  // One judge, heard one frame in two: the odd lease given up for want of a
+  // One judge, heard one frame in four: the odd lease given up for want of a
   // map showing it is allowed, as long as it is rejoined cleanly.
   TEST_ASSERT_TRUE(seen.leasedMs >= forMs / 100 * 90);
   TEST_ASSERT_EQUAL_UINT32(0, w.cars[samsung].slotChanges);
   TEST_ASSERT_EQUAL_UINT32(0, w.cars[v3].slotChanges);
   TEST_ASSERT_EQUAL_UINT32(0, w.leasedCollisions);
-  TEST_ASSERT_EQUAL_UINT32(0, seen.namedCarMs);
-  TEST_ASSERT_TRUE(seen.splitMs <= forMs / 100);
+  // The moto names itself whenever it goes REFERENCE_LAPSE_MS without hearing
+  // the Samsung's radio, about one window in ten at 75 % loss. Nobody follows
+  // it and it keeps its epoch, so the ride's clock is untouched; its own
+  // disagreement is the only split allowed.
+  TEST_ASSERT_EQUAL_UINT32(0, seen.namedByOthersMs);
+  TEST_ASSERT_TRUE(seen.namedCarMs <= forMs / 10);
+  TEST_ASSERT_TRUE(seen.splitMs <= seen.namedCarMs + forMs / 100);
   // The V3 is the reference or hears it directly.
   TEST_ASSERT_TRUE(w.cars[v3].sched.hopsToReference() <= 1);
+  // At these rates the two good radios qualify to keep time and the moto does
+  // not, which is what keeps the clock off it rather than luck.
+  TEST_ASSERT_TRUE(w.cars[samsung].sched.fitToKeepTime());
+  TEST_ASSERT_TRUE(w.cars[v3].sched.fitToKeepTime());
+  TEST_ASSERT_FALSE(w.cars[moto].sched.fitToKeepTime());
 }
 
 void test_sim_the_reference_holds_while_link_quality_jitters() {
-  // Six cars in range of each other, every link losing 0-25 % of its frames,
-  // redrawn every ten seconds for five minutes. Link records wobble with every lost
-  // beacon; the reference must not follow it.
+  // Six cars in range of each other, every link losing 25-50 % of its frames
+  // (the bench's good links with a phone attached), redrawn every ten seconds
+  // for five minutes. Link records wobble with every lost beacon; the
+  // reference must not follow it.
   const size_t cars = 6;
   World w(cars, 61);
   sim::bootAll(w, 0, cars);
@@ -2263,7 +2287,7 @@ void test_sim_the_reference_holds_while_link_quality_jitters() {
   sim::Watch seen;
   for (int period = 0; period < 30; period++) {
     for (size_t a = 0; a < cars; a++)
-      for (size_t b = a + 1; b < cars; b++) w.setLoss(a, b, (uint8_t)(sim::rand32() % 26));
+      for (size_t b = a + 1; b < cars; b++) w.setLoss(a, b, (uint8_t)(25 + sim::rand32() % 26));
     sim::watch(w, seen, 10000);
   }
   char line[120];

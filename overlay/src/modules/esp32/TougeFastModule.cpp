@@ -207,7 +207,11 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     summaries show every other car known hears the origin steadily direct (0013), summaries say so per entry and
 //     go early when a car stops hearing an origin it claimed ("le" se, sk, rn, rs, rd); 981 B less static RAM for
 //     the pre-encoded batch.
-const uint32_t TOUGE_BUILD = 43;
+// 44: fitness to keep time and hearing quality judged on 16 s of beacons at the loss a radio with a phone
+//     attached really sees (35-50 % each way on the bench): a solid link is heard in 5 of 16 s with half of
+//     those showing us back; a poor listener hears under half. A relay is skipped on direct, steady
+//     reception alone, not the fix's age.
+const uint32_t TOUGE_BUILD = 44;
 
 // How long a board hunts before giving up and waiting at home.
 //
