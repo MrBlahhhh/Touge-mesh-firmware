@@ -125,8 +125,12 @@ enum class DirectClaim : uint8_t {
 };
 
 // One slot per origin: the ride's roster. A full table forgets the origin heard
-// longest ago. 16 bytes a slot, and 6 more for the claims (build 43).
-static const size_t REACH_SLOTS = MAX_RIDERS;
+// longest ago. 16 bytes a slot, and 6 more for the claims (build 43). 32, not
+// MAX_RIDERS (28): a 30-car ride has 29 other origins, and each arrival evicted
+// the car due to send next, so nobody's claims survived and no relay was
+// skipped. The extra four slots cost 88 bytes.
+static const size_t REACH_SLOTS = 32;
+static_assert(REACH_SLOTS >= MAX_RIDERS, "at least every car the roster holds");
 static_assert(REACH_SLOTS <= 32, "the claims keep one bit per car in a 32-bit word");
 
 class Reach {
@@ -206,7 +210,7 @@ class Reach {
   // car in slot c said, in its latest summary listing slot o's origin, that it
   // hears it steadily direct. summaryAt_[c] is when that car's latest full
   // summary came in, in 256 ms ticks of the radio's clock, low 16 bits (4.7
-  // hours round; 0 none). 168 bytes.
+  // hours round; 0 none). 192 bytes.
   uint32_t claimedBy_[REACH_SLOTS] = {0};
   uint16_t summaryAt_[REACH_SLOTS] = {0};
   uint32_t lastEarlyMs_ = 0;  // our last early summary, when hasLastEarly_

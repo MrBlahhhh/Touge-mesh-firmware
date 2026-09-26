@@ -218,7 +218,12 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     unheard or alone, with what the slot maps showed), and the status line counts lease beacons sent
 //     ("lease=", "lb") and the longest gap between passes ("gap=", "pg"). No behaviour change: the V3 on
 //     the Pixel lost slot 0 about every 35 s on 45 and nothing said which rule did it.
-const uint32_t TOUGE_BUILD = 46;
+// 47: the review's B1, B3, B4 (docs/plans/2026-09-25-mesh-voice-review.md). core-patches/0017 stops
+//     the V3's UART log stalling the loop (DEBUG and four per-packet INFO lines compiled out, 76 % and
+//     ~15 % of 4.3 KB/s); the reach table holds 32 origins, not 28; Meshtastic's public default key no
+//     longer passes as a secret. B2 (a young lease dropped on one silent pass) is left for the bench:
+//     every wait tried slowed the 25-car power-on or broke the merge and bench sims.
+const uint32_t TOUGE_BUILD = 47;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -309,17 +314,24 @@ static_assert(SYNC_BIAS_MS * (MAX_REF_HOPS + 1) + FRAME_AIRTIME_MS <= SLOT_MS,
               "a car at MAX_REF_HOPS would transmit outside its slot: shorten the chain, "
               "widen the slots, or make the tick faster");
 
-// The shortest PSK worth deriving a 2.4 GHz key from.
-//
-// Meshtastic uses one byte to mean "the default channel, key number N", which
-// is public knowledge rather than a secret. A Touge ride always writes a full
-// 32 byte PSK, so anything this short is a channel nobody has secured.
+// The shortest PSK worth deriving a 2.4 GHz key from. Catches -1 (no usable
+// key) and 0 (encryption off); getKey pads any 2-15 byte PSK to 16.
 const int MIN_PSK_BYTES = 16;
 
-// A channel only the ride can read: its key is a real secret (MIN_PSK_BYTES).
+// A key only the ride has. Length alone is not enough: getKey expands
+// Meshtastic's one-byte PSK ("default key number N", on a fresh radio and on
+// one the app has handed back, STOCK_PSK = [1]) into the 16-byte public
+// defaultpsk, which passes any length test. cryptoKeyIsPublic matches that
+// family.
+bool secretKey(const CryptoKey &key)
+{
+    return key.length >= MIN_PSK_BYTES && !cryptoKeyIsPublic(key);
+}
+
+// A channel only the ride can read: its key is a real secret.
 bool privateChannel(ChannelIndex ch)
 {
-    return ch < channels.getNumChannels() && channels.getKey(ch).length >= MIN_PSK_BYTES;
+    return ch < channels.getNumChannels() && secretKey(channels.getKey(ch));
 }
 
 const char *NVS_NAMESPACE = "tougefast";
@@ -491,18 +503,18 @@ void TougeFastModule::syncChannel()
     CryptoKey key = channels.getKey(channels.getPrimaryIndex());
     // No secret, no fast lane.
     //
-    // -1 is "no usable key", 0 is "encryption off", and 1 is Meshtastic's
-    // default channel: a single byte naming one of the well known keys that
-    // ships with the firmware and is on the public internet. None of the three
-    // is a secret, and a key derived from a value everybody has is the same key
-    // on every board on earth - so every radio on a default channel would share
-    // one 2.4 GHz secret, and the tag checks would all pass and make it look
-    // authenticated.
+    // -1 is "no usable key", 0 is "encryption off", and a one-byte PSK is
+    // Meshtastic's default channel: a well known key that ships with the
+    // firmware and is on the public internet. None of the three is a secret,
+    // and a key derived from a value everybody has is the same key on every
+    // board on earth, so every radio on a default channel would share one
+    // 2.4 GHz secret and the tag checks would all pass.
     //
-    // The first version of this guard tested `<= 0` and let the one byte case
-    // straight through, which is the same hole with a longer name. A ride key
-    // derives a 32 byte PSK, so anything shorter than a real key is not one.
-    if (key.length < MIN_PSK_BYTES) {
+    // Through build 46 this tested length only. getKey had already expanded the
+    // one-byte PSK to the 16-byte public defaultpsk, so a fresh radio passed,
+    // brought the lane up on a key every Touge radio shares, and never said
+    // NO_KEY. secretKey also refuses the defaultpsk family.
+    if (!secretKey(key)) {
         laneDown_ = LaneDown::NO_KEY;
         if (started_) {
             LOG_INFO("touge: primary channel has no real key, fast lane down");
