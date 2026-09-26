@@ -244,6 +244,63 @@ void test_a_full_table_forgets_the_origin_heard_longest_ago() {
   TEST_ASSERT_EQUAL_UINT32(REACH_SLOTS, reach.count(5000));
 }
 
+// 30 origins, one more than a 30-car ride shows any car, each heard direct once
+// an interval in rank order, each summary claiming every other car steady. With
+// 28 slots (MAX_RIDERS, to build 46) each arrival evicted the car due next,
+// wiping its claims, so one car was always UNPROVEN and no relay was skipped.
+void test_30_origins_keep_their_slots_and_claims() {
+  static const uint32_t OTHERS = 30;
+  TEST_ASSERT_TRUE(REACH_SLOTS >= OTHERS);
+  Reach reach;
+  reach.clear();
+  uint32_t cars[OTHERS];
+  for (uint32_t k = 0; k < OTHERS; k++) cars[k] = 0xD0000001 + k;
+  uint32_t seq[OTHERS] = {0};
+  uint32_t nowMs = 0;
+  for (uint32_t round = 0; round < 4; round++) {
+    for (uint32_t k = 0; k < OTHERS; k++) {
+      nowMs = 1000 + round * INTERVAL_MS + k * (INTERVAL_MS / OTHERS);
+      reach.heard(cars[k], fixId(1, ++seq[k]), 300, 0, (uint8_t)cars[k], INTERVAL_MS, nowMs);
+      ReachEntry claims[OTHERS];
+      size_t n = 0;
+      for (uint32_t o = 0; o < OTHERS; o++) {
+        if (o == k) continue;
+        claims[n] = entry(cars[o], 9, 300, 1, 0, (uint8_t)cars[o]);
+        claims[n++].steady = true;
+      }
+      uint8_t buf[REACH_HEADER + OTHERS * REACH_ENTRY];
+      const size_t len = encodeReach(claims, n, REACH_STEADY, buf, sizeof(buf));
+      TEST_ASSERT_TRUE(reach.noteSummary(cars[k], buf, len, nowMs));
+    }
+  }
+
+  TEST_ASSERT_EQUAL_UINT32(OTHERS, reach.count(nowMs));
+  for (uint32_t o = 0; o < OTHERS; o++) {
+    TEST_ASSERT_TRUE(reach.heardWithin(cars[o], INTERVAL_MS * 2, nowMs));
+    uint32_t known[OTHERS];
+    size_t n = 0;
+    for (uint32_t c = 0; c < OTHERS; c++) {
+      if (c == o) continue;
+      TEST_ASSERT_EQUAL(DirectClaim::STEADY, reach.claim(cars[c], cars[o], HOLD_MS, nowMs));
+      known[n++] = cars[c];
+    }
+    TEST_ASSERT_EQUAL(RelayVerdict::SKIP, judgeRelay(reach, cars[o], known, n, HOLD_MS, nowMs));
+  }
+
+  // Our own summaries still list all 30, sixteen and then the rest.
+  bool listed[OTHERS] = {false};
+  uint8_t buf[233];
+  for (int part = 0; part < 2; part++) {
+    const size_t len = reach.takeSummary(nowMs, INTERVAL_MS, buf, sizeof(buf));
+    ReachEntry e;
+    for (size_t i = 0; decodeReachEntry(buf, len, i, e); i++) {
+      TEST_ASSERT_TRUE(e.origin >= cars[0] && e.origin <= cars[OTHERS - 1]);
+      listed[e.origin - cars[0]] = true;
+    }
+  }
+  for (uint32_t o = 0; o < OTHERS; o++) TEST_ASSERT_TRUE(listed[o]);
+}
+
 // ---- Heard steadily direct (build 43) ------------------------------------------
 
 static const uint32_t ORIGIN = 0xA00000C1;
@@ -1387,6 +1444,7 @@ int main(int, char**) {
   RUN_TEST(test_a_long_list_goes_on_in_the_next_summary);
   RUN_TEST(test_an_origin_not_heard_for_4_minutes_is_forgotten);
   RUN_TEST(test_a_full_table_forgets_the_origin_heard_longest_ago);
+  RUN_TEST(test_30_origins_keep_their_slots_and_claims);
   RUN_TEST(test_an_origin_is_claimed_steady_after_four_direct_positions_in_a_row);
   RUN_TEST(test_a_relayed_copy_or_a_missed_position_starts_the_count_again);
   RUN_TEST(test_a_cars_claims_come_from_its_summaries_and_age_out);

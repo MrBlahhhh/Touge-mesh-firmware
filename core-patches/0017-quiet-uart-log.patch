@@ -1,0 +1,102 @@
+--- a/src/DebugConfiguration.h
++++ b/src/DebugConfiguration.h
+@@ -58,6 +58,17 @@
+ #endif
+ #endif
+ 
++// Touge (core-patches/0017): with the console on a UART (Heltec V3, ARDUINO_USB_CDC_ON_BOOT unset) each
++// log character is its own uart_write_bytes under the log mutex, blocking 87 us a byte once the 128 B FIFO
++// fills, so a 1 KB burst holds the loop ~80 ms against a 17 ms fast lane slot. On build 45 the V3 logged
++// 4.3 KB/s of the 11.5 KB/s at 115200, 76 % of it DEBUG. So DEBUG goes, and the per-packet INFO lines
++// test TOUGE_QUIET_UART_LOG at their call sites. The V4's console is USB CDC and keeps everything.
++// -DTOUGE_KEEP_DEBUG_LOG brings it all back for a bench session.
++#if defined(ARCH_ESP32) && !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST) && !defined(TOUGE_KEEP_DEBUG_LOG) &&                       \
++    !(defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT)
++#define TOUGE_QUIET_UART_LOG 1
++#endif
++
+ #ifdef USE_SEGGER
+ // #undef DEBUG_PORT
+ #define LOG_DEBUG(...) SEGGER_RTT_printf(0, __VA_ARGS__)
+@@ -72,7 +83,13 @@
+ #endif
+ #else
+ #if defined(DEBUG_PORT) && !defined(DEBUG_MUTE)
++#ifdef TOUGE_QUIET_UART_LOG
++// An expression like the call it replaces, never run. The arguments are still type-checked and count as
++// used, so variables kept only for a debug line do not warn, and none of them is evaluated.
++#define LOG_DEBUG(...) ((void)(0 && (DEBUG_PORT.log(MESHTASTIC_LOG_LEVEL_DEBUG, __VA_ARGS__), 0)))
++#else
+ #define LOG_DEBUG(...) DEBUG_PORT.log(MESHTASTIC_LOG_LEVEL_DEBUG, __VA_ARGS__)
++#endif
+ #define LOG_INFO(...) DEBUG_PORT.log(MESHTASTIC_LOG_LEVEL_INFO, __VA_ARGS__)
+ #define LOG_WARN(...) DEBUG_PORT.log(MESHTASTIC_LOG_LEVEL_WARN, __VA_ARGS__)
+ #define LOG_ERROR(...) DEBUG_PORT.log(MESHTASTIC_LOG_LEVEL_ERROR, __VA_ARGS__)
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -3651,7 +3651,10 @@
+             // recorded based on the packet rxTime
+             //
+             // FIXME perhaps handle RX_SRC_USER separately?
++            // Touge (core-patches/0017): ~115 B for every position the fast lane injects, 10 % of the V3's serial bytes.
++#ifndef TOUGE_QUIET_UART_LOG
+             LOG_INFO("updatePosition REMOTE node=0x%08x time=%u lat=%d lon=%d", nodeId, p.time, p.latitude_i, p.longitude_i);
++#endif
+ 
+             // First, back up fields that we want to protect from overwrite
+             uint32_t tmp_time = slot.time;
+--- a/src/mesh/PacketHistory.cpp
++++ b/src/mesh/PacketHistory.cpp
+@@ -13,7 +13,12 @@
+ #define RECENT_WARN_AGE (10 * 60 * 1000L) // Warn if the packet that gets removed was more recent than 10 min
+ 
+ #define VERBOSE_PACKET_HISTORY 0     // Set to 1 for verbose logging, 2 for heavy debugging
++// Touge (core-patches/0017): the aging trace is an INFO line per packet inserted, ~1 % of the V3's serial bytes.
++#ifdef TOUGE_QUIET_UART_LOG
++#define PACKET_HISTORY_TRACE_AGING 0
++#else
+ #define PACKET_HISTORY_TRACE_AGING 1 // Set to 1 to enable logging of the age of re/used history slots
++#endif
+ 
+ PacketHistory::PacketHistory(uint32_t size) : recentPacketsCapacity(0) // Initialize members
+ {
+--- a/src/mesh/PhoneAPI.cpp
++++ b/src/mesh/PhoneAPI.cpp
+@@ -1937,7 +1937,10 @@
+         // Consumed by every connected client in this one notify pass, so no per-connection bookkeeping.
+         if (service->identityMovePending())
+             state = STATE_RESEND_MY_INFO;
++        // Touge (core-patches/0017): one per packet queued for the phone, 2 % of the V3's serial bytes.
++#ifndef TOUGE_QUIET_UART_LOG
+         LOG_INFO("Tell client new packets %u", newValue);
++#endif
+         onNowHasData(newValue);
+     } else if (service->identityMovePending() && state != STATE_SEND_NOTHING && state != STATE_SEND_MY_INFO) {
+         // Mid-sync, so this dump is already carrying the old number in its my_info, its self record or
+--- a/src/mesh/ProtobufModule.h
++++ b/src/mesh/ProtobufModule.h
+@@ -91,8 +91,11 @@
+             memset(&scratch, 0, sizeof(scratch));
+             if (pb_decode_from_bytes(p.payload.bytes, p.payload.size, fields, &scratch)) {
+                 decoded = &scratch;
++                // Touge (core-patches/0017): one per protobuf packet heard; position alone was 3.5 % of the V3's serial bytes.
++#ifndef TOUGE_QUIET_UART_LOG
+                 LOG_INFO("Received %s from=0x%08x, id=0x%08x, portnum=%d, payloadlen=%d", name, mp.from, mp.id, p.portnum,
+                          p.payload.size);
++#endif
+             } else {
+                 LOG_ERROR("Error decoding proto module");
+                 // if we can't decode it, nobody can process it!
+--- a/src/mesh/RadioInterface.cpp
++++ b/src/mesh/RadioInterface.cpp
+@@ -887,7 +887,9 @@
+ // Node IDs and packet IDs are formatted as 0x%08x in logs, and !%08x in user-facing display.
+ void printPacket(const char *prefix, const meshtastic_MeshPacket *p)
+ {
+-#if defined(DEBUG_PORT) && !defined(DEBUG_MUTE)
++// Touge (core-patches/0017): the string only feeds LOG_DEBUG, which is compiled out on a quiet UART build, and
++// building it is up to ~12 mt_sprintf allocations several times a packet on the V3's tight internal heap.
++#if defined(DEBUG_PORT) && !defined(DEBUG_MUTE) && !defined(TOUGE_QUIET_UART_LOG)
+     std::string out =
+         DEBUG_PORT.mt_sprintf("%s (id=0x%08x fr=0x%08x to=0x%08x, transport = %u, WantAck=%d, HopLim=%d Ch=%d", prefix, p->id,
+                               p->from, p->to, p->transport_mechanism, p->want_ack, p->hop_limit, p->channel);

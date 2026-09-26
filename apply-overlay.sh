@@ -108,7 +108,11 @@ rm -f "$MODULES.bak"
 # and 0015 sends that position unsigned and lets unsigned positions from signers in
 # (Router.cpp). From build 45, 0016 is upstream's #11940 byte for byte, ahead of its
 # release (RadioLibInterface.h): once the pin includes it, it reverse-applies and is
-# skipped. Without these the fast lane builds but does not carry. Idempotent: a
+# skipped. From build 47, 0017 compiles LOG_DEBUG, printPacket and four per-packet
+# INFO lines out on a Touge ESP32 whose console is a UART (the V3), so serial writes
+# stop stalling the loop past its slot (DebugConfiguration.h and the call sites;
+# -DTOUGE_KEEP_DEBUG_LOG brings them back). Without these the fast lane builds but
+# does not carry. Idempotent: a
 # patch that already reverse-applies is in, and is skipped.
 if ls "$HERE"/core-patches/*.patch >/dev/null 2>&1; then
   echo "==> core patches"
