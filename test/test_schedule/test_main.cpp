@@ -1251,6 +1251,119 @@ void test_a_drowned_lease_listens_again_before_reclaiming() {
   TEST_ASSERT_TRUE(s.claimed());
 }
 
+// ---- Why a lease was given up (build 46) --------------------------------------
+
+void test_a_drowned_lease_says_so() {
+  // test_a_drowned_lease_listens_again_before_reclaiming, read back.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  addLeased(r, 1, 900, 8, 1);
+  Schedule s;
+  uint32_t now = join(s, 300, r);
+  const uint8_t mine = s.slot();
+  const uint16_t gen = s.leaseGeneration();
+  TEST_ASSERT_EQUAL_UINT32(0, s.losses());
+  now += HEARD_WINDOW_MS + 100;
+  touch(r, now);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_FALSE(s.claimed());
+  TEST_ASSERT_EQUAL_UINT32(1, s.losses());
+  const SlotLoss& loss = s.lastLoss();
+  TEST_ASSERT_EQUAL_UINT8(LOSS_DROWNED, loss.why);
+  TEST_ASSERT_EQUAL_UINT8(mine, loss.slot);
+  TEST_ASSERT_EQUAL_UINT16(gen, loss.leaseGen);
+  TEST_ASSERT_EQUAL_UINT32(HEARD_WINDOW_MS + 100, loss.heldMs);
+  TEST_ASSERT_EQUAL_UINT8(2, loss.judges);
+  TEST_ASSERT_EQUAL_UINT8(0, loss.hearUs);
+  TEST_ASSERT_EQUAL_UINT8(0, loss.hearOther);
+  TEST_ASSERT_FALSE(loss.established);
+  // A lease this young goes on the pass the clash starts.
+  TEST_ASSERT_EQUAL_UINT32(0, loss.clashMs);
+}
+
+void test_an_unheard_lease_says_so() {
+  // test_a_lease_no_map_has_shown_for_a_while_is_given_up: one neighbour, so
+  // its silence is never a clash, only a lease nobody reports hearing.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  Schedule s;
+  const uint32_t joined = join(s, 300, r);
+  touch(r, joined + UNHEARD_MS);
+  s.rebuild(300, false, r, ROSTER, joined + UNHEARD_MS);
+  TEST_ASSERT_FALSE(s.claimed());
+  const SlotLoss& loss = s.lastLoss();
+  TEST_ASSERT_EQUAL_UINT8(LOSS_UNHEARD, loss.why);
+  TEST_ASSERT_EQUAL_UINT32(UNHEARD_MS, loss.heardUsAgoMs);
+  TEST_ASSERT_TRUE(loss.established);
+  TEST_ASSERT_EQUAL_UINT8(1, loss.judges);
+}
+
+void test_an_outranked_lease_says_so() {
+  // Every map shows us, so nothing is drowned; but a car holding our slot on
+  // an older lease turns up, and the older lease keeps it.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  addLeased(r, 1, 900, 8, 1);
+  Schedule s;
+  uint32_t now = join(s, 300, r);
+  const uint8_t mine = s.slot();
+  TEST_ASSERT_TRUE(leaseOlder(1, s.leaseGeneration()));
+  addLeased(r, 2, 200, mine, 1);
+  for (size_t i = 0; i < 3; i++) r[i].pos.slotMap[mine] = slotTag(300);
+  now += HEARD_WINDOW_MS + 100;
+  touch(r, now);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_EQUAL_UINT32(1, s.losses());
+  TEST_ASSERT_EQUAL_UINT8(LOSS_OUTRANKED, s.lastLoss().why);
+  TEST_ASSERT_EQUAL_UINT8(mine, s.lastLoss().slot);
+  TEST_ASSERT_EQUAL_UINT8(3, s.lastLoss().hearUs);
+}
+
+void test_a_lease_left_alone_says_so() {
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  Schedule s;
+  const uint32_t joined = join(s, 300, r);
+  TEST_ASSERT_TRUE(s.claimed());
+  // Nobody heard for a whole lease.
+  s.rebuild(300, false, r, ROSTER, joined + LEASE_MS);
+  TEST_ASSERT_FALSE(s.claimed());
+  TEST_ASSERT_EQUAL_UINT8(LOSS_ALONE, s.lastLoss().why);
+  TEST_ASSERT_EQUAL_UINT32(1, s.losses());
+  // And an unleased car that stays alone loses nothing more.
+  s.rebuild(300, false, r, ROSTER, joined + 2 * LEASE_MS);
+  TEST_ASSERT_EQUAL_UINT32(1, s.losses());
+}
+
+void test_a_loss_formats_for_serial_and_the_phone() {
+  SlotLoss loss;
+  loss.why = LOSS_OUTRANKED | LOSS_DROWNED;
+  loss.slot = 0;
+  loss.leaseGen = 21;
+  loss.heldMs = 12400;
+  loss.heardUsAgoMs = 3100;
+  loss.clashMs = 3000;
+  loss.hearOther = 1;
+  loss.judges = 2;
+  loss.established = true;
+  char out[200];
+  TEST_ASSERT_TRUE(formatSlotLoss(loss, 7, false, out, sizeof(out)) > 0);
+  TEST_ASSERT_EQUAL_STRING("ls why=3 n=7 s=0 g=21 held=12400 hu=3100 cl=3000 us=0 ot=1 jd=2 es=1 pr=0", out);
+  TEST_ASSERT_TRUE(formatSlotLoss(loss, 7, true, out, sizeof(out)) > 0);
+  TEST_ASSERT_EQUAL_STRING("{\"ls\":{\"why\":3,\"n\":7,\"s\":0,\"g\":21,\"held\":12400,\"hu\":3100,\"cl\":3000,"
+                           "\"us\":0,\"ot\":1,\"jd\":2,\"es\":1,\"pr\":0}}",
+                           out);
+  // Too small is nothing, not an overrun.
+  TEST_ASSERT_EQUAL_UINT32(0, formatSlotLoss(loss, 7, false, out, 10));
+
+  char words[40];
+  TEST_ASSERT_EQUAL_STRING("outranked+drowned", slotLossWords(loss.why, words, sizeof(words)));
+  TEST_ASSERT_EQUAL_STRING("alone", slotLossWords(LOSS_ALONE, words, sizeof(words)));
+  TEST_ASSERT_EQUAL_STRING("none", slotLossWords(0, words, sizeof(words)));
+  char tiny[6];
+  TEST_ASSERT_EQUAL_STRING("outra", slotLossWords(LOSS_OUTRANKED, tiny, sizeof(tiny)));
+}
+
 void test_the_extra_flag_round_trips() {
   Position p{};
   p.extra = true;
@@ -2376,6 +2489,11 @@ int main(int, char**) {
   RUN_TEST(test_an_extra_slot_opens_only_in_its_own_window);
   RUN_TEST(test_extras_are_disjoint_and_fill_every_occupied_row);
   RUN_TEST(test_a_drowned_lease_listens_again_before_reclaiming);
+  RUN_TEST(test_a_drowned_lease_says_so);
+  RUN_TEST(test_an_unheard_lease_says_so);
+  RUN_TEST(test_an_outranked_lease_says_so);
+  RUN_TEST(test_a_lease_left_alone_says_so);
+  RUN_TEST(test_a_loss_formats_for_serial_and_the_phone);
   RUN_TEST(test_the_extra_flag_round_trips);
   RUN_TEST(test_sim_rates_3_cars);
   RUN_TEST(test_sim_rates_10_cars);

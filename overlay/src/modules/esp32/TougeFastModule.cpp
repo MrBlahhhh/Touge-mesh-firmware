@@ -214,7 +214,11 @@ const uint32_t STATUS_EVERY_MS = 5000;
 // 45: core-patches/0016, upstream's #11940 ahead of its release: a RadioLib error code is no longer read as a
 //     packet's airtime (one bad sample read 7158 % busy, stopped LoRa sends for up to an hour, and would have
 //     wrecked the 5d load figures).
-const uint32_t TOUGE_BUILD = 45;
+// 46: every lease given up is logged with why ("slot lost", and "ls" to the phone: outranked, drowned,
+//     unheard or alone, with what the slot maps showed), and the status line counts lease beacons sent
+//     ("lease=", "lb") and the longest gap between passes ("gap=", "pg"). No behaviour change: the V3 on
+//     the Pixel lost slot 0 about every 35 s on 45 and nothing said which rule did it.
+const uint32_t TOUGE_BUILD = 46;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -680,6 +684,7 @@ void TougeFastModule::beacon(uint32_t nowMs)
     wantBeacon_ = false;
     lastBeaconMs_ = nowMs;
     announcedSlot_ = schedule_.slot();
+    if (schedule_.claimed()) leaseBeacons_++;
     // Move the 1 s deadline on only if it has passed. Advancing it on every
     // send let each movement-triggered beacon push it a second later, and a
     // run of them left a car that stopped silent for several seconds.
@@ -1669,6 +1674,11 @@ int32_t TougeFastModule::runOnce()
         return IDLE_PASS_MS;
     }
 
+    // The pass is asked for every TICK_MS; a longer gap is the main loop busy
+    // elsewhere, and a lease beacon can miss its slot in one.
+    if (lastPassMs_ != 0 && (uint32_t)(now - lastPassMs_) > passGapMaxMs_) passGapMaxMs_ = now - lastPassMs_;
+    lastPassMs_ = now;
+
     drainRadio(now);
     // Nothing held goes out while we are lost.
     //
@@ -1683,6 +1693,7 @@ int32_t TougeFastModule::runOnce()
     trackPhoneLink(now);
     flushPhoneBatch(now);
     beacon(now);
+    reportSlotLoss();
     mesh_.age(now);
     hopKeeping(now);
     status(now);
@@ -1694,6 +1705,27 @@ int32_t TougeFastModule::runOnce()
     // what bounds how promptly a beacon can leave its slot, which is what
     // limits how long the sync chain can be - see SYNC_BIAS_MS.
     return (int32_t)TICK_MS;
+}
+
+void TougeFastModule::reportSlotLoss()
+{
+    const uint32_t losses = schedule_.losses();
+    if (losses == loggedLosses_) return;
+    loggedLosses_ = losses;
+    const touge::SlotLoss &loss = schedule_.lastLoss();
+    // A schedule reset takes the count back to 0; that is not a loss.
+    if (loss.why == 0) return;
+
+    char words[40];
+    touge::slotLossWords(loss.why, words, sizeof(words));
+    char text[160];
+    // With this window's lease beacons and longest pass gap so far, the two
+    // numbers that say whether our own beacons stopped going out.
+    if (touge::formatSlotLoss(loss, losses, false, text, sizeof(text)) > 0)
+        LOG_INFO("touge: slot lost %s %s lease=%u in %ums gap=%ums", words, text, (unsigned)leaseBeacons_,
+                 (unsigned)(millis() - lastStatusMs_), (unsigned)passGapMaxMs_);
+    if (service->api_state != MeshService::STATE_DISCONNECTED)
+        queueJsonToPhone(text, touge::formatSlotLoss(loss, losses, true, text, sizeof(text)));
 }
 
 void TougeFastModule::forwardGnssFix(uint32_t nowMs)
@@ -1779,8 +1811,11 @@ void TougeFastModule::status(uint32_t nowMs)
         snprintf(slotText, sizeof(slotText), "none@g%u", (unsigned)schedule_.generation());
     }
 
+    // lease=: lease beacons sent this window, about one a second while leased.
+    // gap=: the longest wait between passes this window, against TICK_MS.
+    // lost=: leases given up since boot, each logged as "slot lost".
     LOG_INFO("touge: ch=%u slot=%s/%u known=%u ref=%08x%s +%uhop fit=%u/%u via=%08x clock=%s fast=%u "
-             "suppressed=%u dropped=%u txfail=%u(%d) txpwr=%ddBm",
+             "suppressed=%u dropped=%u txfail=%u(%d) txpwr=%ddBm lease=%u/%us gap=%ums lost=%u",
              (unsigned)fastRadio.channel(), slotText, (unsigned)MAX_SLOTS,
              (unsigned)schedule_.known(), (unsigned)schedule_.referenceId(),
              schedule_.weAreReference() ? " (us)" : "", (unsigned)schedule_.hopsToReference(),
@@ -1788,7 +1823,9 @@ void TougeFastModule::status(uint32_t nowMs)
              (unsigned)schedule_.parentId(), clock, (unsigned)fastNeighbours(nowMs),
              (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
              (unsigned)fastRadio.sendFailed(), fastRadio.lastSendError(),
-             (int)fastRadio.txPowerDbm());
+             (int)fastRadio.txPowerDbm(), (unsigned)leaseBeacons_,
+             (unsigned)((statusWindowMs + 500) / 1000), (unsigned)passGapMaxMs_,
+             (unsigned)schedule_.losses());
 
     // The same line, to the phone.
     //
@@ -1809,7 +1846,7 @@ void TougeFastModule::status(uint32_t nowMs)
         char js[meshtastic_Constants_DATA_PAYLOAD_LEN];
         int n = snprintf(
             js, sizeof(js),
-            "{\"fl\":{\"up\":1,\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u,\"gi\":%u,\"gg\":%u,\"tf\":%u,\"li\":%u}}",
+            "{\"fl\":{\"up\":1,\"ch\":%u,\"sl\":%d,\"kn\":%u,\"fa\":%u,\"ck\":\"%s\",\"sp\":%u,\"dr\":%u,\"fw\":%u,\"fix\":%u,\"gi\":%u,\"gg\":%u,\"tf\":%u,\"li\":%u,\"lb\":%u,\"pg\":%u,\"nl\":%u}}",
             (unsigned)fastRadio.channel(), schedule_.claimed() ? (int)schedule_.slot() : -1,
             (unsigned)schedule_.known(), (unsigned)fastNeighbours(nowMs), clock,
             (unsigned)mesh_.suppressed(), (unsigned)fastRadio.dropped(),
@@ -1819,7 +1856,9 @@ void TougeFastModule::status(uint32_t nowMs)
             (unsigned)hop_.index(), (unsigned)hop_.generation(),
             (unsigned)fastRadio.sendFailed(),
             // Our LoRa position interval, 0 while this radio is not sending them.
-            (unsigned)(loraOwned() && ownFix_.fresh(nowMs) ? loraLoad_.intervalMs() : 0));
+            (unsigned)(loraOwned() && ownFix_.fresh(nowMs) ? loraLoad_.intervalMs() : 0),
+            // lease=, gap= and lost= from the serial line above.
+            (unsigned)leaseBeacons_, (unsigned)passGapMaxMs_, (unsigned)schedule_.losses());
         if (n > 0 && (size_t)n < sizeof(js)) {
             meshtastic_MeshPacket *sp = router->allocForSending();
             if (sp) {
@@ -1836,6 +1875,8 @@ void TougeFastModule::status(uint32_t nowMs)
             }
         }
     }
+    leaseBeacons_ = 0;
+    passGapMaxMs_ = 0;
 
     // Signal strength per car, which is the number that settles an argument
     // about antennas.

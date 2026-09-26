@@ -262,6 +262,44 @@ uint32_t slotStartMs(uint8_t slot);
 /** True when generation `a` was issued before `b`. Wrap-safe. */
 bool leaseOlder(uint16_t a, uint16_t b);
 
+// Why a lease was given up, as bits: more than one can hold at once. Recorded
+// from build 46 because none of them was logged, and a V3 on the bench lost
+// slot 0 about every 35 s (2026-09-25) without the log saying which rule did it.
+enum SlotLossWhy : uint8_t {
+  LOSS_OUTRANKED = 1, // an older lease holds our slot
+  LOSS_DROWNED = 2,   // the maps show somebody else there, or nobody at all
+  LOSS_UNHEARD = 4,   // no map has shown us there for UNHEARD_MS
+  LOSS_ALONE = 8,     // nobody heard for a whole lease
+};
+
+struct SlotLoss;
+
+/**
+ * A loss as "ls why=2 n=7 s=0 g=21 held=12400 hu=3100 cl=3000 us=0 ot=0 jd=2
+ * es=1 pr=0" for serial, or {"ls":{...}} for the phone. `why` is the
+ * SlotLossWhy bits and `n` the losses since boot; the rest are SlotLoss's
+ * fields in order. 0 if it did not fit.
+ */
+size_t formatSlotLoss(const SlotLoss& loss, uint32_t losses, bool json, char* out, size_t cap);
+
+/** The reasons as words, "outranked+drowned", for the serial line. */
+const char* slotLossWords(uint8_t why, char* out, size_t cap);
+
+/** The last lease given up and what settleLease saw as it did. */
+struct SlotLoss {
+  uint8_t why = 0; // SlotLossWhy bits
+  uint8_t slot = SLOT_NONE;
+  uint16_t leaseGen = 0;
+  uint32_t heldMs = 0;       // how long the lease lasted
+  uint32_t heardUsAgoMs = 0; // since a slot map last showed us on it
+  uint32_t clashMs = 0;      // how long the clash had run; 0 with none, or one that began this pass
+  uint8_t hearUs = 0;        // judges whose fresh map shows us on the slot
+  uint8_t hearOther = 0;     // judges whose map shows another car there
+  uint8_t judges = 0;        // judges we hear well, the ones "nobody" counts from
+  bool established = false;  // held for ESTABLISHED_LEASE_MS
+  bool poor = false;         // we hear the ride poorly
+};
+
 class Schedule {
  public:
   void reset();
@@ -427,6 +465,10 @@ class Schedule {
    */
   void drawSharedTurn(uint32_t random);
 
+  /** The last lease given up, and how many have been since boot. */
+  const SlotLoss& lastLoss() const { return lastLoss_; }
+  uint32_t losses() const { return losses_; }
+
  private:
   void electReference(bool selfLocked, const Rider* riders, size_t maxRiders, uint32_t nowMs);
   void settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs);
@@ -435,6 +477,9 @@ class Schedule {
 
   // Listen again before the next claim, longer after repeated losses.
   void listenAgain(uint32_t nowMs);
+  // Records the lease about to be given up in lastLoss_. Call before slot_ is cleared.
+  void noteLoss(uint8_t why, uint32_t nowMs, uint8_t hearUs, uint8_t hearOther, uint8_t judges,
+                bool poor);
   // Re-reads fit_ from the link record.
   void updateFitness(uint32_t nowMs);
   // Under three in four of the lease beacons due from the cars we hear at all.
@@ -495,6 +540,9 @@ class Schedule {
   uint8_t known_ = 0;
   uint32_t epochMs_ = 0;
   bool haveEpoch_ = false;
+
+  SlotLoss lastLoss_;
+  uint32_t losses_ = 0;
 };
 
 } // namespace touge

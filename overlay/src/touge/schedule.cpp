@@ -1,6 +1,49 @@
 #include "schedule.h"
 
+#include <string.h>
+
+#include "kvline.h"
+
 namespace touge {
+
+size_t formatSlotLoss(const SlotLoss& loss, uint32_t losses, bool json, char* out, size_t cap) {
+  KvLine line(out, cap, "ls", json);
+  line.add("why", loss.why);
+  line.add("n", losses);
+  line.add("s", loss.slot);
+  line.add("g", loss.leaseGen);
+  line.add("held", loss.heldMs);
+  line.add("hu", loss.heardUsAgoMs);
+  line.add("cl", loss.clashMs);
+  line.add("us", loss.hearUs);
+  line.add("ot", loss.hearOther);
+  line.add("jd", loss.judges);
+  line.add("es", loss.established ? 1 : 0);
+  line.add("pr", loss.poor ? 1 : 0);
+  return line.finish();
+}
+
+const char* slotLossWords(uint8_t why, char* out, size_t cap) {
+  if (out == nullptr || cap == 0) return "";
+  out[0] = 0;
+  static const struct {
+    uint8_t bit;
+    const char* word;
+  } kWords[] = {
+      {LOSS_OUTRANKED, "outranked"},
+      {LOSS_DROWNED, "drowned"},
+      {LOSS_UNHEARD, "unheard"},
+      {LOSS_ALONE, "alone"},
+  };
+  for (const auto& w : kWords) {
+    if (!(why & w.bit)) continue;
+    if (out[0]) strncat(out, "+", cap - strlen(out) - 1);
+    strncat(out, w.word, cap - strlen(out) - 1);
+  }
+  if (!out[0]) strncpy(out, "none", cap - 1);
+  out[cap - 1] = 0;
+  return out;
+}
 
 uint32_t slotStartMs(uint8_t slot) {
   const uint32_t block = slot % BLOCKS;
@@ -181,6 +224,7 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
   // so we let it go too and rejoin as a newcomer when the ride comes back,
   // rather than walking back in and taking a slot that has been reissued.
   if (live == 0) {
+    if (claimed()) noteLoss(LOSS_ALONE, nowMs, 0, 0, 0, false);
     slot_ = SLOT_NONE;
     heardAnyone_ = false;
     return;
@@ -253,6 +297,9 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
       if (established && !clash && (int32_t)(lastHeardUsMs_ - leasedAtMs_) > 0) strikes_ = 0;
       return;
     }
+    const uint8_t why = (uint8_t)((outranked ? LOSS_OUTRANKED : 0) | (drowned ? LOSS_DROWNED : 0) |
+                                  (unheard ? LOSS_UNHEARD : 0));
+    noteLoss(why, nowMs, hearUs, hearOther, wellHeardJudges, poor);
     clashing_ = false;
     slot_ = SLOT_NONE;
     if (strikes_ < 255) strikes_++;
@@ -485,6 +532,24 @@ bool Schedule::hearingPoorly(uint32_t nowMs) const {
 bool Schedule::hearsPoorly(uint8_t slot, uint32_t id, uint32_t nowMs) const {
   if (slot >= MAX_SLOTS || slotHeardTag_[slot] != slotTag(id)) return false;
   return poorRecord(upToNow(slotSeen_[slot], nowMs - slotHeardMs_[slot]));
+}
+
+void Schedule::noteLoss(uint8_t why, uint32_t nowMs, uint8_t hearUs, uint8_t hearOther,
+                        uint8_t judges, bool poor) {
+  SlotLoss& loss = lastLoss_;
+  loss.why = why;
+  loss.slot = slot_;
+  loss.leaseGen = leaseGen_;
+  loss.heldMs = nowMs - leasedAtMs_;
+  loss.heardUsAgoMs = nowMs - lastHeardUsMs_;
+  // settleLease has already set clashing_ for this pass.
+  loss.clashMs = clashing_ ? nowMs - clashSinceMs_ : 0;
+  loss.hearUs = hearUs;
+  loss.hearOther = hearOther;
+  loss.judges = judges;
+  loss.established = loss.heldMs >= ESTABLISHED_LEASE_MS;
+  loss.poor = poor;
+  losses_++;
 }
 
 void Schedule::listenAgain(uint32_t nowMs) {

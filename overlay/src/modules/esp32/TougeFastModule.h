@@ -241,6 +241,16 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     // The lease slot our last lease beacon went out in. A new lease is
     // announced in its first slot rather than at the next 1 s deadline.
     uint8_t announcedSlot_ = touge::SLOT_NONE;
+
+    // Build 46, for the V3 that kept losing slot 0: a neighbour's slot map
+    // shows us only from our lease beacon, so a pass that runs late and misses
+    // the slot takes us off both neighbours' maps at once. Per status window.
+    uint32_t leaseBeacons_ = 0;
+    uint32_t lastPassMs_ = 0;
+    uint32_t passGapMaxMs_ = 0;
+    // Logs each lease the schedule gives up, with why (touge/schedule.h SlotLoss).
+    void reportSlotLoss();
+    uint32_t loggedLosses_ = 0;
     // Where we were when we last transmitted, for the distance gate.
     int32_t sentLat_ = 0;
     int32_t sentLon_ = 0;
