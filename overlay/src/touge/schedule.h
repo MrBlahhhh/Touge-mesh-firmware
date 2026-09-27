@@ -155,7 +155,8 @@ static const uint32_t HEARD_WINDOW_MS = SCHEDULE_MS + SCHEDULE_MS / 2;
  * A clash is nearly always a newcomer landing on a slot it could not see was
  * taken, and the newcomer moves at once. The incumbent waits two map windows
  * so it is the newcomer that moves, not both; if the clash outlasts that, it
- * moves too. A lease counts as established after ESTABLISHED_LEASE_MS.
+ * moves too. A lease counts as established after ESTABLISHED_LEASE_MS. A
+ * younger lease that a map has already shown waits out silence the same way.
  */
 static const uint32_t CLASH_PATIENCE_MS = 2 * HEARD_WINDOW_MS;
 static const uint32_t ESTABLISHED_LEASE_MS = 10000;

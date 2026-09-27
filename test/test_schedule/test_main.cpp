@@ -1281,6 +1281,60 @@ void test_a_drowned_lease_says_so() {
   TEST_ASSERT_EQUAL_UINT32(0, loss.clashMs);
 }
 
+void test_a_young_lease_a_map_has_shown_waits_out_silence() {
+  // A map showed us a second in, so our beacons were getting through; both
+  // judges then going quiet is more likely lost beacons than a collision.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  addLeased(r, 1, 900, 8, 1);
+  Schedule s;
+  uint32_t now = join(s, 300, r);
+  const uint8_t mine = s.slot();
+  now += SCHEDULE_MS;
+  touch(r, now);
+  r[0].pos.slotMap[mine] = slotTag(300);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_TRUE(s.claimed());
+
+  r[0].pos.slotMap[mine] = 0;
+  now += HEARD_WINDOW_MS + 100;
+  touch(r, now);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_TRUE_MESSAGE(s.claimed(), "a young lease a map has shown kept on one silent pass");
+  now += CLASH_PATIENCE_MS;
+  touch(r, now);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_FALSE(s.claimed());
+  TEST_ASSERT_EQUAL_UINT8(LOSS_DROWNED, s.lastLoss().why);
+  TEST_ASSERT_FALSE(s.lastLoss().established);
+  TEST_ASSERT_EQUAL_UINT32(CLASH_PATIENCE_MS, s.lastLoss().clashMs);
+}
+
+void test_a_car_heard_on_a_young_lease_moves_it_at_once() {
+  // Shown by a map, but a judge now hears another car on our slot: a real
+  // clash, so a lease this young still gives way on the pass it is seen.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  addLeased(r, 1, 900, 8, 1);
+  Schedule s;
+  uint32_t now = join(s, 300, r);
+  const uint8_t mine = s.slot();
+  now += SCHEDULE_MS;
+  touch(r, now);
+  r[0].pos.slotMap[mine] = slotTag(300);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_TRUE(s.claimed());
+
+  now += HEARD_WINDOW_MS + 100;
+  touch(r, now);
+  r[0].pos.slotMap[mine] = slotTag(700);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_FALSE(s.claimed());
+  TEST_ASSERT_EQUAL_UINT8(LOSS_DROWNED, s.lastLoss().why);
+  TEST_ASSERT_EQUAL_UINT8(1, s.lastLoss().hearOther);
+  TEST_ASSERT_EQUAL_UINT32(0, s.lastLoss().clashMs);
+}
+
 void test_an_unheard_lease_says_so() {
   // test_a_lease_no_map_has_shown_for_a_while_is_given_up: one neighbour, so
   // its silence is never a clash, only a lease nobody reports hearing.
@@ -2385,6 +2439,39 @@ void test_sim_the_bench_three_radios_with_the_weak_one_lowest() {
   TEST_ASSERT_FALSE(w.cars[moto].sched.fitToKeepTime());
 }
 
+void test_sim_a_v3_joining_a_lossy_bench_keeps_its_young_lease() {
+  // The 2026-09-27 bench: three radios in range of each other, every link
+  // losing 40 % of its frames, the V3 powering on into a ride of two. Its two
+  // neighbours are its only judges, and both missing its beacon in one pass
+  // used to take a lease under ESTABLISHED_LEASE_MS at once, again and again.
+  const size_t cars = 3, v3 = 2;
+  World w(cars, 54);
+  for (size_t a = 0; a < cars; a++)
+    for (size_t b = a + 1; b < cars; b++) w.setLoss(a, b, 40);
+  sim::bootAll(w, 0, v3);
+  w.run(20000);
+  TEST_ASSERT_TRUE(w.settled());
+
+  // Counted from the V3's power-on, while its lease is young.
+  w.mark();
+  sim::Watch seen;
+  seen.car = v3;
+  sim::bootAll(w, v3, cars);
+  const uint32_t forMs = 60000;
+  sim::watch(w, seen, forMs);
+  const uint32_t lost = w.cars[v3].sched.losses();
+  char line[120];
+  snprintf(line, sizeof(line), "V3 joining at 40 %% loss: %u leases lost in its first minute, leased %u %% of it",
+           (unsigned)lost, (unsigned)(seen.leasedMs * 100 / forMs));
+  TEST_MESSAGE(line);
+  TEST_ASSERT_TRUE(lost <= 1);
+  // A few seconds of listening before the claim, then a slot nearly all the time.
+  TEST_ASSERT_TRUE(seen.leasedMs >= forMs / 100 * 80);
+  TEST_ASSERT_EQUAL_UINT32(0, w.cars[0].slotChanges);
+  TEST_ASSERT_EQUAL_UINT32(0, w.cars[1].slotChanges);
+  TEST_ASSERT_EQUAL_UINT32(0, w.leasedCollisions);
+}
+
 void test_sim_the_reference_holds_while_link_quality_jitters() {
   // Six cars in range of each other, every link losing 25-50 % of its frames
   // (the bench's good links with a phone attached), redrawn every ten seconds
@@ -2490,6 +2577,8 @@ int main(int, char**) {
   RUN_TEST(test_extras_are_disjoint_and_fill_every_occupied_row);
   RUN_TEST(test_a_drowned_lease_listens_again_before_reclaiming);
   RUN_TEST(test_a_drowned_lease_says_so);
+  RUN_TEST(test_a_young_lease_a_map_has_shown_waits_out_silence);
+  RUN_TEST(test_a_car_heard_on_a_young_lease_moves_it_at_once);
   RUN_TEST(test_an_unheard_lease_says_so);
   RUN_TEST(test_an_outranked_lease_says_so);
   RUN_TEST(test_a_lease_left_alone_says_so);
@@ -2503,6 +2592,7 @@ int main(int, char**) {
   RUN_TEST(test_sim_extras_cut_the_age_of_a_1hz_phone_fix);
   RUN_TEST(test_sim_a_weak_radio_keeps_to_a_free_slot_and_off_the_clock);
   RUN_TEST(test_sim_the_bench_three_radios_with_the_weak_one_lowest);
+  RUN_TEST(test_sim_a_v3_joining_a_lossy_bench_keeps_its_young_lease);
   RUN_TEST(test_sim_the_reference_holds_while_link_quality_jitters);
   return UNITY_END();
 }
