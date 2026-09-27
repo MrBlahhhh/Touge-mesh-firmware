@@ -223,7 +223,13 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     ~15 % of 4.3 KB/s); the reach table holds 32 origins, not 28; Meshtastic's public default key no
 //     longer passes as a secret. B2 (a young lease dropped on one silent pass) is left for the bench:
 //     every wait tried slowed the 25-car power-on or broke the merge and bench sims.
-const uint32_t TOUGE_BUILD = 47;
+// 48: the review's B2, narrowed. A young lease that some map has already shown waits out a silent clash
+//     (CLASH_PATIENCE_MS) like an established one; a lease no map has shown still goes at once, since that
+//     is a collision from its first beacon and the power-on and merge sims need it gone. On 46 the bench V3
+//     lost young leases 15 times in two minutes as drowned. Host sim of a V3 joining a two-car ride at 40 %
+//     loss (test_sim_a_v3_joining_a_lossy_bench_keeps_its_young_lease): 1 lease lost in its first minute
+//     and a slot 94 % of it, against 4 and 79 % on 47's rule; the power-on, merge and bench sims still pass.
+const uint32_t TOUGE_BUILD = 48;
 
 // How long a board hunts before giving up and waiting at home.
 //

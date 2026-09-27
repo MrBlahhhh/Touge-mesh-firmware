@@ -283,14 +283,23 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
     // nobody gets through at all, which is what three cars on one slot look
     // like: two judges at least, so one neighbour's lost frame moves nobody,
     // and ones we hear well, since a car we hear poorly misses us as often.
+    const bool silent = wellHeardJudges >= 2 && hearUs == 0 && hearOther == 0;
     const bool clash = hearOther > hearUs ||
-                       (hearOther > 0 && hearOther == hearUs && otherTag < ourTag) ||
-                       (wellHeardJudges >= 2 && hearUs == 0 && hearOther == 0);
+                       (hearOther > 0 && hearOther == hearUs && otherTag < ourTag) || silent;
     if (clash && !clashing_) clashSinceMs_ = nowMs;
     clashing_ = clash;
     const bool established = (uint32_t)(nowMs - leasedAtMs_) >= ESTABLISHED_LEASE_MS;
+    // A young lease a map has already shown is getting through, so silence
+    // about it is most likely lost beacons: it waits out CLASH_PATIENCE_MS like
+    // an established one. On 2026-09-27 the bench V3 lost young leases 15 times
+    // in two minutes as drowned; the loss read back in full had been shown by a
+    // map a second before. A lease no map has shown still goes at once: that is a
+    // collision from its first beacon, and making every young lease wait slowed
+    // the 25-car power-on and broke the merge sims (tried for build 47).
+    const bool shownOnThisLease = (int32_t)(lastHeardUsMs_ - leasedAtMs_) > 0;
+    const bool waits = established || (silent && shownOnThisLease);
     const bool drowned =
-        clash && (!established || (uint32_t)(nowMs - clashSinceMs_) >= CLASH_PATIENCE_MS);
+        clash && (!waits || (uint32_t)(nowMs - clashSinceMs_) >= CLASH_PATIENCE_MS);
     const bool unheard = (uint32_t)(nowMs - lastHeardUsMs_) >= UNHEARD_MS;
     if (!outranked && !drowned && !unheard) {
       // Settled and heard: whatever went wrong before is behind us.
