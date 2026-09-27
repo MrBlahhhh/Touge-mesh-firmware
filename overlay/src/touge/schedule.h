@@ -271,6 +271,7 @@ enum SlotLossWhy : uint8_t {
   LOSS_DROWNED = 2,   // the maps show somebody else there, or nobody at all
   LOSS_UNHEARD = 4,   // no map has shown us there for UNHEARD_MS
   LOSS_ALONE = 8,     // nobody heard for a whole lease
+  LOSS_QUIET = 16,    // nothing to send (no fix fed), so no beacon to hold it with
 };
 
 struct SlotLoss;
@@ -332,9 +333,14 @@ class Schedule {
    * counts from neighbours we hear well: one we hear poorly most likely hears
    * us poorly too, and its silence would move a weak car off a slot it has
    * to itself.
+   *
+   * @param speaking whether this car is putting beacons on the air (it has a
+   *   fix to send). A quiet car holds no lease and claims none: nothing would
+   *   show its claim, so it would be drowned and claim again every few seconds.
+   *   When it speaks again it listens first, like a newcomer.
    */
   void rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders,
-               uint32_t nowMs);
+               uint32_t nowMs, bool speaking = true);
 
   /**
    * A lease beacon arrived straight from `senderId` (not forwarded, not an
@@ -472,7 +478,7 @@ class Schedule {
 
  private:
   void electReference(bool selfLocked, const Rider* riders, size_t maxRiders, uint32_t nowMs);
-  void settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs);
+  void settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs, bool speaking);
   void chooseParent(const Rider* riders, size_t maxRiders, uint32_t nowMs);
   void planExtras(const Rider* riders, size_t maxRiders, uint32_t nowMs);
 
@@ -521,6 +527,11 @@ class Schedule {
   // gave up a lease: the listen runs from here.
   uint32_t firstHeardMs_ = 0;
   bool heardAnyone_ = false;
+  // Not speaking at the last rebuild; the listen restarts when it speaks again.
+  bool quiet_ = false;
+  // The latest time rebuild has been given, which it never goes back from.
+  uint32_t latestMs_ = 0;
+  bool sawTime_ = false;
 
   uint32_t slotHeardMs_[MAX_SLOTS] = {};
   uint8_t slotHeardTag_[MAX_SLOTS] = {}; // 0 until somebody is heard there
