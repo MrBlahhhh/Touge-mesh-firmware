@@ -229,7 +229,13 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     lost young leases 15 times in two minutes as drowned. Host sim of a V3 joining a two-car ride at 40 %
 //     loss (test_sim_a_v3_joining_a_lossy_bench_keeps_its_young_lease): 1 lease lost in its first minute
 //     and a slot 94 % of it, against 4 and 79 % on 47's rule; the power-on, merge and bench sims still pass.
-const uint32_t TOUGE_BUILD = 48;
+// 49: two kinds of slot churn from the 48 group ride. The drain rebuilt the schedule on a fresh millis() and
+//     beacon() then judged it on the pass's earlier time, so a lease taken at T+1 was judged at T and went as
+//     unheard with held=4294967295 (two of the tablet's six losses). The drain now uses the pass's time, and
+//     the schedule never goes back in time. And a radio with no fix fed (the moto's, after its phone left the
+//     ride) claimed a slot on every frame it heard, never beaconed in it, was drowned and claimed again: 53
+//     losses in 6 minutes. It now gives its lease up once, as "quiet", and claims none until it speaks again.
+const uint32_t TOUGE_BUILD = 49;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -546,7 +552,7 @@ void TougeFastModule::syncChannel()
     mesh_.reset();
     schedule_.reset();
     schedule_.rebuild(nodeDB->getNodeNum(), rideClock.locked((uint64_t)esp_timer_get_time()),
-                      mesh_.riders(), MAX_RIDERS, millis());
+                      mesh_.riders(), MAX_RIDERS, millis(), ownFix_.fresh(millis()));
     wantBeacon_ = false;
     sentOnce_ = false;
     announcedSlot_ = SLOT_NONE;
@@ -667,7 +673,7 @@ void TougeFastModule::beacon(uint32_t nowMs)
             // frame arriving, so the schedule is re-read once per beacon too.
             // Otherwise a car left alone would hold its lease indefinitely.
             schedule_.rebuild(nodeId_, rideClock.locked((uint64_t)esp_timer_get_time()),
-                              mesh_.riders(), MAX_RIDERS, nowMs);
+                              mesh_.riders(), MAX_RIDERS, nowMs, true);
             schedule_.drawSharedTurn(esp_random());
         }
     }
@@ -1561,9 +1567,11 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
                 // gain a GPS fix and become the right car to keep time by, and
                 // either of those has to reach the schedule when it happens
                 // rather than when somebody else next turns up. A pass over 28
-                // riders and 32 slots is cheap.
+                // riders and 32 slots is cheap. On the pass's time, as the frame
+                // was noted: a fresh millis() here claimed a lease a moment after
+                // the time beacon() then judged it at (build 48).
                 schedule_.rebuild(nodeId_, rideClock.locked((uint64_t)esp_timer_get_time()),
-                                  mesh_.riders(), MAX_RIDERS, millis());
+                                  mesh_.riders(), MAX_RIDERS, nowMs, ownFix_.fresh(nowMs));
             }
         }
 

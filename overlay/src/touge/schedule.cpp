@@ -34,6 +34,7 @@ const char* slotLossWords(uint8_t why, char* out, size_t cap) {
       {LOSS_DROWNED, "drowned"},
       {LOSS_UNHEARD, "unheard"},
       {LOSS_ALONE, "alone"},
+      {LOSS_QUIET, "quiet"},
   };
   for (const auto& w : kWords) {
     if (!(why & w.bit)) continue;
@@ -111,11 +112,16 @@ bool poorRecord(uint16_t bits) {
 void Schedule::reset() { *this = Schedule(); }
 
 void Schedule::rebuild(uint32_t selfId, bool selfLocked, const Rider* riders, size_t maxRiders,
-                       uint32_t nowMs) {
+                       uint32_t nowMs, bool speaking) {
+  // Time only goes forward here. Build 48 claimed a lease at T+1 and judged it
+  // at T; the unsigned age wrapped and the lease went as unheard, held=4294967295.
+  if (sawTime_ && (int32_t)(nowMs - latestMs_) < 0) nowMs = latestMs_;
+  latestMs_ = nowMs;
+  sawTime_ = true;
   selfId_ = selfId;
   // Lease first: only a leased car may keep time, and a car that claims its
   // slot in this pass should be able to win the job in the same pass.
-  settleLease(riders, maxRiders, nowMs);
+  settleLease(riders, maxRiders, nowMs, speaking);
   electReference(selfLocked, riders, maxRiders, nowMs);
   chooseParent(riders, maxRiders, nowMs);
   planExtras(riders, maxRiders, nowMs);
@@ -184,7 +190,7 @@ void Schedule::electReference(bool selfLocked, const Rider* riders, size_t maxRi
   }
 }
 
-void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs) {
+void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs, bool speaking) {
   // Who holds each slot among the cars we can hear, directly or relayed, and
   // the newest generation any of them has heard of.
   bool held[MAX_SLOTS] = {};
@@ -231,6 +237,25 @@ void Schedule::settleLease(const Rider* riders, size_t maxRiders, uint32_t nowMs
   }
   if (!heardAnyone_) {
     heardAnyone_ = true;
+    firstHeardMs_ = nowMs;
+    listenMs_ = JOIN_LISTEN_MS;
+  }
+
+  // No beacon of ours is on the air (the phone stopped feeding a fix), so a
+  // lease would only be drowned for want of one and claimed again: on 48 the
+  // moto's radio lost 53 that way in 6 minutes after its phone left the ride.
+  if (!speaking) {
+    if (claimed()) {
+      clashing_ = false;
+      noteLoss(LOSS_QUIET, nowMs, 0, 0, 0, false);
+      slot_ = SLOT_NONE;
+    }
+    quiet_ = true;
+    return;
+  }
+  // Back on the air. Nobody has seen us waiting, so listen first like a newcomer.
+  if (quiet_) {
+    quiet_ = false;
     firstHeardMs_ = nowMs;
     listenMs_ = JOIN_LISTEN_MS;
   }

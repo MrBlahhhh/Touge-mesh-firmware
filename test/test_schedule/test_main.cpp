@@ -1389,6 +1389,68 @@ void test_a_lease_left_alone_says_so() {
   TEST_ASSERT_EQUAL_UINT32(1, s.losses());
 }
 
+void test_a_claim_judged_a_millisecond_before_it_was_made_stands() {
+  // Build 48 took a lease on a fresh millis() after a frame, then judged it on
+  // the pass's earlier time: the age wrapped and the lease went as unheard.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  Schedule s;
+  touch(r, 1000);
+  s.rebuild(300, false, r, ROSTER, 1000);
+  const uint32_t claimAt = 1000 + JOIN_LISTEN_MS + 1;
+  touch(r, claimAt - 1);
+  s.rebuild(300, false, r, ROSTER, claimAt);
+  TEST_ASSERT_TRUE(s.claimed());
+  s.rebuild(300, false, r, ROSTER, claimAt - 1);
+  TEST_ASSERT_TRUE_MESSAGE(s.claimed(), "a lease judged 1 ms before it was taken stands");
+  TEST_ASSERT_EQUAL_UINT32(0, s.losses());
+}
+
+void test_a_car_with_nothing_to_send_claims_no_slot() {
+  // Its phone gone, the radio sends nothing, so a claim would never be shown
+  // and would be drowned for it, over and over.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  addLeased(r, 1, 900, 8, 1);
+  Schedule s;
+  uint32_t now = 1000;
+  for (int i = 0; i < 60; i++, now += SCHEDULE_MS) {
+    touch(r, now);
+    s.rebuild(300, false, r, ROSTER, now, false);
+    TEST_ASSERT_FALSE(s.claimed());
+  }
+  TEST_ASSERT_EQUAL_UINT32(0, s.losses());
+  // Speaking again, it listens like a newcomer before claiming.
+  touch(r, now);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_FALSE_MESSAGE(s.claimed(), "back on the air, it listens first");
+  now += JOIN_LISTEN_MS;
+  touch(r, now);
+  s.rebuild(300, false, r, ROSTER, now);
+  TEST_ASSERT_TRUE(s.claimed());
+}
+
+void test_a_leased_car_that_goes_quiet_gives_its_slot_up_once() {
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  addLeased(r, 1, 900, 8, 1);
+  Schedule s;
+  uint32_t now = join(s, 300, r);
+  TEST_ASSERT_TRUE(s.claimed());
+  const uint8_t mine = s.slot();
+  for (int i = 0; i < 30; i++) {
+    now += SCHEDULE_MS;
+    touch(r, now);
+    s.rebuild(300, false, r, ROSTER, now, false);
+    TEST_ASSERT_FALSE(s.claimed());
+  }
+  TEST_ASSERT_EQUAL_UINT32(1, s.losses());
+  const SlotLoss& loss = s.lastLoss();
+  TEST_ASSERT_EQUAL_UINT8(LOSS_QUIET, loss.why);
+  TEST_ASSERT_EQUAL_UINT8(mine, loss.slot);
+  TEST_ASSERT_EQUAL_UINT32(0, loss.clashMs);
+}
+
 void test_a_loss_formats_for_serial_and_the_phone() {
   SlotLoss loss;
   loss.why = LOSS_OUTRANKED | LOSS_DROWNED;
@@ -1413,6 +1475,7 @@ void test_a_loss_formats_for_serial_and_the_phone() {
   char words[40];
   TEST_ASSERT_EQUAL_STRING("outranked+drowned", slotLossWords(loss.why, words, sizeof(words)));
   TEST_ASSERT_EQUAL_STRING("alone", slotLossWords(LOSS_ALONE, words, sizeof(words)));
+  TEST_ASSERT_EQUAL_STRING("quiet", slotLossWords(LOSS_QUIET, words, sizeof(words)));
   TEST_ASSERT_EQUAL_STRING("none", slotLossWords(0, words, sizeof(words)));
   char tiny[6];
   TEST_ASSERT_EQUAL_STRING("outra", slotLossWords(LOSS_OUTRANKED, tiny, sizeof(tiny)));
@@ -1509,6 +1572,9 @@ struct Car {
   uint32_t lastSendAt = 0;
   uint32_t extrasSent = 0;
   uint8_t announced = SLOT_NONE;
+  // False once its phone stops feeding a fix: the radio listens and sends
+  // nothing, as TougeFastModule::beacon returns before the schedule.
+  bool phone = true;
 };
 
 struct World {
@@ -1638,7 +1704,7 @@ struct World {
     c.seen[d.src] = d.id;
     note(c, srcId, d.pos, d.hopsAway, at);
     if (d.hopsAway == 0 && !d.pos.extra) c.sched.heardBeacon(srcId, d.pos, at);
-    c.sched.rebuild(c.id, c.gps, c.roster, ROSTER, at);
+    c.sched.rebuild(c.id, c.gps, c.roster, ROSTER, at, c.phone);
 
     // Extras are never forwarded.
     if (d.hopsAway < RELAY_HOPS && !d.pos.extra)
@@ -1688,6 +1754,7 @@ struct World {
 
   void tick(size_t i) {
     Car& c = cars[i];
+    if (!c.phone) return;
     const uint32_t at = local(c, now);
     if (extraTick(i, at)) return;
     if (!c.want) {
@@ -1756,13 +1823,13 @@ struct World {
     return false;
   }
 
-  // Every car on holds a lease, and no two that could collide share one.
+  // Every car on and sending holds a lease, and no two that could collide share one.
   bool settled() const {
     for (size_t a = 0; a < cars.size(); a++) {
-      if (!cars[a].on) continue;
+      if (!cars[a].on || !cars[a].phone) continue;
       if (!cars[a].sched.claimed()) return false;
       for (size_t b = a + 1; b < cars.size(); b++)
-        if (cars[b].on && cars[a].sched.slot() == cars[b].sched.slot() && interferes(a, b))
+        if (cars[b].on && cars[b].phone && cars[a].sched.slot() == cars[b].sched.slot() && interferes(a, b))
           return false;
     }
     return true;
@@ -2472,6 +2539,39 @@ void test_sim_a_v3_joining_a_lossy_bench_keeps_its_young_lease() {
   TEST_ASSERT_EQUAL_UINT32(0, w.leasedCollisions);
 }
 
+void test_sim_a_radio_whose_phone_has_gone_holds_no_slot() {
+  // The 48 group ride: the moto left the ride and its phone stopped feeding the
+  // radio, which went on claiming a slot on every frame it heard. None of its
+  // claims went out, so the maps drowned each one and it claimed again.
+  const size_t cars = 3, moto = 2;
+  World w(cars, 71);
+  sim::bootAll(w, 0, cars);
+  w.run(20000);
+  TEST_ASSERT_TRUE(w.settled());
+
+  w.mark();
+  const uint32_t before = w.cars[moto].sched.losses();
+  w.cars[moto].phone = false;
+  w.run(6 * 60000);
+  const uint32_t lost = w.cars[moto].sched.losses() - before;
+  char line[120];
+  snprintf(line, sizeof(line), "radio with no phone: %u leases lost in 6 minutes", (unsigned)lost);
+  TEST_MESSAGE(line);
+  TEST_ASSERT_EQUAL_UINT32(1, lost);
+  TEST_ASSERT_EQUAL_UINT8(LOSS_QUIET, w.cars[moto].sched.lastLoss().why);
+  TEST_ASSERT_FALSE(w.cars[moto].sched.claimed());
+  TEST_ASSERT_TRUE(w.settled());
+
+  // The phone back: a slot within a few seconds, and nobody else moves.
+  w.cars[moto].phone = true;
+  w.run(8000);
+  TEST_ASSERT_TRUE(w.cars[moto].sched.claimed());
+  TEST_ASSERT_TRUE(w.settled());
+  TEST_ASSERT_EQUAL_UINT32(0, w.cars[0].slotChanges);
+  TEST_ASSERT_EQUAL_UINT32(0, w.cars[1].slotChanges);
+  TEST_ASSERT_EQUAL_UINT32(0, w.leasedCollisions);
+}
+
 void test_sim_the_reference_holds_while_link_quality_jitters() {
   // Six cars in range of each other, every link losing 25-50 % of its frames
   // (the bench's good links with a phone attached), redrawn every ten seconds
@@ -2582,6 +2682,9 @@ int main(int, char**) {
   RUN_TEST(test_an_unheard_lease_says_so);
   RUN_TEST(test_an_outranked_lease_says_so);
   RUN_TEST(test_a_lease_left_alone_says_so);
+  RUN_TEST(test_a_claim_judged_a_millisecond_before_it_was_made_stands);
+  RUN_TEST(test_a_car_with_nothing_to_send_claims_no_slot);
+  RUN_TEST(test_a_leased_car_that_goes_quiet_gives_its_slot_up_once);
   RUN_TEST(test_a_loss_formats_for_serial_and_the_phone);
   RUN_TEST(test_the_extra_flag_round_trips);
   RUN_TEST(test_sim_rates_3_cars);
@@ -2593,6 +2696,7 @@ int main(int, char**) {
   RUN_TEST(test_sim_a_weak_radio_keeps_to_a_free_slot_and_off_the_clock);
   RUN_TEST(test_sim_the_bench_three_radios_with_the_weak_one_lowest);
   RUN_TEST(test_sim_a_v3_joining_a_lossy_bench_keeps_its_young_lease);
+  RUN_TEST(test_sim_a_radio_whose_phone_has_gone_holds_no_slot);
   RUN_TEST(test_sim_the_reference_holds_while_link_quality_jitters);
   return UNITY_END();
 }
