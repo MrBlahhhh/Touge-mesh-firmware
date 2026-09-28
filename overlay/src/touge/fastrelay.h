@@ -9,7 +9,9 @@
 // by (mesh.h). That stays as the backup. This adds the build 43 LoRa rule
 // (relaypref.h) on the fast lane: skip a forward only when fresh evidence shows
 // every other car we know already hears the origin steadily, so our copy would
-// reach nobody who lacks it. Positions and voice alike.
+// reach nobody who lacks it. Positions and voice alike are judged;
+// fastRelayDropsForward says which skips are taken, by frame type and how many
+// cars are on the ride.
 //
 // ## The evidence
 //
@@ -84,12 +86,12 @@
 //
 // A relayed copy has been on the air from its relayer, so every car that hears
 // the relayer has it too: it is skipped when every car hears the origin or the
-// relayer steadily. The relayer names itself by its slotTag in a header byte
-// the frame does not carry yet (the plan's appendix), and is placed only as the
-// one car on the ride with that tag, so a hidden car sharing its slot cannot
-// pass for it. A relayed copy whose relayer cannot be placed is judged on the
-// origin alone, which is as safe: if every other car, the relayer included,
-// hears the origin steadily, our copy reaches nobody who lacks it.
+// relayer steadily. The relayer names itself by its slotTag in header byte 12
+// (Frame::relayer, from build 51), and is placed only as the one car on the
+// ride with that tag, so a hidden car sharing its slot cannot pass for it. A
+// relayed copy whose relayer cannot be placed is judged on the origin alone,
+// which is as safe: if every other car, the relayer included, hears the origin
+// steadily, our copy reaches nobody who lacks it.
 //
 // ## RAM
 //
@@ -98,7 +100,9 @@
 // not MAX_RIDERS (28): a roster with every seat taken may be hiding a car and
 // never skips, and a 28th car on the ride stops skips for a lease. A history
 // per slot instead of per car, 28 x 32 x 16 bits, would be 1.8 KB, too much
-// for a Heltec V3 (ram.h).
+// for a Heltec V3 (ram.h). It lives in TougeFastModule, which is allocated from
+// the heap at boot, so from build 51 the V3's "touge: heap" line reads about
+// 1 KB lower.
 //
 // Platform-free: time comes in as an argument.
 
@@ -109,6 +113,19 @@
 #include "schedule.h"
 
 namespace touge {
+
+// The fewest cars on a ride, the origin included and us not, at which a SKIP
+// drops a position forward. A link judged steady still misses about one beacon
+// in five, and on a small ride our forward was what covered it.
+// 2B sim, p = 0.2, 1-hop positions against 50 with no floor: 3 cars -8.5 points, 4 -8.1, 6 -3.3, 8 -1.2.
+// A floor of 8 still cost 9-12 car rides 1.0-0.5 points; at 12 they are level and 13-14 lose 0.4 and 0.3.
+static const size_t FAST_RELAY_MIN_CARS = 12;
+
+// Whether a SKIP drops voice forwards from FAST_RELAY_MIN_CARS up as well. A
+// skipped voice frame is a hole, where a skipped position is covered by the
+// next one. Voice is judged and counted either way ({"fe"} in phonebatch.h).
+// 2B sim: above the floor it changes nothing at p = 0.2 and 0.4 and pays only in a clean 25-car park.
+static const bool FAST_RELAY_SKIPS_VOICE = false;
 
 // Maps remembered per pair: one byte of record, newest in bit 0.
 static const uint8_t FAST_RELAY_MAPS = 8;
@@ -181,6 +198,21 @@ enum class FastRelayVerdict : uint8_t {
   NEEDED,       // a car's fresh maps do not show the origin (or the relayer) steadily, or not for long enough yet
 };
 
+// Cars on the ride as judge counts them: on the roster, heard within LEASE_MS,
+// and not us. The origin of a frame judged SKIP is always one of them.
+size_t countCarsOnRide(uint32_t selfId, const Rider* riders, size_t maxRiders, uint32_t nowMs);
+
+// Whether `verdict` drops our forward of a `frameType` frame, with
+// `carsOnRide` from countCarsOnRide at the verdict's time. With the origin the
+// only other car, nobody could want our copy (plan 1C.2's two-car rule), so
+// that skip is taken for voice too.
+inline bool fastRelayDropsForward(FastRelayVerdict verdict, uint8_t frameType, size_t carsOnRide) {
+  if (verdict != FastRelayVerdict::SKIP) return false;
+  if (carsOnRide == 1) return true;
+  if (carsOnRide < FAST_RELAY_MIN_CARS) return false;
+  return frameType != FRAME_VOICE || FAST_RELAY_SKIPS_VOICE;
+}
+
 class FastRelay {
  public:
   void reset();
@@ -197,11 +229,12 @@ class FastRelay {
 
   /**
    * Whether our forward of a frame from `origin` is worth sending. `relayed`:
-   * the copy we heard came from a relay (hops below what the origin sends
-   * with); `relayerTag` is the relay's slotTag from the header, 0 when the
-   * frame names none. `riders` is the roster, Mesh::riders() with MAX_RIDERS,
-   * already holding this frame's sender if it was a position. Ask before
-   * Mesh::defer, so a skipped frame never holds a forward slot.
+   * the copy we heard came from a relay (hopsTravelled above 0, against what
+   * its frame type starts with); `relayerTag` is Frame::relayer, the relay's
+   * slotTag, 0 when the frame names none. `riders` is the roster,
+   * Mesh::riders() with MAX_RIDERS, already holding this frame's sender if it
+   * was a position. Ask before Mesh::defer, so a skipped frame never holds a
+   * forward slot.
    *
    * `relayerUnplaced`, when given, is set for a relayed copy judged on the
    * origin alone because its relayer could not be placed: no tag, a tag no car

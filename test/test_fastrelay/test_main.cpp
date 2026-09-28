@@ -1146,6 +1146,67 @@ void test_the_counters_tally_each_verdict() {
   TEST_ASSERT_EQUAL_UINT32(2, skips.noRelayer);
 }
 
+// ---- Which skips are taken ---------------------------------------------------
+
+void test_a_skip_is_taken_with_the_origin_alone_and_for_positions_from_twelve_other_cars() {
+  // The 2B sim's floor: below it the forward a SKIP drops was often a car's only copy.
+  TEST_ASSERT_EQUAL_UINT32(12, FAST_RELAY_MIN_CARS);
+  const FastRelayVerdict goes[] = {FastRelayVerdict::NO_EVIDENCE, FastRelayVerdict::STALE, FastRelayVerdict::NEEDED};
+  for (size_t cars = 0; cars <= MAX_RIDERS; cars++) {
+    for (FastRelayVerdict v : goes) {
+      TEST_ASSERT_FALSE(fastRelayDropsForward(v, FRAME_POSITION, cars));
+      TEST_ASSERT_FALSE(fastRelayDropsForward(v, FRAME_VOICE, cars));
+    }
+  }
+  // A two-car ride: the origin is the only other car, so nobody could want our copy.
+  TEST_ASSERT_TRUE(fastRelayDropsForward(FastRelayVerdict::SKIP, FRAME_POSITION, 1));
+  TEST_ASSERT_TRUE(fastRelayDropsForward(FastRelayVerdict::SKIP, FRAME_VOICE, 1));
+  // Two to eleven other cars: every forward goes.
+  for (size_t cars = 2; cars < 12; cars++) {
+    TEST_ASSERT_FALSE(fastRelayDropsForward(FastRelayVerdict::SKIP, FRAME_POSITION, cars));
+    TEST_ASSERT_FALSE(fastRelayDropsForward(FastRelayVerdict::SKIP, FRAME_VOICE, cars));
+  }
+  // Twelve and up: positions skip, voice keeps its forward.
+  for (size_t cars = 12; cars <= MAX_RIDERS; cars++) {
+    TEST_ASSERT_TRUE(fastRelayDropsForward(FastRelayVerdict::SKIP, FRAME_POSITION, cars));
+    TEST_ASSERT_FALSE(fastRelayDropsForward(FastRelayVerdict::SKIP, FRAME_VOICE, cars));
+  }
+  // Nobody on the ride cannot come with a SKIP (judge needs the origin), and takes none.
+  TEST_ASSERT_FALSE(fastRelayDropsForward(FastRelayVerdict::SKIP, FRAME_POSITION, 0));
+}
+
+void test_the_ride_is_counted_as_judge_counts_it() {
+  Mesh mesh;
+  mesh.reset();
+  Position p;
+  p.slot = 0;
+  mesh.note(0xA0000001, p, HEARD_FAST, -50, 0, 1000, 1);
+  p.slot = 1;
+  mesh.note(0xA0000002, p, HEARD_FAST, -50, 0, 1000 + LEASE_MS, 1);
+  // Our own number on the roster is a node number collision, never us.
+  p.slot = 2;
+  mesh.note(SELF, p, HEARD_FAST, -50, 0, 1000 + LEASE_MS, 1);
+  // A lease after the first car was heard it is off the ride.
+  TEST_ASSERT_EQUAL_UINT32(1, countCarsOnRide(SELF, mesh.riders(), MAX_RIDERS, 1000 + LEASE_MS));
+  // A ms before, it is on, and a stamp after the count's time reads as now.
+  TEST_ASSERT_EQUAL_UINT32(2, countCarsOnRide(SELF, mesh.riders(), MAX_RIDERS, 1000 + LEASE_MS - 1));
+
+  // Judge and the count agree: a two-car ride skips every forward, and a
+  // five-car park that skips by the maps keeps its forwards.
+  Ride two;
+  two.add(0xA0000001, 0);
+  two.second();
+  ASSERT_VERDICT(FastRelayVerdict::SKIP, two.judge(0));
+  TEST_ASSERT_EQUAL_UINT32(1, countCarsOnRide(SELF, two.riders(), MAX_RIDERS, two.nowMs));
+  Ride park;
+  carPark(park);
+  park.seconds(FAST_RELAY_MAPS + 1);
+  ASSERT_VERDICT(FastRelayVerdict::SKIP, park.judge(0));
+  const size_t cars = countCarsOnRide(SELF, park.riders(), MAX_RIDERS, park.nowMs);
+  TEST_ASSERT_EQUAL_UINT32(5, cars);
+  TEST_ASSERT_FALSE(fastRelayDropsForward(park.judge(0), FRAME_POSITION, cars));
+}
+
 void test_the_record_fits_a_v3() {
   char line[64];
   snprintf(line, sizeof(line), "sizeof(FastRelay) = %u bytes", (unsigned)sizeof(FastRelay));
@@ -1182,6 +1243,8 @@ int main(int, char**) {
   RUN_TEST(test_a_flaky_neighbour_is_judged_by_how_often_its_maps_show_the_origin);
   RUN_TEST(test_a_link_that_dies_stops_counting_within_seconds);
   RUN_TEST(test_the_counters_tally_each_verdict);
+  RUN_TEST(test_a_skip_is_taken_with_the_origin_alone_and_for_positions_from_twelve_other_cars);
+  RUN_TEST(test_the_ride_is_counted_as_judge_counts_it);
   RUN_TEST(test_the_record_fits_a_v3);
   return UNITY_END();
 }

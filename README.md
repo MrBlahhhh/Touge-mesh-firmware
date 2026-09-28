@@ -21,8 +21,8 @@ is idempotent: it skips what's already applied, and stops if a patch or
 Flash with `flash-all.ps1` (every V3/V4 on USB, chip identified with esptool,
 NVS kept) or the Web Serial page in `web-flasher/`.
 
-Every radio on a ride must run the same frame version (4, from build 40).
-Boards on different versions drop each other's frames. From build 43
+Every radio on a ride must run the same frame version (5, from build 51).
+Boards on different versions drop each other's frames and meet only on LoRa. From build 43
 positions go unsigned: every radio needs 43, and a stock one needs packet
 signature policy Compatible.
 
@@ -77,10 +77,11 @@ Needs a host C++ compiler on PATH.
   counter lives in NVS.
 - **Channel.** Wi-Fi channel 1, fixed (build 42). Hopping is in the code and
   off (`FAST_LANE_HOP`). A board that hears nobody for 6 s goes back to it.
-- **Frame.** 14-byte header, version 4. A position body is 67 bytes plus a
-  16-byte name every 30 s: 89 bytes on air, 105 with the name. Layout in
-  `frame.h`. Only position and voice frames are sent; text, pair and roster
-  types are defined and unused.
+- **Frame.** 14-byte header, version 5 (build 51): byte 12 names the car that
+  relayed a copy, byte 13 is the length. A position body is 67 bytes plus a
+  16-byte name every 30 s: 89 bytes on air, 105 with the name, and carries its
+  schedule layout in two flag bits. Layout in `frame.h`. Only position and
+  voice frames are sent; text, pair and roster types are defined and unused.
 - **Beacon.** On moving 20 m or once a second, whichever comes first.
 - **Schedule** (`schedule.h`). One second, four 250 ms blocks, each eight 27 ms
   leased slots and a 34 ms shared window. 32 leases, taken by rule from the
@@ -89,9 +90,17 @@ Needs a host C++ compiler on PATH.
 - **Clock.** The GNSS PPS edge when locked (three on-time pulses), otherwise
   the beacons of a reference car. Reference order: GPS-locked, then fit to keep
   time (most links working both ways), then lowest node number.
-- **Forwarding.** Two hops. Weakest RSSI forwards first, in a 30 to 120 ms
-  window that widens with the neighbour count; a held forward is dropped after
-  3 copies are heard.
+- **Forwarding.** Two hops, positions and voice alike. Weakest RSSI forwards
+  first, in a 30 to 120 ms window that widens with the neighbour count, in
+  whole steps of a pass and the frame's airtime plus a tie of 0 or 1 step; a
+  held forward is dropped after 3 copies are heard. The wait runs from when the
+  frame arrived, or from the pass that drains it after a stall. A forward is
+  skipped when the slot maps show every other car hears the origin, or the
+  relayer, steadily (`fastrelay.h`): any forward when the origin is the only
+  other car, otherwise a position's with 8 or more other cars on the ride.
+  `forward.h` makes the call, off the board so the host tests run it. Voice
+  has its own hop and copy constants (`mesh.h`); the ride sim in
+  `test/test_ridesim` set them.
 - **NodeDB.** A heard position is written with `updatePosition` and
   `last_heard`, so the OLED and stock app see it. A LoRa position from a car
   heard on 2.4 GHz in the last 3 s is let through for relaying, then the row
@@ -108,7 +117,7 @@ Private-port payloads by first byte:
 
 | Byte | Direction | Content |
 |---|---|---|
-| `{` | radio to phone | JSON: lane reports (`fl`, `fs`, `fq`), LoRa reports (`ll`, `lt`, `le`), own fix (`gf`); the app also uses it for profiles and invites |
+| `{` | radio to phone | JSON: lane reports (`fl`, `fs`, `fq`, `fd`, `fr`, `fe`), LoRa reports (`ll`, `lt`, `le`), own fix (`gf`); the app also uses it for profiles and invites |
 | `T` 0x54 | both | voice frame |
 | 0xC1 | radio to phone | position batch (`phonebatch.h`) |
 | 0xC2 | phone to its radio | hello (`phonebatch.h`) |

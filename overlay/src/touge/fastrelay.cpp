@@ -9,14 +9,8 @@ const uint32_t GAP_STEP_MS = 16;
 const uint8_t GAP_NONE = 0xFF;
 static_assert(GAP_NONE * GAP_STEP_MS > FAST_RELAY_FRESH_MS, "a gap too long to be fresh must fit below GAP_NONE");
 
-// Since `atMs`, for the relay's own stamps. Unsigned: seats are never aged out,
-// so a seat left for weeks has to read as long gone, not as just heard. A
-// stamp up to a second ahead of nowMs reads as now: a map fed on its receive
-// time and judged on a pass that began a moment before.
-uint32_t msSince(uint32_t atMs, uint32_t nowMs) {
-  const uint32_t age = nowMs - atMs;
-  return age > 0u - SCHEDULE_MS ? 0 : age;
-}
+// The relay's own stamps are read through stampAgeMs (schedule.h), not signed:
+// seats are never aged out, so a seat left for weeks has to read as long gone.
 
 uint8_t gapSteps(uint32_t gapMs) {
   const uint32_t steps = (gapMs + GAP_STEP_MS - 1) / GAP_STEP_MS;
@@ -86,6 +80,14 @@ bool mapCoversTwoBeacons(uint8_t reporterSlot, uint8_t originSlot) {
   return !clearlyOne;
 }
 
+size_t countCarsOnRide(uint32_t selfId, const Rider* riders, size_t maxRiders, uint32_t nowMs) {
+  size_t cars = 0;
+  for (size_t i = 0; i < maxRiders; i++) {
+    if (onRide(riders[i], selfId, nowMs)) cars++;
+  }
+  return cars;
+}
+
 void FastRelay::reset() { *this = FastRelay(); }
 
 size_t FastRelay::seatOf(uint32_t id) const {
@@ -108,7 +110,7 @@ size_t FastRelay::takeSeat(uint32_t id, uint32_t nowMs) {
     }
     // Every seat holds a car on the ride, so more cars are about than the 27
     // this counts on, and one may now be on no list at all.
-    if (msSince(mapAtMs_[seat], nowMs) < LEASE_MS) {
+    if (stampAgeMs(mapAtMs_[seat], nowMs) < LEASE_MS) {
       crowded_ = true;
       crowdedAtMs_ = nowMs;
     }
@@ -144,7 +146,7 @@ void FastRelay::heardMap(uint32_t senderId, const Position& p, uint32_t nowMs) {
     clearAsOrigin(n);
     prevGap_[n] = GAP_NONE;
   } else {
-    const uint32_t gapMs = msSince(mapAtMs_[n], nowMs);
+    const uint32_t gapMs = stampAgeMs(mapAtMs_[n], nowMs);
     // Nothing moves, freshness included: refreshed by maps that do not count,
     // a car beaconing four times a second would keep a frozen record fresh.
     if (gapMs < FAST_RELAY_MAP_SPACING_MS) return;
@@ -164,7 +166,7 @@ void FastRelay::heardMap(uint32_t senderId, const Position& p, uint32_t nowMs) {
 }
 
 bool FastRelay::onRideHere(size_t seat, uint32_t selfId, uint32_t nowMs) const {
-  return carId_[seat] != 0 && carId_[seat] != selfId && msSince(mapAtMs_[seat], nowMs) < LEASE_MS;
+  return carId_[seat] != 0 && carId_[seat] != selfId && stampAgeMs(mapAtMs_[seat], nowMs) < LEASE_MS;
 }
 
 // Unsigned, so a map stamped later than nowMs reads as stale.
@@ -219,7 +221,7 @@ FastRelayVerdict FastRelay::judge(uint32_t selfId, uint32_t origin, bool relayed
                                   bool* relayerUnplaced) const {
   if (relayerUnplaced != nullptr) *relayerUnplaced = false;
   if (rosterMayMissCars(riders, maxRiders, nowMs)) return FastRelayVerdict::NO_EVIDENCE;
-  if (crowded_ && msSince(crowdedAtMs_, nowMs) < LEASE_MS) return FastRelayVerdict::NO_EVIDENCE;
+  if (crowded_ && stampAgeMs(crowdedAtMs_, nowMs) < LEASE_MS) return FastRelayVerdict::NO_EVIDENCE;
 
   // The origin has to hold a lease of its own for any map to show it.
   const Rider* originRider = findOnRide(origin, selfId, riders, maxRiders, nowMs);

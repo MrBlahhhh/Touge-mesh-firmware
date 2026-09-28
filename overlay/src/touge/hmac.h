@@ -30,8 +30,9 @@ void hmacSha256(const uint8_t* key, size_t keyLen, const uint8_t* data, size_t d
 
 // The tag for one frame. Covers the sender, the packet id, the type, the
 // channel byte and the ciphertext. Deliberately not the hop count, which every
-// forwarding node decrements: covering it would make a forwarded frame fail
-// its own tag at the next node along.
+// forwarding node decrements, nor the relayer byte, which every forwarding node
+// rewrites: covering either would make a forwarded frame fail its own tag at
+// the next node along.
 void frameTag(const uint8_t* key, size_t keyLen, uint32_t src, uint32_t id, uint8_t type,
               uint8_t chan, const uint8_t* cipher, size_t cipherLen, uint8_t out[TAG_LEN]);
 

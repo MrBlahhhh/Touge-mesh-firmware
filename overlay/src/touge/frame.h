@@ -29,10 +29,16 @@ static const uint8_t FRAME_MAGIC = 0x54; // 'T', same as the app's VoicePacket
 // 38: every position carries its fix identity (FixId). 4 from build 40: the
 // same bytes, but flag bits saying whether the sender, and its reference, are
 // fit to keep time (Schedule::fitToKeepTime), which the reference election now
-// reads; a build 39 radio would elect differently. Boards on different
-// versions drop each other's frames; every radio is flashed together.
-static const uint8_t FRAME_VERSION = 4;
+// reads; a build 39 radio would elect differently. 5 from build 51: byte 12,
+// the always-zero high byte of the length, names the car that put this copy on
+// the air (Frame::relayer). Boards on different versions drop each other's
+// frames; every radio is flashed together.
+static const uint8_t FRAME_VERSION = 5;
+
+// 0 magic | 1 version and type | 2-5 src | 6-9 id | 10 hops | 11 chan |
+// 12 relayer | 13 payload length | 14.. payload: ciphertext, then the tag.
 static const size_t FRAME_HEADER = 14;
+static const size_t FRAME_RELAYER_AT = 12;
 
 // ESP-NOW tops out at 250 bytes and is the tightest of the two radios, so it
 // sets the ceiling for both. A LoRa frame is much smaller in practice.
@@ -41,6 +47,8 @@ static const size_t FRAME_MAX_PAYLOAD = FRAME_MAX - FRAME_HEADER;
 // What is left for the plaintext once the authentication tag has taken its
 // share of the payload.
 static const size_t FRAME_MAX_BODY = FRAME_MAX_PAYLOAD - 8;
+
+static_assert(FRAME_MAX_PAYLOAD <= 0xFF, "byte 13 alone carries the payload length");
 
 struct Frame {
   uint8_t type = 0;
@@ -56,6 +64,10 @@ struct Frame {
   // First byte of the channel hash. Not security, just a cheap way to drop
   // another group's traffic before spending anything on decryption.
   uint8_t chan = 0;
+  // The slotTag of the car that put this copy on the air, 0 on the origin's
+  // own; a tag is never 0. Outside the tag like hops, so a forwarder rewrites it
+  // without the key. The relay rule reads it (fastrelay.h).
+  uint8_t relayer = 0;
   const uint8_t* payload = nullptr;
   uint16_t len = 0;
 };
@@ -102,6 +114,10 @@ static_assert(MAX_REF_HOPS < REF_UNREACHABLE, "the cap has to fit under the sent
 static const uint8_t SLOT_NONE = 0xFF;
 // One entry per slot in Position::slotMap. schedule.h asserts it matches.
 static const size_t SLOT_MAP_LEN = 32;
+// Layout ids a position can carry: two spare flag bits, so the position frame
+// did not grow for them.
+static const uint8_t POSITION_LAYOUTS = 4;
+static_assert(POSITION_LAYOUTS <= 4, "the layout has two flag bits, 0x40 and 0x80");
 
 // ---- Fix identity (SCALE-PLAN 5a) -------------------------------------------
 //
@@ -176,6 +192,10 @@ struct Position {
   // announced by one, so a car that missed a hop hears about it from whoever
   // it hears from next instead of having had one chance at a command.
   uint8_t hop = 0;
+  // Which layout of the second the sender's schedule runs (SCHEDULE_LAYOUT in
+  // schedule.h). Flag bits 0x40 and 0x80, from build 51; under POSITION_LAYOUTS.
+  // Here, not with the other flags, to sit in padding before refId.
+  uint8_t layout = 0;
   // Which car this one believes is keeping time for the whole ride, and how
   // many hops away it thinks that car is.
   //
@@ -215,7 +235,7 @@ struct Position {
   char name[16] = {0};
 };
 
-// Body, version 4: 0-7 lat, lon | 8 heading | 9 speed | 10 battery | 11 flags
+// Body, versions 4 and 5: 0-7 lat, lon | 8 heading | 9 speed | 10 battery | 11 flags
 // | 12 hop | 13-16 reference | 17 its hops, lock and fitness | 18 slot | 19-22
 // lease and schedule generations | 23-54 slot map | 55-66 fix identity | 67..
 // name.

@@ -13,8 +13,9 @@ uint32_t forwardSpreadMs(size_t neighbours) {
   return want;
 }
 
-uint32_t forwardDelayMs(int16_t rssi, uint32_t spreadMs, uint32_t tieBreak) {
-  const uint32_t tie = FORWARD_TIE_MS > 0 ? (tieBreak % FORWARD_TIE_MS) : 0;
+uint32_t forwardDelayMs(int16_t rssi, uint32_t spreadMs, uint32_t tieBreak, size_t wireLen) {
+  const uint32_t step = forwardStepMs(wireLen);
+  const uint32_t tie = (tieBreak % FORWARD_TIE_STEPS) * step;
   if (spreadMs == 0) return tie;
 
   int32_t r = rssi;
@@ -27,7 +28,9 @@ uint32_t forwardDelayMs(int16_t rssi, uint32_t spreadMs, uint32_t tieBreak) {
   // signal should not be the one elected to relay.
   const int32_t span = (int32_t)FORWARD_NEAR_DBM - (int32_t)FORWARD_FAR_DBM;
   const uint32_t d = (uint32_t)(((int64_t)(r - FORWARD_FAR_DBM) * (int64_t)spreadMs) / span);
-  return d + tie;
+  // Down to a whole step, so two hearers' waits are equal or a step apart. In
+  // between, neither hears the other's copy before its own pass.
+  return d - d % step + tie;
 }
 
 uint32_t nextOnGrid(uint32_t deadlineMs, uint32_t periodMs, uint32_t nowMs) {
@@ -121,27 +124,29 @@ uint8_t* Mesh::slotBytes(size_t i) {
 }
 
 bool Mesh::holdIn(size_t i, const uint8_t* wire, size_t len, uint32_t src, uint32_t id,
-                  uint32_t dueMs) {
+                  uint32_t dueMs, uint8_t suppressAfter) {
   if (held_[i].used || len > slotCapacity(i)) return false;
   memcpy(slotBytes(i), wire, len);
   held_[i].len = (uint16_t)len;
   held_[i].src = src;
   held_[i].id = id;
   held_[i].dueMs = dueMs;
+  held_[i].suppressAfter = suppressAfter;
   held_[i].used = true;
   return true;
 }
 
-bool Mesh::defer(const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uint32_t dueMs) {
+bool Mesh::defer(const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uint32_t dueMs,
+                 uint8_t suppressAfter) {
   if (wire == nullptr || len == 0 || len > FRAME_MAX) return false;
 
   // Small slots first, so a burst of positions does not take the full-size
   // slots a voice frame needs. They fall back to a full one when those run out.
   for (size_t i = FORWARD_FULL_SLOTS; i < FORWARD_SLOTS; i++) {
-    if (holdIn(i, wire, len, src, id, dueMs)) return true;
+    if (holdIn(i, wire, len, src, id, dueMs, suppressAfter)) return true;
   }
   for (size_t i = 0; i < FORWARD_FULL_SLOTS; i++) {
-    if (holdIn(i, wire, len, src, id, dueMs)) return true;
+    if (holdIn(i, wire, len, src, id, dueMs, suppressAfter)) return true;
   }
   // No room. The frame is dropped rather than pushing an already-waiting one
   // out: a forward that arrives late is worth less than one that arrives, and
@@ -177,7 +182,7 @@ bool Mesh::nextDue(uint32_t nowMs, Forward& out) {
     // pure interference. Suppressing one does not excuse the rest, so this
     // goes round again rather than giving up for this tick; the slot has been
     // released either way, so the loop always shrinks.
-    if (copies(due.src, due.id, nowMs) >= SUPPRESS_AFTER) {
+    if (copies(due.src, due.id, nowMs) >= due.suppressAfter) {
       suppressed_++;
       continue;
     }

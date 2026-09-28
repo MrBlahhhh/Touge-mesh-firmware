@@ -34,6 +34,7 @@
 #include "SinglePortModule.h"
 #include "concurrency/OSThread.h"
 #include "touge/espnow.h"
+#include "touge/fastrelay.h"
 #include "touge/frame.h"
 #include "touge/gnssfix.h"
 #include "touge/mesh.h"
@@ -204,6 +205,12 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     touge::FastNet net_;
     touge::Schedule schedule_;
     touge::Hop hop_;
+    // Whether a 2.4 GHz forward is worth sending, from the slot maps (build 51).
+    // 1004 B, which on a V3 comes out of the heap core-patches/0018 gave back.
+    touge::FastRelay fastRelay_;
+    // Its verdicts since boot, positions and voice apart ({"fe"}).
+    touge::FastRelaySkips positionSkips_;
+    touge::FastRelaySkips voiceSkips_;
 
     uint8_t keySeen_[touge::PSK_LEN] = {0};
     uint8_t keySeenLen_ = 0;

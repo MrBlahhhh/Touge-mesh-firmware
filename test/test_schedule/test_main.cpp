@@ -1521,6 +1521,113 @@ void test_the_extra_flag_round_trips() {
   TEST_ASSERT_FALSE(got.extra);
 }
 
+// ---- Beacons stamped on their receive time (build 51) ------------------------
+
+void test_a_stamp_just_ahead_reads_as_now_and_an_old_one_as_old() {
+  TEST_ASSERT_EQUAL_UINT32(3, stampAgeMs(1000, 1003));
+  TEST_ASSERT_EQUAL_UINT32(0, stampAgeMs(1003, 1000));
+  TEST_ASSERT_EQUAL_UINT32(0, stampAgeMs(1000 + SCHEDULE_MS - 1, 1000));
+  TEST_ASSERT_EQUAL_UINT32(7, stampAgeMs(0xFFFFFFFEu, 5));
+  // A second or more ahead is a stamp from long ago, not one from the future:
+  // signed, a slot heard 25 days back would read as just heard.
+  TEST_ASSERT_TRUE(stampAgeMs(1000 + SCHEDULE_MS, 1000) > LEASE_MS);
+  TEST_ASSERT_TRUE(stampAgeMs(0, 25u * 24 * 3600 * 1000) > LEASE_MS);
+}
+
+void test_a_beacon_stamped_after_the_pass_began_reads_as_just_heard() {
+  // Build 51 stamps heardBeacon with the frame's receive time, taken on the
+  // Wi-Fi task a few ms after the pass that drains it began. Read on the
+  // pass's time, an unsigned age wrapped: the car left our slot map and our
+  // link record in the very pass that heard it, and we never became fit.
+  // Stamped 3 ms late or on time, everything reads the same.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 200, 4, 1);
+  addLeased(r, 1, 300, 8, 1);
+  Schedule onTime, late;
+  const uint32_t joined = join(onTime, 100, r);
+  join(late, 100, r);
+  TEST_ASSERT_EQUAL_UINT8(0, late.slot());
+  r[0].pos.slotMap[0] = slotTag(100);
+  r[1].pos.slotMap[0] = slotTag(100);
+
+  for (uint32_t k = 1; k <= 20; k++) {
+    const uint32_t pass = joined + k * SCHEDULE_MS;
+    touch(r, pass);
+    onTime.heardBeacon(200, beaconOn(4, 0, 100), pass);
+    onTime.heardBeacon(300, beaconOn(8, 0, 100), pass);
+    late.heardBeacon(200, beaconOn(4, 0, 100), pass + 3);
+    late.heardBeacon(300, beaconOn(8, 0, 100), pass + 3);
+    onTime.rebuild(100, false, r, ROSTER, pass);
+    late.rebuild(100, false, r, ROSTER, pass);
+
+    uint8_t mapOnTime[SLOT_MAP_LEN];
+    uint8_t mapLate[SLOT_MAP_LEN];
+    onTime.fillSlotMap(pass, mapOnTime);
+    late.fillSlotMap(pass, mapLate);
+    char at[48];
+    snprintf(at, sizeof(at), "second %u", (unsigned)k);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(slotTag(200), mapLate[4], at);
+    TEST_ASSERT_EQUAL_MEMORY_MESSAGE(mapOnTime, mapLate, SLOT_MAP_LEN, at);
+    TEST_ASSERT_EQUAL_MESSAGE(onTime.fitToKeepTime(), late.fitToKeepTime(), at);
+    TEST_ASSERT_EQUAL_MESSAGE(onTime.slot(), late.slot(), at);
+  }
+  TEST_ASSERT_TRUE(late.fitToKeepTime());
+  TEST_ASSERT_EQUAL_UINT32(0, late.losses());
+}
+
+// ---- Layouts of the second (build 51) -----------------------------------------
+
+void test_the_layout_rides_in_two_spare_flag_bits() {
+  Position p{};
+  p.hasFix = true;
+  p.extra = true;
+  p.fitToKeepTime = true;
+  uint8_t wire[POSITION_MIN];
+  for (uint8_t layout = 0; layout < POSITION_LAYOUTS; layout++) {
+    p.layout = layout;
+    // The position frame did not grow for it.
+    const size_t n = encodePosition(p, wire, sizeof(wire));
+    TEST_ASSERT_EQUAL_UINT32(POSITION_MIN, n);
+    Position got{};
+    TEST_ASSERT_TRUE(decodePosition(wire, n, got));
+    TEST_ASSERT_EQUAL_UINT8(layout, got.layout);
+    TEST_ASSERT_TRUE(got.hasFix);
+    TEST_ASSERT_TRUE(got.extra);
+    TEST_ASSERT_TRUE(got.fitToKeepTime);
+    TEST_ASSERT_FALSE(got.phoneAttached);
+    TEST_ASSERT_FALSE(got.clockLocked);
+  }
+  // Today's layout leaves the bits as every earlier build did.
+  p.layout = SCHEDULE_LAYOUT;
+  encodePosition(p, wire, sizeof(wire));
+  TEST_ASSERT_EQUAL_UINT8(0, wire[11] & 0xC0);
+  // One that does not fit two bits is refused, not sent as another layout.
+  p.layout = POSITION_LAYOUTS;
+  TEST_ASSERT_EQUAL_UINT32(0, encodePosition(p, wire, sizeof(wire)));
+  TEST_ASSERT_EQUAL_UINT32(105, POSITION_FRAME_MAX);
+}
+
+void test_a_beacon_from_another_layout_does_not_set_the_clock() {
+  // Its slots open elsewhere in the second, so syncing to it would put us a
+  // slot or more out: the clash a talk-time layout (plan 2C) would bring to a
+  // car that missed the switch.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  Schedule s;
+  join(s, 300, r);
+  const uint8_t other = (uint8_t)((SCHEDULE_LAYOUT + 1) % POSITION_LAYOUTS);
+  s.syncTo(10000, 0, 0, other);
+  TEST_ASSERT_FALSE(s.synced());
+
+  s.syncTo(10000, 0, 0, SCHEDULE_LAYOUT);
+  TEST_ASSERT_TRUE(s.synced());
+  const uint32_t opens = slotStartMs(s.slot());
+  TEST_ASSERT_TRUE(s.inSlot(10000 + opens));
+  // Synced, another layout's beacon moves nothing.
+  s.syncTo(10400, 0, 0, other);
+  TEST_ASSERT_TRUE(s.inSlot(10000 + SCHEDULE_MS + opens));
+}
+
 // ---- The simulator ----------------------------------------------------------
 //
 // Millisecond steps. Each car runs the module's beacon logic against its own
@@ -2775,6 +2882,10 @@ int main(int, char**) {
   RUN_TEST(test_a_leased_car_that_goes_quiet_gives_its_slot_up_once);
   RUN_TEST(test_a_loss_formats_for_serial_and_the_phone);
   RUN_TEST(test_the_extra_flag_round_trips);
+  RUN_TEST(test_a_stamp_just_ahead_reads_as_now_and_an_old_one_as_old);
+  RUN_TEST(test_a_beacon_stamped_after_the_pass_began_reads_as_just_heard);
+  RUN_TEST(test_the_layout_rides_in_two_spare_flag_bits);
+  RUN_TEST(test_a_beacon_from_another_layout_does_not_set_the_clock);
   RUN_TEST(test_sim_rates_3_cars);
   RUN_TEST(test_sim_rates_10_cars);
   RUN_TEST(test_sim_rates_25_cars);

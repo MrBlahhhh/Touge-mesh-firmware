@@ -377,6 +377,18 @@ size_t formatQueueStats(const LinkStats& s, char* out, size_t cap);
 size_t formatDropStats(const LinkStats& s, char* out, size_t cap);
 size_t formatRadioStats(const LinkStats& s, char* out, size_t cap);
 
+struct FastRelaySkips;
+
+// The 2.4 GHz relay rule's verdicts on our forwards since boot (fastrelay.h),
+// build 51, as {"fe":{...}} for the phone or "fe sk=.." for serial:
+//   positions: sk skipped, rn no evidence, rs stale, rd needed (as "le" names
+//   them), nr relayed copies whose relayer could not be placed;
+//   voice: vk, vn, vs, vd, vr, the same. A SKIP is counted whether or not
+//   fastRelayDropsForward took it (by frame type and ride size).
+// 0 if it did not fit.
+size_t formatFastRelay(const FastRelaySkips& positions, const FastRelaySkips& voice, bool json, char* out,
+                       size_t cap);
+
 // Why the 2.4 GHz lane is not running, for the report the radio sends every
 // five seconds whether the lane runs or not. A Touge radio always says its
 // build; a stock Meshtastic radio says nothing, which is how the phone tells

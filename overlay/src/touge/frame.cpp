@@ -66,7 +66,8 @@ size_t encodeFrame(const Frame& f, uint8_t* out, size_t cap) {
   put32(out + 6, f.id);
   out[10] = f.hops;
   out[11] = f.chan;
-  put16(out + 12, f.len);
+  out[FRAME_RELAYER_AT] = f.relayer;
+  out[13] = (uint8_t)f.len;
   if (f.len > 0) memcpy(out + FRAME_HEADER, f.payload, f.len);
   return FRAME_HEADER + f.len;
 }
@@ -76,7 +77,7 @@ bool decodeFrame(const uint8_t* in, size_t len, Frame& out) {
   if (in[0] != FRAME_MAGIC) return false;
   if ((in[1] >> 4) != FRAME_VERSION) return false;
 
-  uint16_t plen = get16(in + 12);
+  const uint16_t plen = in[13];
   // The length field is attacker- and noise-controlled, so it is checked
   // against what actually arrived rather than trusted. A corrupted length that
   // overran here would hand the caller a pointer past the buffer.
@@ -87,6 +88,7 @@ bool decodeFrame(const uint8_t* in, size_t len, Frame& out) {
   out.id = get32(in + 6);
   out.hops = in[10];
   out.chan = in[11];
+  out.relayer = in[FRAME_RELAYER_AT];
   out.len = plen;
   out.payload = plen > 0 ? in + FRAME_HEADER : nullptr;
   return true;
@@ -95,6 +97,9 @@ bool decodeFrame(const uint8_t* in, size_t len, Frame& out) {
 size_t encodePosition(const Position& p, uint8_t* out, size_t cap) {
   size_t nameLen = strnlen(p.name, sizeof(p.name));
   if (cap < POSITION_MIN + nameLen) return 0;
+  // Masked to two bits it would name another layout, and a car syncing to it
+  // would be a slot out. Refuse, as encodeFrame does a type too wide.
+  if (p.layout >= POSITION_LAYOUTS) return 0;
 
   put32(out + 0, (uint32_t)p.lat);
   put32(out + 4, (uint32_t)p.lon);
@@ -104,11 +109,11 @@ size_t encodePosition(const Position& p, uint8_t* out, size_t cap) {
   out[9] = p.speedMph;
   out[10] = p.batteryPct;
   // Flags. The high nibble was the slot in version 1; 0x10 marks an extra
-  // beacon since build 32, 0x20 a car fit to keep time since build 40, and
-  // the rest is zero.
+  // beacon since build 32, 0x20 a car fit to keep time since build 40, 0xC0
+  // the layout since build 51, and 0x08 is zero.
   out[11] = (uint8_t)((p.hasFix ? 0x01 : 0) | (p.phoneAttached ? 0x02 : 0) |
                       (p.clockLocked ? 0x04 : 0) | (p.extra ? 0x10 : 0) |
-                      (p.fitToKeepTime ? 0x20 : 0));
+                      (p.fitToKeepTime ? 0x20 : 0) | (p.layout << 6));
   out[12] = p.hop;
   put32(out + 13, p.refId);
   // The hop count in the low nibble, then whether that reference is GPS-locked
@@ -140,6 +145,7 @@ bool decodePosition(const uint8_t* in, size_t len, Position& out) {
   out.clockLocked = (in[11] & 0x04) != 0;
   out.extra = (in[11] & 0x10) != 0;
   out.fitToKeepTime = (in[11] & 0x20) != 0;
+  out.layout = (uint8_t)(in[11] >> 6);
   out.hop = in[12];
   out.refId = get32(in + 13);
   out.refHops = (uint8_t)(in[17] & 0x0F);

@@ -14,6 +14,7 @@
 #include "airtime.h"
 #include "main.h"
 #include "touge/cipher.h"
+#include "touge/forward.h"
 #if !MESHTASTIC_EXCLUDE_GPS
 #include "gps/GPS.h"
 #include "modules/PositionModule.h"
@@ -92,12 +93,6 @@ const uint32_t FAST_PRECEDENCE_MS = 3000;
 // The name rides along every half minute rather than on every ping. Everyone
 // who can hear you has it after one, and after that it is just bytes.
 const uint32_t NAME_EVERY_MS = 30000;
-
-// Two hops. ESP-NOW reaches roughly as far as you can see, so the case this
-// covers is a convoy strung out far enough that the front and back cannot hear
-// each other directly but the middle can hear both. Three would mostly buy
-// duplicate transmissions.
-const uint8_t FAST_HOPS = 2;
 
 // How far ahead of anything already sent the id counter jumps at boot. Large
 // enough that a board would have to send this many packets in one power cycle
@@ -248,7 +243,17 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     goes or stops renewing it for 75 s. A 49 radio hands those frames to its phone, so flash every
 //     radio in earshot before running it. Only sent frames enter the dedupe table, and extras and the
 //     fit vote commit only once sent. The V3 keeps sending its NodeInfo to new nodes below 100.
-const uint32_t TOUGE_BUILD = 50;
+// 51: a flag day, flash every radio together. Frame v5: header byte 12 names the car that relayed a copy, so 50
+//     and 51 radios do not hear each other on 2.4 GHz and meet only on LoRa. Forwards wait from when the frame
+//     arrived (from the pass, after a stall) in whole steps of a pass and the frame's airtime, plus a tie of 0 or 1
+//     step, so a car counts the copies sent a step ahead of it before its own goes. Voice keeps 2 hops and 3
+//     copies like positions: the 2B ride sim found no pair that carries it further without costing positions. A
+//     forward is skipped when every other car's slot maps show it hears the origin or the relayer steadily
+//     (touge/fastrelay.h, ~1 KB of V3 heap): any forward when the origin is the only other car, otherwise only a
+//     position's with 12 or more other cars on the ride. {"fe"} reports the verdicts. Lease beacons are stamped on
+//     their receive time. Every beacon carries its schedule layout (0) and no car syncs to another layout's beacon, but that is
+//     all 51 does with it: a later build that switches layouts is still a flag day.
+const uint32_t TOUGE_BUILD = 51;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -281,8 +286,9 @@ const uint8_t FAST_HOME_INDEX = 0;
 // Was a bare `return 5` at the bottom of runOnce. It is named here because two
 // other things depend on it: a beacon cannot leave its slot any more promptly
 // than this, and that is what bounds how far a clock drifts as it is handed
-// down the convoy.
+// down the convoy. A forward waits in whole passes too (touge/mesh.h).
 const uint32_t TICK_MS = 5;
+static_assert(TICK_MS == FORWARD_PASS_MS, "touge/mesh.h spaces forwards by the pass; keep the two equal");
 
 // The earliest the fast lane may start WiFi after boot. A floor, not the gate:
 // the gate is Bluetooth being up. See bleSettled.
@@ -565,6 +571,7 @@ void TougeFastModule::syncChannel()
     const uint32_t lastIdSent = mesh_.lastId();
     mesh_.reset();
     schedule_.reset();
+    fastRelay_.reset();
     schedule_.rebuild(nodeDB->getNodeNum(), rideClock.locked((uint64_t)esp_timer_get_time()),
                       mesh_.riders(), MAX_RIDERS, millis(), ownFix_.fresh(millis()));
     wantBeacon_ = false;
@@ -846,6 +853,8 @@ void TougeFastModule::fillBeacon(Position &p, uint32_t nowMs)
     p.slot = schedule_.slot();
     p.leaseGen = schedule_.leaseGeneration();
     p.schedGen = schedule_.generation();
+    // Which layout of the second those slots are in, so nobody syncs across two.
+    p.layout = SCHEDULE_LAYOUT;
     schedule_.fillSlotMap(nowMs, p.slotMap);
     // And which channel we think the ride is on. Every car carries this, so a
     // car that missed a hop learns it from whoever it hears next rather than
@@ -1537,7 +1546,7 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
             decodePosition(body, bodyLen, syncBeacon) && !syncBeacon.extra) {
             lastSyncSrc_ = f.src;
             lastSyncId_ = f.id;
-            schedule_.syncTo(rx.rxMs, syncBeacon.slot, SYNC_BIAS_MS);
+            schedule_.syncTo(rx.rxMs, syncBeacon.slot, SYNC_BIAS_MS, syncBeacon.layout);
         }
 
         if (!mesh_.firstSight(f.src, f.id, nowMs)) continue;
@@ -1561,13 +1570,20 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
                 // proof it had succeeded.
                 // An extra beacon is sent with no hops left but comes straight
                 // from its sender, so it counts as direct for the roster.
-                const uint8_t hopsAway = p.extra ? 0 : (uint8_t)(FAST_HOPS - f.hops);
+                const uint8_t hopsAway = p.extra ? 0 : hopsTravelled(f.type, f.hops);
                 mesh_.note(f.src, p, HEARD_FAST, rx.rssi, hopsAway, nowMs, rx.chan);
+                // Every beacon's slot map, direct or relayed, for the relay rule
+                // (touge/fastrelay.h). It ignores extras itself.
+                fastRelay_.heardMap(f.src, p, rx.rxMs);
                 // Lease beacons heard directly only: the slot map says who got
                 // through in which slot, and the link record how well. A forward
                 // says nothing about that, and an extra was not sent in the slot
                 // it names, so counting it could make a clashed lease look heard.
-                if (f.hops == FAST_HOPS && !p.extra) schedule_.heardBeacon(f.src, p, nowMs);
+                // On the receive time, not the pass's: a stalled pass (120 ms on
+                // the tablet's V4) stamped it late, and fastrelay.h's phase margins
+                // had to allow for that. Schedule reads a stamp a little ahead of
+                // its own time as now (stampAgeMs).
+                if (f.hops == FAST_HOPS && !p.extra) schedule_.heardBeacon(f.src, p, rx.rxMs);
                 // A newer belief about the channel wins, wherever it comes
                 // from. Only acted on after the tag has already passed, so a
                 // stranger cannot walk the ride off its channel.
@@ -1627,8 +1643,8 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         if (f.type == FRAME_VOICE && decodeTestVoice(body, bodyLen, testSession, testSeq, sentPhase)) {
             uint32_t phase = 0;
             const uint16_t heardPhase = schedule_.phaseAt(rx.rxMs, phase) ? (uint16_t)phase : TEST_VOICE_NO_PHASE;
-            const uint8_t hopsAway = f.hops < FAST_HOPS ? (uint8_t)(FAST_HOPS - f.hops) : 0;
-            voiceMeter_.heard(f.src, testSession, testSeq, hopsAway, sentPhase, heardPhase, nowMs);
+            voiceMeter_.heard(f.src, testSession, testSeq, hopsTravelled(f.type, f.hops), sentPhase, heardPhase,
+                              nowMs);
         } else {
             inject(f, body, bodyLen, rx.rssi);
         }
@@ -1637,28 +1653,28 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         // keeps the original sender and id so every copy in flight is the same
         // packet; giving it a new id here would defeat dedupe at the next node
         // and turn a convoy into an echo chamber.
-        //
-        // Held, not sent. Every car that heard this frame is about to reach
-        // this line at the same instant, and if they all transmit together the
-        // forward is lost to a collision and helps nobody. Waiting a random
-        // slice also gives the others time to go first, and whoever loses the
-        // race drops their copy instead of adding to the noise.
-        if (f.hops > 0) {
-            Frame fwd = f;
-            fwd.hops = f.hops - 1;
-            fwd.payload = sealed;
-            uint8_t wire[FRAME_MAX];
-            size_t n = encodeFrame(fwd, wire, sizeof(wire));
-            // Weakest hearer first, over a window that widens with the
-            // number of cars in earshot. A flat slice meant the earliest
-            // third of hearers transmitted before a single copy had been
-            // counted, so the suppression below never got a chance to run.
-            if (n > 0) {
-                const uint32_t spread = forwardSpreadMs(fastNeighbours(nowMs));
-                if (!mesh_.defer(wire, n, f.src, f.id, nowMs + forwardDelayMs(rx.rssi, spread, esp_random())))
-                    stats_.forwardsRefused++;
-            }
-        }
+        if (f.hops == 0) continue;
+
+        // Skip or when, in touge/forward.h so the host tests and the ride sim
+        // can run this same decision. Judged before defer, so a skipped frame
+        // never holds one of the V3's three full-size forward slots. firstSight
+        // has already counted the frame, so dedupe and copy counts are the same
+        // either way.
+        const ForwardPlan plan = planForward(f, fastRelay_, nodeId_, mesh_.riders(), MAX_RIDERS, rx.rxMs, nowMs,
+                                             rx.rssi, fastNeighbours(nowMs), esp_random());
+        FastRelaySkips &skips = f.type == FRAME_VOICE ? voiceSkips_ : positionSkips_;
+        skips.note(plan.verdict, plan.relayerUnplaced);
+        if (plan.skip) continue;
+
+        // Held, not sent: every car that heard this frame reaches this line
+        // together, and forwards sent together collide. See forwardDelayMs.
+        Frame fwd = f;
+        fwd.hops = f.hops - 1;
+        fwd.payload = sealed;
+        uint8_t wire[FRAME_MAX];
+        const size_t n = encodeFrame(fwd, wire, sizeof(wire));
+        if (n == 0) continue;
+        if (!mesh_.defer(wire, n, f.src, f.id, plan.dueMs, plan.suppressAfter)) stats_.forwardsRefused++;
     }
 }
 
@@ -2077,6 +2093,8 @@ void TougeFastModule::sendDeferred(uint32_t nowMs)
     // Bounded for the same reason drainRadio is. Everything left behind comes
     // due again five milliseconds from now.
     for (int budget = 0; budget < 4 && mesh_.nextDue(nowMs, f); budget++) {
+        // We are this copy's relayer (touge/forward.h), for fastrelay.h's rule.
+        markRelayer(f.wire, f.len, nodeId_);
         if (fastRadio.send(f.wire, f.len)) {
             stats_.fast.tx++;
             stats_.forwardsSent++;
@@ -2227,7 +2245,7 @@ ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
         stats_.localDropped++;
         return ProcessMessage::STOP;
     }
-    if (transmit(FRAME_VOICE, payload, len, FAST_HOPS)) stats_.voiceSent++;
+    if (transmit(FRAME_VOICE, payload, len, VOICE_HOPS)) stats_.voiceSent++;
     else stats_.voiceRefused++;
     return ProcessMessage::STOP;
 }
@@ -2251,7 +2269,7 @@ void TougeFastModule::sendTestVoice(uint32_t nowMs)
     const uint8_t bytes = testTalker_.bodyBytes > FRAME_MAX_BODY ? (uint8_t)FRAME_MAX_BODY : testTalker_.bodyBytes;
     uint8_t body[FRAME_MAX_BODY];
     const size_t n = encodeTestVoice(testSession_, testSeq_++, phaseMs, bytes, body, sizeof(body));
-    if (n > 0 && transmit(FRAME_VOICE, body, n, FAST_HOPS)) testSent_++;
+    if (n > 0 && transmit(FRAME_VOICE, body, n, VOICE_HOPS)) testSent_++;
     else testRefused_++;
 }
 
@@ -2328,7 +2346,7 @@ PhoneRecord TougeFastModule::phoneRecordFor(const Frame &f, const Position &p, i
     r.rssi = rssi;
     r.external = p.phoneAttached;
     r.lane = LANE_FAST;
-    r.hopsAway = (p.extra || f.hops > FAST_HOPS) ? 0 : (uint8_t)(FAST_HOPS - f.hops);
+    r.hopsAway = p.extra ? 0 : hopsTravelled(f.type, f.hops);
     r.heardMs = millis();
     return r;
 }
@@ -2582,6 +2600,8 @@ void TougeFastModule::reportLinkStats(uint32_t nowMs, uint32_t windowMs)
     if (formatBaseline(stats_, statsAtLastReport_, windowMs, line, sizeof(line)) > 0) {
         LOG_INFO("touge: %s hello=%u", line, (unsigned)helloSeen_);
     }
+    // A line of its own, like the heap: the status line is at Meshtastic's 159.
+    if (formatFastRelay(positionSkips_, voiceSkips_, false, line, sizeof(line)) > 0) LOG_INFO("touge: %s", line);
 
     // Nobody to read them, and 32 unread reports would fill the phone queue.
     if (service->api_state != MeshService::STATE_DISCONNECTED) {
@@ -2590,6 +2610,7 @@ void TougeFastModule::reportLinkStats(uint32_t nowMs, uint32_t windowMs)
         queueJsonToPhone(js, formatQueueStats(stats_, js, sizeof(js)));
         queueJsonToPhone(js, formatDropStats(stats_, js, sizeof(js)));
         queueJsonToPhone(js, formatRadioStats(stats_, js, sizeof(js)));
+        queueJsonToPhone(js, formatFastRelay(positionSkips_, voiceSkips_, true, js, sizeof(js)));
         reportVoiceTest(nowMs);
     }
     statsAtLastReport_ = stats_;

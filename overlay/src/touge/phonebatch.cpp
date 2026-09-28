@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "fastrelay.h"
+#include "kvline.h"
+
 namespace touge {
 namespace {
 
@@ -511,6 +514,22 @@ size_t formatRadioStats(const LinkStats& s, char* out, size_t cap) {
                    (unsigned long)s.sendsDoneFailed, (unsigned)s.txRate, (unsigned)s.rxRate);
   if (n <= 0 || (size_t)n >= cap) return 0;
   return (size_t)n;
+}
+
+size_t formatFastRelay(const FastRelaySkips& positions, const FastRelaySkips& voice, bool json, char* out,
+                       size_t cap) {
+  KvLine line(out, cap, "fe", json);
+  line.add("sk", positions.skipped);
+  line.add("rn", positions.noEvidence);
+  line.add("rs", positions.stale);
+  line.add("rd", positions.needed);
+  line.add("nr", positions.noRelayer);
+  line.add("vk", voice.skipped);
+  line.add("vn", voice.noEvidence);
+  line.add("vs", voice.stale);
+  line.add("vd", voice.needed);
+  line.add("vr", voice.noRelayer);
+  return line.finish();
 }
 
 size_t formatLaneDown(uint32_t build, LaneDown why, char* out, size_t cap) {
