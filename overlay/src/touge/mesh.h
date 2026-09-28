@@ -26,12 +26,12 @@ static const size_t MAX_RIDERS = 28;
 static const size_t PEAK_FRAMES_PER_SEC = 55;
 
 // How long a packet is remembered, which has to outlive every echo of it. A
-// forward waits at most FORWARD_JITTER_MAX_MS a hop (asserted below), so even
-// the lean second is several times the real window. The table must hold the
-// whole window at peak, or eviction silently shortens it (assert below).
-// A Seen is 16 bytes: 1.5 KB roomy, 1 KB lean.
+// forward waits at most FORWARD_DELAY_MAX_MS a hop (asserted below). The table
+// must hold the whole window at peak, or eviction silently shortens it (assert
+// below). A Seen is 16 bytes: 1.5 KB roomy, 1 KB lean.
+static const uint32_t SEEN_TTL_LEAN_MS = 1000;
 #if TOUGE_LEAN_RAM
-static const uint32_t SEEN_TTL_MS = 1000;
+static const uint32_t SEEN_TTL_MS = SEEN_TTL_LEAN_MS;
 static const size_t SEEN_SLOTS = 64;
 #else
 static const uint32_t SEEN_TTL_MS = 1500;
@@ -42,37 +42,27 @@ static_assert(SEEN_SLOTS >= PEAK_FRAMES_PER_SEC * SEEN_TTL_MS / 1000,
               "the dedupe table must be able to hold the window it claims, or "
               "eviction silently shortens it and the TTL means nothing");
 
-// Forwarding a packet the instant it arrives is the wrong thing to do, and it
-// gets worse the more cars are on the ride. Three nodes that all hear one
-// frame rebroadcast in the same microsecond and collide, so nobody downstream
-// gets it. Each forward waits before going out.
+// Forwarding a packet the instant it arrives is the wrong thing to do: every
+// car that heard it transmits together and the copies collide. Each forward
+// waits, and the wait carries information.
 //
-// ## Why the wait is not just noise
-//
-// It used to be a flat random slice of fifteen milliseconds, and the copy
-// suppression underneath it could not do its job. Copies are counted as they
-// arrive, and a forward only arrives after its sender has waited: so in the
-// first few milliseconds after a frame lands, nobody has forwarded it yet,
-// every hearer still counts exactly one copy, and every hearer whose slice
-// expires in that window transmits. With the drain running at five
-// milliseconds that was about a third of them - nine forwards of every frame
-// in a full ride, roughly eight hundred and fifty milliseconds of air per
-// second from positions alone. The suppression was not failing; it was never
-// being consulted in time.
-//
-// Two changes, and the wait carries information instead of noise.
-//
-// Ordered by signal: the car that heard the frame most weakly goes first,
-// because it is the one furthest out and the one whose forward reaches
-// somewhere the original did not. Everyone nearer hears that forward while
-// still holding their own, and drops it. The most useful forwarder is also
-// the earliest, so the frame travels outward rather than in a random order.
-//
-// Spread by density: the window widens with the number of cars in earshot,
-// because density is what broke it. Nine neighbours get ninety milliseconds
-// to sort themselves out instead of fifteen, so the first bucket is a twentieth
-// of them rather than a third. Bounded, because a forward that arrives after
-// the next beacon is worth nothing.
+// A flat random 15 ms left the copy suppression below nothing to count: no
+// forward had arrived before a third of the hearers' waits ran out, so a full
+// ride forwarded every frame about nine times, some 850 ms of air a second from
+// positions alone. So:
+// - Weakest signal first. That car is furthest out, and its forward reaches
+//   somewhere the original did not; everyone nearer hears it and drops theirs.
+// - Wider with more cars in earshot, from FORWARD_JITTER_MS to
+//   FORWARD_JITTER_MAX_MS: nine neighbours get 90 ms instead of 15. Bounded,
+//   since a forward that arrives after the next beacon is worth nothing.
+// - In whole steps of a pass and a frame (forwardStepMs), from build 51. Two
+//   cars whose waits differ by less than that both send before either hears
+//   the other. The tie was 0-3 ms against a 5 ms pass, and every car at -40 dBm
+//   or stronger had the same wait, so three cars on the bench put every voice
+//   frame on the air three times. Now two waits are equal or a step apart, and
+//   a tie of up to FORWARD_TIE_STEPS - 1 steps spreads cars of similar signal:
+//   two equal hearers share a step one time in two. That cuts the bench's
+//   copies only at two copies a frame; voice keeps three (VOICE_SUPPRESS_AFTER).
 static const uint32_t FORWARD_JITTER_MS = 30;
 static const uint32_t FORWARD_JITTER_MAX_MS = 120;
 
@@ -81,13 +71,45 @@ static const uint32_t FORWARD_JITTER_MAX_MS = 120;
 static const int16_t FORWARD_FAR_DBM = -95;
 static const int16_t FORWARD_NEAR_DBM = -40;
 
-// Two cars at the same distance must not transmit together, and nothing about
-// their signal separates them.
-static const uint32_t FORWARD_TIE_MS = 4;
+// How often the module drains the radio and sends what is due: TougeFastModule's
+// TICK_MS, asserted equal there. A forward leaves on a pass, not between them.
+static const uint32_t FORWARD_PASS_MS = 5;
+
+// Steps the tie spreads cars of similar signal over.
+// 2B sim, 192 seeds: 3 cost a clean line's 3-hop positions 0.8 points (SE 0.2; 0.7 on 512 more), 4 cost 1.3;
+// 1 costs a lossy park's 1-hop 0.6-0.8. 2 costs a clean park air instead: 1.8 copies a lease frame and 20 %,
+// against 1.3 and 15 % at 3.
+static const uint32_t FORWARD_TIE_STEPS = 2;
+
+// 802.11 and ESP-NOW framing around our bytes: MAC header 24, category and OUI
+// 4, random 4, vendor element 7, FCS 4.
+static const size_t FAST_FRAME_OVERHEAD = 43;
+// Assumed ESP-NOW long range at 250 kbit/s. Nothing sets a rate (espnow.cpp
+// allows 11b/g/n and LR; "tr" in {"fr"} says what the driver used), and the LR
+// preamble is left out. Plan 1C.8 measures the real figure.
+static const uint32_t FAST_BITS_PER_MS = 250;
+
+// On-air time of a 2.4 GHz frame of `wireLen` bytes, rounded up to a whole ms:
+// 5 for a position, 6 for today's 107 B voice packet, 10 for a full frame.
+constexpr uint32_t fastAirtimeMs(size_t wireLen) {
+  return (uint32_t)(((wireLen + FAST_FRAME_OVERHEAD) * 8 + FAST_BITS_PER_MS - 1) / FAST_BITS_PER_MS);
+}
+
+// How far apart two forwarders' waits must be for the later one to hear the
+// earlier's copy before its own pass: the pass the earlier leaves on, then the
+// airtime, rounded up to whole passes. 10 ms for a position, 15 for voice.
+constexpr uint32_t forwardStepMs(size_t wireLen) {
+  return FORWARD_PASS_MS + (fastAirtimeMs(wireLen) + FORWARD_PASS_MS - 1) / FORWARD_PASS_MS * FORWARD_PASS_MS;
+}
+
+// The longest a forward waits: the widest window, then the last tie step of a
+// full frame. 135 ms.
+static const uint32_t FORWARD_DELAY_MAX_MS =
+    FORWARD_JITTER_MAX_MS + (FORWARD_TIE_STEPS - 1) * forwardStepMs(FRAME_MAX);
 
 static_assert(FORWARD_JITTER_MAX_MS >= FORWARD_JITTER_MS,
               "the ceiling cannot be below the floor");
-static_assert(SEEN_TTL_MS >= 4 * (FORWARD_JITTER_MAX_MS + FORWARD_TIE_MS),
+static_assert(SEEN_TTL_MS >= 4 * FORWARD_DELAY_MAX_MS,
               "a packet must be remembered until well after its last forward could arrive");
 
 // Frames waiting their turn to be forwarded. Twelve is enough that a busy relay
@@ -101,8 +123,8 @@ static const size_t POSITION_FRAME_MAX = FRAME_HEADER + POSITION_MIN + sizeof(Po
 // How many of the slots hold a whole frame; the rest hold a position frame.
 // A full-size slot is 250 bytes and nearly everything forwarded is a position,
 // so a lean board keeps three for voice and text: one talker's frames are 60 ms
-// apart and wait at most FORWARD_JITTER_MAX_MS, so about two are ever held.
-// 1.7 KB of frame storage instead of 3 KB.
+// apart and wait at most FORWARD_DELAY_MAX_MS (135 ms), so three at most are
+// ever held. 1.7 KB of frame storage instead of 3 KB.
 #if TOUGE_LEAN_RAM
 static const size_t FORWARD_FULL_SLOTS = 3;
 #else
@@ -119,8 +141,45 @@ static_assert(FORWARD_SMALL_BYTES < FRAME_MAX, "a small slot that fits everythin
 // Having heard this many copies of a packet, everyone within earshot already
 // has it and adding another transmission helps nobody. In a four-car convoy
 // in line of sight nearly every forward is already redundant; this is what
-// stops them costing anything.
+// stops them costing anything. Positions; voice has its own below.
 static const uint8_t SUPPRESS_AFTER = 3;
+
+// The hops a position leaves with. ESP-NOW reaches roughly as far as you can
+// see, so two covers a convoy strung out far enough that the front and back
+// cannot hear each other but the middle hears both. Three would mostly buy
+// duplicate transmissions.
+static const uint8_t FAST_HOPS = 2;
+
+// Voice (FRAME_VOICE, the test talker's frames included) keeps the positions'
+// hops and copies. The 2B ride sim (plan 2B, Results) found no pair that carries
+// voice further without costing positions somewhere.
+// 2B sim, 192 seeds: 3 hops (2 copies) lift cars 8-16 of a line from 17 to 29 % on time but cost its 2-hop
+// positions 0.8 points at p = 0.4; 1 hop reaches 4 %.
+static const uint8_t VOICE_HOPS = 2;
+// 2B sim, 192 seeds: 2 copies cut a 25-car park from 10.7 to 9.2 copies a voice frame but cost cars 8-16 of
+// a line 1.4 points.
+static const uint8_t VOICE_SUPPRESS_AFTER = 3;
+
+static_assert(SUPPRESS_AFTER >= 2 && VOICE_SUPPRESS_AFTER >= 2,
+              "the copy we heard counts as one, so at 1 every forward would suppress itself");
+static_assert(FAST_HOPS >= 1 && VOICE_HOPS >= 1, "a frame with no hops is never forwarded");
+static_assert(VOICE_HOPS * (FORWARD_DELAY_MAX_MS + FORWARD_PASS_MS + fastAirtimeMs(FRAME_MAX)) < SEEN_TTL_LEAN_MS,
+              "a lean board must still remember a voice frame when its last hop's copy arrives, "
+              "or that copy is new to it and goes round again");
+
+// What a frame of `frameType` leaves with, and the copies after which a held
+// forward of it is dropped.
+inline uint8_t startHopsFor(uint8_t frameType) { return frameType == FRAME_VOICE ? VOICE_HOPS : FAST_HOPS; }
+inline uint8_t suppressAfterFor(uint8_t frameType) {
+  return frameType == FRAME_VOICE ? VOICE_SUPPRESS_AFTER : SUPPRESS_AFTER;
+}
+
+// How many hops a copy has come: 0 straight from its origin. Relayed is above 0,
+// whatever the type starts with.
+inline uint8_t hopsTravelled(uint8_t frameType, uint8_t hops) {
+  const uint8_t start = startHopsFor(frameType);
+  return hops < start ? (uint8_t)(start - hops) : 0;
+}
 
 // A car nobody has heard from in two minutes is stale, not gone. It stays on
 // the roster greyed out, because a car that vanishes off the screen every time
@@ -138,12 +197,16 @@ static const uint32_t RIDER_DROP_MS = 600000;
 uint32_t forwardSpreadMs(size_t neighbours);
 
 /**
- * How long this particular hearer holds this particular frame.
+ * How long this particular hearer holds this particular frame, from when it
+ * arrived.
  *
- * Weakest signal first. [tieBreak] is any random number; only its low few bits
- * are used, to separate cars the signal cannot.
+ * Weakest signal first, in whole forwardStepMs(wireLen) steps. [tieBreak] is
+ * any random number; tieBreak % FORWARD_TIE_STEPS more steps separate cars the
+ * signal cannot. [wireLen] is the frame's length on the wire, which sets the
+ * step.
  */
-uint32_t forwardDelayMs(int16_t rssi, uint32_t spreadMs, uint32_t tieBreak);
+uint32_t forwardDelayMs(int16_t rssi, uint32_t spreadMs, uint32_t tieBreak,
+                        size_t wireLen = POSITION_FRAME_MAX);
 
 /**
  * A deadline on a fixed [periodMs] grid, moved on only once it has passed.
@@ -226,7 +289,10 @@ class Mesh {
   // room, which means the ride is busier than this can keep up with and the
   // frame is dropped rather than delaying the ones already queued. A position
   // takes a small slot while there is one, keeping the full ones for voice.
-  bool defer(const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uint32_t dueMs);
+  // Dropped unsent once [suppressAfter] copies have come past: pass
+  // suppressAfterFor(the frame's type).
+  bool defer(const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uint32_t dueMs,
+             uint8_t suppressAfter = SUPPRESS_AFTER);
 
   // The next held frame whose time has come and which is still worth sending.
   // Frames overtaken by neighbours while they waited are discarded here rather
@@ -288,6 +354,7 @@ class Mesh {
     uint32_t id = 0;
     uint32_t dueMs = 0;
     uint16_t len = 0;
+    uint8_t suppressAfter = SUPPRESS_AFTER;
     bool used = false;
   };
 
@@ -297,7 +364,8 @@ class Mesh {
   // Slots 0 .. FORWARD_FULL_SLOTS-1 are full-size, the rest position-sized.
   static size_t slotCapacity(size_t i);
   uint8_t* slotBytes(size_t i);
-  bool holdIn(size_t i, const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uint32_t dueMs);
+  bool holdIn(size_t i, const uint8_t* wire, size_t len, uint32_t src, uint32_t id, uint32_t dueMs,
+              uint8_t suppressAfter);
 
   Seen seen_[SEEN_SLOTS];
   Rider riders_[MAX_RIDERS];

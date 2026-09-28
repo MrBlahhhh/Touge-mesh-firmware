@@ -6,6 +6,7 @@
 #include <unity.h>
 #include <stdio.h>
 #include <string.h>
+#include "fastrelay.h"
 #include "phonebatch.h"
 
 using namespace touge;
@@ -919,6 +920,44 @@ void test_stats_format_as_the_app_reads_them() {
       buf);
 }
 
+// Build 51's relay verdicts, positions then voice, fit one payload with every
+// counter at its limit, and the serial line fits under Meshtastic's 159.
+void test_the_relay_verdicts_fit_a_payload_at_their_worst() {
+  FastRelaySkips maxed;
+  maxed.skipped = maxed.noEvidence = maxed.stale = maxed.needed = maxed.noRelayer = 0xFFFFFFFFu;
+  char buf[BATCH_MAX_PAYLOAD];
+  const size_t json = formatFastRelay(maxed, maxed, true, buf, sizeof(buf));
+  TEST_ASSERT_TRUE(json > 0);
+  TEST_ASSERT_TRUE(json < BATCH_MAX_PAYLOAD);
+  TEST_ASSERT_EQUAL_UINT32(strlen(buf), json);
+  const size_t serial = formatFastRelay(maxed, maxed, false, buf, sizeof(buf));
+  TEST_ASSERT_TRUE(serial > 0);
+  TEST_ASSERT_TRUE(serial + strlen("touge: ") < 159);
+}
+
+// Named keys, pinned for the app, and the verdicts counted where they belong.
+void test_the_relay_verdicts_format_as_the_app_reads_them() {
+  FastRelaySkips positions;
+  positions.note(FastRelayVerdict::SKIP);
+  positions.note(FastRelayVerdict::NO_EVIDENCE);
+  positions.note(FastRelayVerdict::NO_EVIDENCE);
+  positions.note(FastRelayVerdict::STALE, true);
+  positions.note(FastRelayVerdict::NEEDED);
+  FastRelaySkips voice;
+  voice.skipped = 6;
+  voice.noEvidence = 7;
+  voice.stale = 8;
+  voice.needed = 9;
+  voice.noRelayer = 10;
+  char buf[BATCH_MAX_PAYLOAD];
+  formatFastRelay(positions, voice, true, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING(
+      "{\"fe\":{\"sk\":1,\"rn\":2,\"rs\":1,\"rd\":1,\"nr\":1,\"vk\":6,\"vn\":7,\"vs\":8,\"vd\":9,\"vr\":10}}", buf);
+  formatFastRelay(positions, voice, false, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING("fe sk=1 rn=2 rs=1 rd=1 nr=1 vk=6 vn=7 vs=8 vd=9 vr=10", buf);
+  TEST_ASSERT_EQUAL(0, formatFastRelay(positions, voice, true, buf, 20));
+}
+
 // A Touge radio says its build even with the lane down, and why it is down.
 void test_the_lane_report_goes_out_when_the_lane_is_down() {
   char buf[64];
@@ -1114,6 +1153,8 @@ int main(int, char**) {
   RUN_TEST(test_hello_round_trips_and_refuses_junk);
   RUN_TEST(test_stats_fit_a_payload_at_their_worst);
   RUN_TEST(test_stats_format_as_the_app_reads_them);
+  RUN_TEST(test_the_relay_verdicts_fit_a_payload_at_their_worst);
+  RUN_TEST(test_the_relay_verdicts_format_as_the_app_reads_them);
   RUN_TEST(test_the_lane_report_goes_out_when_the_lane_is_down);
   RUN_TEST(test_ages_are_clamped_and_old_records_expire);
   RUN_TEST(test_baseline_reports_rates_over_the_window);

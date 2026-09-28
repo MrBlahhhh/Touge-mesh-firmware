@@ -20,6 +20,7 @@
 #include "hop.h"
 #include "gnssfix.h"
 #include "ownfix.h"
+#include "voicetest.h"
 
 using namespace touge;
 
@@ -212,6 +213,124 @@ void test_frame_refuses_to_overflow() {
   f.type = FRAME_POSITION;
   f.len = FRAME_MAX_PAYLOAD + 1;
   TEST_ASSERT_EQUAL_UINT32(0, encodeFrame(f, wire, sizeof(wire)));
+}
+
+// ---- The relayer byte (build 51, frame v5) -----------------------------------
+
+void test_the_relayer_rides_in_byte_12_and_the_length_in_byte_13() {
+  const uint8_t body[] = {1, 2, 3, 4, 5};
+  Frame f;
+  f.type = FRAME_VOICE;
+  f.src = 0xDEADBEEF;
+  f.id = 7;
+  f.hops = 1;
+  f.payload = body;
+  f.len = sizeof(body);
+  uint8_t wire[FRAME_MAX];
+
+  // The origin's own copy names nobody.
+  size_t n = encodeFrame(f, wire, sizeof(wire));
+  Frame got;
+  TEST_ASSERT_TRUE(decodeFrame(wire, n, got));
+  TEST_ASSERT_EQUAL_UINT8(0, got.relayer);
+  TEST_ASSERT_EQUAL_UINT8(0, wire[FRAME_RELAYER_AT]);
+
+  f.relayer = 0xA7;
+  n = encodeFrame(f, wire, sizeof(wire));
+  TEST_ASSERT_EQUAL_UINT32(FRAME_HEADER + sizeof(body), n);
+  TEST_ASSERT_EQUAL_UINT8(0xA7, wire[12]);
+  TEST_ASSERT_EQUAL_UINT8(sizeof(body), wire[13]);
+  TEST_ASSERT_TRUE(decodeFrame(wire, n, got));
+  TEST_ASSERT_EQUAL_UINT8(0xA7, got.relayer);
+  TEST_ASSERT_EQUAL_UINT8(1, got.hops);
+  TEST_ASSERT_EQUAL_UINT16(sizeof(body), got.len);
+  TEST_ASSERT_EQUAL_MEMORY(body, got.payload, sizeof(body));
+}
+
+void test_the_longest_payload_still_fits_one_length_byte() {
+  uint8_t body[FRAME_MAX_PAYLOAD];
+  for (size_t i = 0; i < sizeof(body); i++) body[i] = (uint8_t)i;
+  Frame f;
+  f.type = FRAME_VOICE;
+  f.relayer = 0xFF;
+  f.payload = body;
+  f.len = FRAME_MAX_PAYLOAD;
+  uint8_t wire[FRAME_MAX];
+  const size_t n = encodeFrame(f, wire, sizeof(wire));
+  TEST_ASSERT_EQUAL_UINT32(FRAME_MAX, n);
+  TEST_ASSERT_EQUAL_UINT8(236, wire[13]);
+  Frame got;
+  TEST_ASSERT_TRUE(decodeFrame(wire, n, got));
+  TEST_ASSERT_EQUAL_UINT16(236, got.len);
+  TEST_ASSERT_EQUAL_UINT8(0xFF, got.relayer);
+  TEST_ASSERT_EQUAL_MEMORY(body, got.payload, sizeof(body));
+}
+
+void test_a_build_50_frame_and_ours_drop_each_other() {
+  // A flag day. Build 50 read bytes 12-13 as one length, so without the version
+  // it would take every origin's copy and drop every forwarded one, a ride that
+  // half works. Each side drops the other's frames outright instead.
+  const uint8_t body[] = {9, 8, 7};
+  Frame f;
+  f.type = FRAME_POSITION;
+  f.relayer = 0x31;
+  f.payload = body;
+  f.len = sizeof(body);
+  uint8_t wire[FRAME_MAX];
+  const size_t n = encodeFrame(f, wire, sizeof(wire));
+
+  // What build 50 checks: the version nibble is 4 or the frame is dropped.
+  TEST_ASSERT_EQUAL_UINT8(5, wire[1] >> 4);
+  TEST_ASSERT_NOT_EQUAL(4, wire[1] >> 4);
+
+  // A build 50 frame: version 4, a 16-bit length whose high byte is 0.
+  uint8_t old[FRAME_MAX];
+  memcpy(old, wire, n);
+  old[1] = (uint8_t)((4 << 4) | FRAME_POSITION);
+  old[12] = 0;
+  old[13] = sizeof(body);
+  Frame got;
+  TEST_ASSERT_FALSE(decodeFrame(old, n, got));
+}
+
+void test_a_forwarder_rewrites_the_relayer_and_the_tag_still_holds() {
+  // The relayer is outside the tag like hops, so a forwarder names itself
+  // without the key and the sealed payload goes out unchanged.
+  const uint8_t key[PSK_LEN] = {4, 5, 6};
+  const uint8_t cipher[6] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
+  uint8_t sealed[sizeof(cipher) + TAG_LEN];
+  memcpy(sealed, cipher, sizeof(cipher));
+  frameTag(key, PSK_LEN, 0xC0FFEE, 42, FRAME_VOICE, 0x54, cipher, sizeof(cipher), sealed + sizeof(cipher));
+
+  Frame f;
+  f.type = FRAME_VOICE;
+  f.src = 0xC0FFEE;
+  f.id = 42;
+  f.hops = 1;
+  f.chan = 0x54;
+  f.payload = sealed;
+  f.len = sizeof(sealed);
+  uint8_t wire[FRAME_MAX];
+  const size_t n = encodeFrame(f, wire, sizeof(wire));
+
+  // What the module does: re-encode with a hop less, then patch the byte just
+  // before the send, as sendDeferred does.
+  Frame heard;
+  TEST_ASSERT_TRUE(decodeFrame(wire, n, heard));
+  Frame fwd = heard;
+  fwd.hops = (uint8_t)(heard.hops - 1);
+  uint8_t out[FRAME_MAX];
+  const size_t m = encodeFrame(fwd, out, sizeof(out));
+  TEST_ASSERT_EQUAL_UINT32(n, m);
+  out[FRAME_RELAYER_AT] = slotTag(0xBADCAFE);
+
+  Frame got;
+  TEST_ASSERT_TRUE(decodeFrame(out, m, got));
+  TEST_ASSERT_EQUAL_UINT8(slotTag(0xBADCAFE), got.relayer);
+  TEST_ASSERT_EQUAL_UINT8(0, got.hops);
+  uint8_t want[TAG_LEN];
+  frameTag(key, PSK_LEN, got.src, got.id, got.type, got.chan, got.payload, got.len - TAG_LEN, want);
+  TEST_ASSERT_TRUE(tagsMatch(want, got.payload + got.len - TAG_LEN, TAG_LEN));
 }
 
 void test_position_round_trip() {
@@ -686,16 +805,55 @@ void test_a_board_that_cannot_measure_signal_waits_longest() {
 }
 
 void test_two_cars_at_the_same_distance_do_not_transmit_together() {
-  // Identical signal, so nothing about the ordering separates them. A few
-  // milliseconds of noise does.
+  // Identical signal, so nothing about the ordering separates them. The tie
+  // does, a whole step at a time: a pass for the first car to leave on, then
+  // its frame's airtime, so the second has heard it before its own pass.
   const uint32_t spread = 90;
-  bool differed = false;
-  for (uint32_t t = 0; t < FORWARD_TIE_MS; t++)
-    if (forwardDelayMs(-70, spread, t) != forwardDelayMs(-70, spread, 0)) differed = true;
-  TEST_ASSERT_TRUE(differed);
-  // And the noise never grows into the next car's place in the order.
-  TEST_ASSERT_TRUE(forwardDelayMs(-70, spread, FORWARD_TIE_MS - 1) <
+  const uint32_t step = forwardStepMs(POSITION_FRAME_MAX);
+  for (uint32_t t = 1; t < FORWARD_TIE_STEPS; t++)
+    TEST_ASSERT_EQUAL_UINT32(forwardDelayMs(-70, spread, 0) + t * step, forwardDelayMs(-70, spread, t));
+  // Only the low bits count.
+  TEST_ASSERT_EQUAL_UINT32(forwardDelayMs(-70, spread, 1), forwardDelayMs(-70, spread, 1 + FORWARD_TIE_STEPS));
+  // And the tie never grows into the nearest car's place in the order.
+  TEST_ASSERT_TRUE(forwardDelayMs(-70, spread, FORWARD_TIE_STEPS - 1) <
                    forwardDelayMs(FORWARD_NEAR_DBM, spread, 0));
+}
+
+void test_two_hearers_wait_the_same_or_a_whole_step_apart() {
+  // Waits 1-9 ms apart were the bench's three copies of every voice frame:
+  // neither car heard the other's forward before its own pass. Every wait is
+  // now a whole number of steps, so two are equal or a step apart, whatever
+  // the signal, the window or the frame.
+  const size_t lens[] = {FRAME_HEADER + POSITION_MIN + TAG_LEN, POSITION_FRAME_MAX, 129, 225, FRAME_MAX};
+  const uint32_t spreads[] = {FORWARD_JITTER_MS, 60, 90, FORWARD_JITTER_MAX_MS};
+  for (size_t len : lens) {
+    const uint32_t step = forwardStepMs(len);
+    TEST_ASSERT_EQUAL_UINT32(0, step % FORWARD_PASS_MS);
+    for (uint32_t spread : spreads) {
+      for (int16_t rssi = -100; rssi <= 0; rssi++) {
+        for (uint32_t tie = 0; tie < FORWARD_TIE_STEPS; tie++) {
+          const uint32_t wait = forwardDelayMs(rssi, spread, tie, len);
+          TEST_ASSERT_EQUAL_UINT32(0, wait % step);
+          TEST_ASSERT_TRUE(wait <= FORWARD_DELAY_MAX_MS);
+        }
+      }
+    }
+  }
+}
+
+void test_airtime_follows_the_frame_length() {
+  // ESP-NOW long range at 250 kbit/s with 43 B of framing, rounded up; the
+  // rate is assumed until plan 1C.8 measures it.
+  TEST_ASSERT_EQUAL_UINT32(5, fastAirtimeMs(FRAME_HEADER + POSITION_MIN + TAG_LEN)); // a position, 89 B
+  TEST_ASSERT_EQUAL_UINT32(5, fastAirtimeMs(POSITION_FRAME_MAX));                   // with its name, 105 B
+  TEST_ASSERT_EQUAL_UINT32(6, fastAirtimeMs(129));                                  // a voice packet today
+  TEST_ASSERT_EQUAL_UINT32(10, fastAirtimeMs(249));                                 // one with prev
+  TEST_ASSERT_EQUAL_UINT32(10, fastAirtimeMs(FRAME_MAX));
+  // A step is a pass and the airtime, in whole passes.
+  TEST_ASSERT_EQUAL_UINT32(10, forwardStepMs(POSITION_FRAME_MAX));
+  TEST_ASSERT_EQUAL_UINT32(15, forwardStepMs(129));
+  TEST_ASSERT_EQUAL_UINT32(15, forwardStepMs(FRAME_MAX));
+  TEST_ASSERT_EQUAL_UINT32(135, FORWARD_DELAY_MAX_MS);
 }
 
 void test_the_forwarding_window_widens_with_the_neighbourhood() {
@@ -712,9 +870,11 @@ void test_the_forwarding_window_is_bounded() {
   // window stops widening well before a cycle.
   TEST_ASSERT_EQUAL_UINT32(FORWARD_JITTER_MAX_MS, forwardSpreadMs(MAX_RIDERS));
   TEST_ASSERT_TRUE(forwardSpreadMs(MAX_RIDERS) <= FORWARD_JITTER_MAX_MS);
-  // Including the tie-break noise on top of the widest window.
-  TEST_ASSERT_TRUE(forwardDelayMs(FORWARD_NEAR_DBM, forwardSpreadMs(MAX_RIDERS),
-                                  FORWARD_TIE_MS - 1) < 250);
+  // Including the tie on top of the widest window, for the longest frame.
+  const uint32_t longest =
+      forwardDelayMs(FORWARD_NEAR_DBM, forwardSpreadMs(MAX_RIDERS), FORWARD_TIE_STEPS - 1, FRAME_MAX);
+  TEST_ASSERT_EQUAL_UINT32(FORWARD_DELAY_MAX_MS, longest);
+  TEST_ASSERT_TRUE(longest < 250);
 }
 
 void test_an_empty_neighbourhood_still_waits() {
@@ -916,6 +1076,153 @@ void test_forwards_come_back_byte_exact_from_either_kind_of_slot() {
   TEST_ASSERT_EQUAL_UINT16(sizeof(voice), out.len);
   TEST_ASSERT_EQUAL_MEMORY(voice, out.wire, sizeof(voice));
   TEST_ASSERT_FALSE(m.nextDue(30, out));
+}
+
+// ---- Hops and suppression by frame type (build 51) --------------------------
+
+void test_each_frame_type_leaves_with_its_own_hops_and_copy_count() {
+  TEST_ASSERT_EQUAL_UINT8(FAST_HOPS, startHopsFor(FRAME_POSITION));
+  TEST_ASSERT_EQUAL_UINT8(SUPPRESS_AFTER, suppressAfterFor(FRAME_POSITION));
+  TEST_ASSERT_EQUAL_UINT8(VOICE_HOPS, startHopsFor(FRAME_VOICE));
+  TEST_ASSERT_EQUAL_UINT8(VOICE_SUPPRESS_AFTER, suppressAfterFor(FRAME_VOICE));
+  // Positions keep build 50's numbers.
+  TEST_ASSERT_EQUAL_UINT8(2, FAST_HOPS);
+  TEST_ASSERT_EQUAL_UINT8(3, SUPPRESS_AFTER);
+  // How far a copy has come is read against what its own type starts with, so
+  // it holds for voice at one hop or at five.
+  const uint8_t types[] = {FRAME_POSITION, FRAME_VOICE};
+  for (uint8_t type : types) {
+    const uint8_t start = startHopsFor(type);
+    TEST_ASSERT_EQUAL_UINT8(0, hopsTravelled(type, start));
+    for (uint8_t left = 0; left < start; left++) TEST_ASSERT_EQUAL_UINT8(start - left, hopsTravelled(type, left));
+    // More hops than its type starts with is no copy of ours: read as direct.
+    TEST_ASSERT_EQUAL_UINT8(0, hopsTravelled(type, (uint8_t)(start + 1)));
+  }
+}
+
+void test_the_full_forward_slots_hold_every_frame_one_talker_has_waiting() {
+  // A talker's packet every TEST_VOICE_PERIOD_MS, each held up to the longest
+  // wait and a pass: a lean board's three full-size slots must not run out.
+  TEST_ASSERT_TRUE(FORWARD_FULL_SLOTS * TEST_VOICE_PERIOD_MS > FORWARD_DELAY_MAX_MS + FORWARD_PASS_MS);
+}
+
+void test_a_held_forward_is_dropped_at_its_own_copy_count() {
+  Mesh m;
+  m.reset();
+  uint8_t wire[FRAME_HEADER + 8];
+  patternFrame(wire, sizeof(wire), 9);
+  m.firstSight(1, 100, 0);
+  m.firstSight(2, 200, 0);
+  TEST_ASSERT_TRUE(m.defer(wire, sizeof(wire), 1, 100, 10, 2));
+  TEST_ASSERT_TRUE(m.defer(wire, sizeof(wire), 2, 200, 10, 3));
+  // A second copy of each: enough for the one dropped at two, not the other.
+  m.firstSight(1, 100, 5);
+  m.firstSight(2, 200, 5);
+  Forward out;
+  TEST_ASSERT_TRUE(m.nextDue(10, out));
+  TEST_ASSERT_EQUAL_UINT32(2, out.src);
+  TEST_ASSERT_FALSE(m.nextDue(10, out));
+  TEST_ASSERT_EQUAL_UINT32(1, m.suppressed());
+}
+
+// `cars` cars hear one frame at the same signal at 1000 ms, hold it until
+// `suppressAfter` copies, and hear each other's forwards. Each runs a pass every
+// FORWARD_PASS_MS from its own phase, draining first and then sending what is
+// due, as runOnce does. A forward reaches the others its airtime after the pass
+// that sends it, and is counted at their first pass after that. Returns the
+// forwards sent.
+static const size_t HEARERS_MAX = 3;
+static Mesh hearers[HEARERS_MAX];
+
+static int forwardsAmong(size_t cars, uint8_t suppressAfter, size_t wireLen, const uint32_t* ties,
+                         const uint32_t* phasesMs) {
+  const uint32_t src = 0xA1;
+  const uint32_t id = 7;
+  const uint32_t heardAt = 1000;
+  uint8_t wire[FRAME_MAX];
+  patternFrame(wire, wireLen, 5);
+  const uint32_t spread = forwardSpreadMs(cars + 1);
+  for (size_t i = 0; i < cars; i++) {
+    hearers[i].reset();
+    hearers[i].firstSight(src, id, heardAt);
+    const uint32_t due = heardAt + forwardDelayMs(-60, spread, ties[i], wireLen);
+    TEST_ASSERT_TRUE(hearers[i].defer(wire, wireLen, src, id, due, suppressAfter));
+  }
+  // When car i's forward reaches car j, 0 until it is sent; and whether j has counted it.
+  uint32_t reachesAt[HEARERS_MAX][HEARERS_MAX] = {};
+  bool counted[HEARERS_MAX][HEARERS_MAX] = {};
+  int sent = 0;
+  for (uint32_t t = heardAt; t < heardAt + 2 * FORWARD_DELAY_MAX_MS; t++) {
+    for (size_t j = 0; j < cars; j++) {
+      if ((t - phasesMs[j]) % FORWARD_PASS_MS != 0) continue;
+      // Strictly before the pass: a copy landing on the pass's own ms may miss its drain.
+      for (size_t i = 0; i < cars; i++) {
+        if (reachesAt[i][j] == 0 || counted[i][j] || reachesAt[i][j] >= t) continue;
+        hearers[j].firstSight(src, id, t);
+        counted[i][j] = true;
+      }
+      Forward out;
+      while (hearers[j].nextDue(t, out)) {
+        sent++;
+        for (size_t k = 0; k < cars; k++)
+          if (k != j) reachesAt[j][k] = t + fastAirtimeMs(wireLen);
+      }
+    }
+  }
+  return sent;
+}
+
+void test_two_equal_hearers_make_one_voice_forward_at_two_copies() {
+  // The bench's case: two cars of equal signal hear a talker. Whichever tie
+  // comes first forwards; the other hears that copy before its own pass and,
+  // held to two copies, drops its own, whatever the pass phases. The same tie,
+  // one draw in FORWARD_TIE_STEPS, still sends both. Two copies, not
+  // VOICE_SUPPRESS_AFTER: the step spacing is what is under test, and the 2B
+  // ride sim kept voice at three.
+  const size_t voiceLen = 129;
+  for (uint32_t a = 0; a < FORWARD_TIE_STEPS; a++) {
+    for (uint32_t b = 0; b < FORWARD_TIE_STEPS; b++) {
+      for (uint32_t pa = 0; pa < FORWARD_PASS_MS; pa++) {
+        for (uint32_t pb = 0; pb < FORWARD_PASS_MS; pb++) {
+          const uint32_t ties[] = {a, b};
+          const uint32_t phases[] = {pa, pb};
+          char at[64];
+          snprintf(at, sizeof(at), "ties %u %u, passes at +%u +%u", (unsigned)a, (unsigned)b, (unsigned)pa,
+                   (unsigned)pb);
+          TEST_ASSERT_EQUAL_INT_MESSAGE(a == b ? 2 : 1, forwardsAmong(2, 2, voiceLen, ties, phases), at);
+        }
+      }
+    }
+  }
+}
+
+void test_three_equal_hearers_forward_unless_two_drew_an_earlier_step() {
+  // Positions are dropped at SUPPRESS_AFTER (3) copies, so of three cars of
+  // equal signal one forwards unless two others drew an earlier step, whatever
+  // the pass phases. Two on one step and one behind make two forwards, as three
+  // steps do; one ahead of two makes three.
+  const size_t posLen = FRAME_HEADER + POSITION_MIN + TAG_LEN;
+  for (uint32_t a = 0; a < FORWARD_TIE_STEPS; a++) {
+    for (uint32_t b = 0; b < FORWARD_TIE_STEPS; b++) {
+      for (uint32_t c = 0; c < FORWARD_TIE_STEPS; c++) {
+        const uint32_t ties[] = {a, b, c};
+        int want = 0;
+        for (uint32_t mine : ties) {
+          int ahead = 0;
+          for (uint32_t other : ties) ahead += other < mine;
+          want += ahead < SUPPRESS_AFTER - 1;
+        }
+        for (uint32_t pa = 0; pa < FORWARD_PASS_MS; pa++) {
+          for (uint32_t pb = 0; pb < FORWARD_PASS_MS; pb++) {
+            for (uint32_t pc = 0; pc < FORWARD_PASS_MS; pc++) {
+              const uint32_t phases[] = {pa, pb, pc};
+              TEST_ASSERT_EQUAL_INT(want, forwardsAmong(3, SUPPRESS_AFTER, posLen, ties, phases));
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 void test_dedupe_holds_its_whole_window_at_peak_traffic() {
@@ -1442,6 +1749,10 @@ int main(int, char**) {
   RUN_TEST(test_frame_round_trip);
   RUN_TEST(test_frame_rejects_junk);
   RUN_TEST(test_frame_refuses_to_overflow);
+  RUN_TEST(test_the_relayer_rides_in_byte_12_and_the_length_in_byte_13);
+  RUN_TEST(test_the_longest_payload_still_fits_one_length_byte);
+  RUN_TEST(test_a_build_50_frame_and_ours_drop_each_other);
+  RUN_TEST(test_a_forwarder_rewrites_the_relayer_and_the_tag_still_holds);
   RUN_TEST(test_position_round_trip);
   RUN_TEST(test_position_heading_quantises_to_two_degrees);
   RUN_TEST(test_position_truncates_a_long_name);
@@ -1472,6 +1783,8 @@ int main(int, char**) {
   RUN_TEST(test_signal_beyond_the_ends_of_the_range_is_clamped);
   RUN_TEST(test_a_board_that_cannot_measure_signal_waits_longest);
   RUN_TEST(test_two_cars_at_the_same_distance_do_not_transmit_together);
+  RUN_TEST(test_two_hearers_wait_the_same_or_a_whole_step_apart);
+  RUN_TEST(test_airtime_follows_the_frame_length);
   RUN_TEST(test_the_forwarding_window_widens_with_the_neighbourhood);
   RUN_TEST(test_the_forwarding_window_is_bounded);
   RUN_TEST(test_an_empty_neighbourhood_still_waits);
@@ -1487,6 +1800,11 @@ int main(int, char**) {
   RUN_TEST(test_positions_fill_small_slots_before_borrowing_full_ones);
   RUN_TEST(test_a_whole_frame_is_never_squeezed_into_a_small_slot);
   RUN_TEST(test_forwards_come_back_byte_exact_from_either_kind_of_slot);
+  RUN_TEST(test_each_frame_type_leaves_with_its_own_hops_and_copy_count);
+  RUN_TEST(test_the_full_forward_slots_hold_every_frame_one_talker_has_waiting);
+  RUN_TEST(test_a_held_forward_is_dropped_at_its_own_copy_count);
+  RUN_TEST(test_two_equal_hearers_make_one_voice_forward_at_two_copies);
+  RUN_TEST(test_three_equal_hearers_forward_unless_two_drew_an_earlier_step);
   RUN_TEST(test_dedupe_holds_its_whole_window_at_peak_traffic);
   RUN_TEST(test_mesh_tables_stay_inside_their_budget);
   RUN_TEST(test_distance_is_close_enough_to_be_a_gate);

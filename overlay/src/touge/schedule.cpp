@@ -498,7 +498,7 @@ void Schedule::heardBeacon(uint32_t senderId, const Position& p, uint32_t nowMs)
   if (s >= MAX_SLOTS) return;
   const uint8_t tag = slotTag(senderId);
   // Whole beacons since the last one in this slot, so the gaps are misses.
-  const uint32_t beacons = (nowMs - slotHeardMs_[s] + SCHEDULE_MS / 2) / SCHEDULE_MS;
+  const uint32_t beacons = (stampAgeMs(slotHeardMs_[s], nowMs) + SCHEDULE_MS / 2) / SCHEDULE_MS;
   if (slotHeardTag_[s] != tag || beacons >= LINK_SECONDS) {
     slotSeen_[s] = 0;
     slotMutual_[s] = 0;
@@ -516,7 +516,7 @@ void Schedule::updateFitness(uint32_t nowMs) {
   uint8_t heard = 0;
   uint8_t solid = 0;
   for (uint8_t s = 0; s < MAX_SLOTS; s++) {
-    const uint32_t sinceMs = nowMs - slotHeardMs_[s];
+    const uint32_t sinceMs = stampAgeMs(slotHeardMs_[s], nowMs);
     // A car heard at least twice in the window. One that has just left still
     // counts for a few seconds, against us, which errs the safe way.
     const int seen = __builtin_popcount(upToNow(slotSeen_[s], sinceMs));
@@ -550,7 +550,7 @@ bool Schedule::hearingPoorly(uint32_t nowMs) const {
   uint32_t heard = 0;
   uint32_t due = 0;
   for (uint8_t s = 0; s < MAX_SLOTS; s++) {
-    const uint16_t seen = upToNow(slotSeen_[s], nowMs - slotHeardMs_[s]);
+    const uint16_t seen = upToNow(slotSeen_[s], stampAgeMs(slotHeardMs_[s], nowMs));
     // One beacon says nothing about the ones in between, and a slot silent for
     // eight seconds has been left, which says nothing about our hearing. Three,
     // until build 44: a car heard one beacon in four goes three seconds silent
@@ -565,7 +565,7 @@ bool Schedule::hearingPoorly(uint32_t nowMs) const {
 
 bool Schedule::hearsPoorly(uint8_t slot, uint32_t id, uint32_t nowMs) const {
   if (slot >= MAX_SLOTS || slotHeardTag_[slot] != slotTag(id)) return false;
-  return poorRecord(upToNow(slotSeen_[slot], nowMs - slotHeardMs_[slot]));
+  return poorRecord(upToNow(slotSeen_[slot], stampAgeMs(slotHeardMs_[slot], nowMs)));
 }
 
 void Schedule::noteLoss(uint8_t why, uint32_t nowMs, uint8_t hearUs, uint8_t hearOther,
@@ -601,7 +601,7 @@ void Schedule::listenAgain(uint32_t nowMs) {
 
 void Schedule::fillSlotMap(uint32_t nowMs, uint8_t map[SLOT_MAP_LEN]) const {
   for (uint8_t s = 0; s < MAX_SLOTS; s++) {
-    const bool fresh = (uint32_t)(nowMs - slotHeardMs_[s]) < HEARD_WINDOW_MS;
+    const bool fresh = stampAgeMs(slotHeardMs_[s], nowMs) < HEARD_WINDOW_MS;
     map[s] = fresh ? slotHeardTag_[s] : 0;
   }
 }
@@ -614,10 +614,12 @@ bool Schedule::takesClockFrom(uint32_t src) const {
   return src == (parentId_ != 0 ? parentId_ : referenceId_);
 }
 
-void Schedule::syncTo(uint32_t heardAtMs, uint8_t senderSlot, uint32_t senderLateMs) {
+void Schedule::syncTo(uint32_t heardAtMs, uint8_t senderSlot, uint32_t senderLateMs,
+                      uint8_t senderLayout) {
   // A beacon sent in the shared window marks no particular point in the
-  // second, so it cannot set the clock.
-  if (senderSlot >= MAX_SLOTS) return;
+  // second, so it cannot set the clock. Nor can one sent under another layout,
+  // whose slot opens at another point.
+  if (senderSlot >= MAX_SLOTS || senderLayout != SCHEDULE_LAYOUT) return;
   epochMs_ = heardAtMs - senderLateMs - slotStartMs(senderSlot);
   haveEpoch_ = true;
 }

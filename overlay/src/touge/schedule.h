@@ -117,9 +117,9 @@ static const uint8_t MAX_SLOTS = BLOCKS * SLOTS_PER_BLOCK;
 static const uint32_t SHARED_OFFSET_MS = SLOTS_PER_BLOCK * SLOT_MS;
 static const uint32_t SHARED_MS = BLOCK_MS - SHARED_OFFSET_MS;
 
-// Roughly how long a full frame takes on the air: 250 bytes at ESP-NOW LR's
-// 250 kbps. Unmeasured (see firmware/docs/REDESIGN-30-CARS.md); a position
-// frame is nearer 120 bytes with the 802.11 overhead, about 4 ms.
+// What a slot allows for its frame on the air. Slots carry positions only, 5 ms
+// at most by fastAirtimeMs (mesh.h), which leaves 3 ms for the preamble and a
+// rate it assumes. Unmeasured (plan 1C.8).
 static const uint32_t FRAME_AIRTIME_MS = 8;
 
 // Room a frame needs in front of it before it may start. Holding a slot is
@@ -137,6 +137,8 @@ static_assert(SLOT_MS >= 3 * FRAME_AIRTIME_MS,
 static_assert(SHARED_MS >= 3 * FRAME_AIRTIME_MS,
               "the shared window has to fit more than one joiner");
 static_assert(SLOT_GUARD_MS >= FRAME_AIRTIME_MS, "the guard has to cover a whole frame");
+static_assert(fastAirtimeMs(POSITION_FRAME_MAX) <= FRAME_AIRTIME_MS,
+              "the longest position, name and all, has to fit what the slot allows");
 static_assert(SHARED_SPREAD_MS + SLOT_GUARD_MS < SHARED_MS,
               "the latest spread start still has to finish inside the window");
 static_assert(MAX_SLOTS >= 25, "the target is a 25-car ride with a slot each");
@@ -150,6 +152,27 @@ static_assert(MAX_SLOTS == SLOT_MAP_LEN, "Position::slotMap has one entry per sl
 static const uint32_t HEARD_WINDOW_MS = SCHEDULE_MS + SCHEDULE_MS / 2;
 static_assert(DIRECT_HOLD_MS == HEARD_WINDOW_MS,
               "a car stays direct for as long as its slot map is trusted");
+
+// How long ago `stampMs` was, for a stamp taken on a frame's receive time and
+// read on a pass's. The receive callback runs on the Wi-Fi task, so a frame can
+// be stamped a few ms after the pass that drains it began: a stamp under a
+// second ahead reads as now, where unsigned it read as 49 days ago. Not signed:
+// then a slot last heard 25 days ago would read as just heard.
+inline uint32_t stampAgeMs(uint32_t stampMs, uint32_t nowMs) {
+  const uint32_t age = nowMs - stampMs;
+  return age > 0u - SCHEDULE_MS ? 0 : age;
+}
+
+// The layout of the second above: 32 slots of 27 ms in four blocks, each with
+// a shared window. Every beacon carries its sender's (Position::layout), and
+// syncTo refuses a beacon sent under another, since slotStartMs and so the
+// epoch depend on it. That is all build 51 does with the id: everything else
+// reads another layout's slot as one of these, and a 51 radio keeps beaconing
+// on this layout. A build that switches the ride to another layout (voice
+// windows, plan 2C) still needs every radio on it, by a flag day or a
+// FRAME_VERSION bump.
+static const uint8_t SCHEDULE_LAYOUT = 0;
+static_assert(SCHEDULE_LAYOUT < POSITION_LAYOUTS, "a position has to be able to carry the layout");
 
 /**
  * How long an established lease rides out a clash before moving.
@@ -347,7 +370,9 @@ class Schedule {
   /**
    * A lease beacon arrived straight from `senderId` (not forwarded, not an
    * extra). Feeds the slot map and the per-slot record of how well we hear
-   * that car and whether its map shows us.
+   * that car and whether its map shows us. `nowMs` is when it arrived, which
+   * may be a little after the time the next rebuild or fillSlotMap is given
+   * (stampAgeMs).
    */
   void heardBeacon(uint32_t senderId, const Position& p, uint32_t nowMs);
 
@@ -432,8 +457,12 @@ class Schedule {
    *   put us a slot out for a second. Ignored if it is not a leased slot.
    * @param senderLateMs how far into its slot the sender is expected to have
    *   transmitted, which is half a module tick on average.
+   * @param senderLayout the layout the beacon was sent under
+   *   (Position::layout). Ignored unless it is ours, SCHEDULE_LAYOUT: another
+   *   layout's slots open elsewhere in the second.
    */
-  void syncTo(uint32_t heardAtMs, uint8_t senderSlot, uint32_t senderLateMs = 0);
+  void syncTo(uint32_t heardAtMs, uint8_t senderSlot, uint32_t senderLateMs = 0,
+              uint8_t senderLayout = SCHEDULE_LAYOUT);
 
   /**
    * Declare the schedule ourselves. Only for the reference with no epoch yet:
