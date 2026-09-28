@@ -560,6 +560,26 @@ void test_roster_updates_in_place() {
   TEST_ASSERT_EQUAL_INT16(-110, r->rssi);
 }
 
+void test_a_forward_that_beats_a_lost_direct_copy_keeps_the_car_direct() {
+  // Review B7: the direct copy lost, a neighbour's forward got through first.
+  Mesh m;
+  m.reset();
+  m.note(7, posNamed("jackie"), HEARD_FAST, -55, 0, 1000, 11);
+  m.note(7, posNamed("jackie"), HEARD_FAST, -70, 1, 2000, 11);
+  TEST_ASSERT_EQUAL_UINT8(0, m.find(7)->hopsAway);
+  TEST_ASSERT_EQUAL_INT16(-55, m.find(7)->rssi);
+  TEST_ASSERT_EQUAL_UINT32(2000, m.find(7)->atMs);
+
+  // No direct copy for a whole map window: it really is a hop away now.
+  m.note(7, posNamed("jackie"), HEARD_FAST, -70, 1, 1000 + DIRECT_HOLD_MS, 11);
+  TEST_ASSERT_EQUAL_UINT8(1, m.find(7)->hopsAway);
+  TEST_ASSERT_EQUAL_INT16(-70, m.find(7)->rssi);
+
+  // A new car first heard through a forward is a hop away from the start.
+  m.note(9, posNamed("sam"), HEARD_FAST, -60, 1, 3000, 11);
+  TEST_ASSERT_EQUAL_UINT8(1, m.find(9)->hopsAway);
+}
+
 void test_roster_keeps_a_name_between_name_pings() {
   // The name rides along only now and then, because forty characters on every
   // ping is pure airtime. An unnamed ping must not blank the roster entry.
@@ -914,11 +934,12 @@ void test_mesh_tables_stay_inside_their_budget() {
   // Build 36 ran a V3 out of internal RAM. The roster, dedupe table and held
   // forwards together, pinned so growing them is a decision and not drift.
   // Build 38's fix identity: 12 bytes a rider, 12 a position forward slot,
-  // 5500 to 5944 bytes lean and 7424 to 7760 roomy.
+  // 5500 to 5944 bytes lean and 7424 to 7760 roomy. Build 50's direct hold
+  // (review B7): 4 bytes a rider, 112 in all.
 #if TOUGE_LEAN_RAM
-  TEST_ASSERT_TRUE(sizeof(Mesh) <= 5950);
+  TEST_ASSERT_TRUE(sizeof(Mesh) <= 6062);
 #else
-  TEST_ASSERT_TRUE(sizeof(Mesh) <= 7800);
+  TEST_ASSERT_TRUE(sizeof(Mesh) <= 7912);
 #endif
   TEST_ASSERT_EQUAL(12, sizeof(FixId));
   // Still a whole ride, lean or not.
@@ -1441,6 +1462,7 @@ int main(int, char**) {
   RUN_TEST(test_dedupe_forgets_after_the_window);
   RUN_TEST(test_dedupe_survives_more_traffic_than_it_has_slots);
   RUN_TEST(test_roster_updates_in_place);
+  RUN_TEST(test_a_forward_that_beats_a_lost_direct_copy_keeps_the_car_direct);
   RUN_TEST(test_roster_keeps_a_name_between_name_pings);
   RUN_TEST(test_roster_will_not_bump_a_car_you_are_driving_behind);
   RUN_TEST(test_roster_drops_only_after_a_very_long_silence);

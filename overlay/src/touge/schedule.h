@@ -148,6 +148,8 @@ static_assert(MAX_SLOTS == SLOT_MAP_LEN, "Position::slotMap has one entry per sl
 // How far back a car's slot map reaches. Every holder transmits once a
 // second, so a second and a half always spans at least one of its beacons.
 static const uint32_t HEARD_WINDOW_MS = SCHEDULE_MS + SCHEDULE_MS / 2;
+static_assert(DIRECT_HOLD_MS == HEARD_WINDOW_MS,
+              "a car stays direct for as long as its slot map is trusted");
 
 /**
  * How long an established lease rides out a clash before moving.
@@ -414,13 +416,11 @@ class Schedule {
   bool fitToKeepTime() const { return fit_; }
 
   /**
-   * The same, for a beacon about to go out. Our own vote ranks us on what we
-   * last put on the air, which is what every other car ranks us on.
+   * What a lease beacon that went on the air said about fitToKeepTime. Our own
+   * vote ranks us on that, which is what every other car ranks us on; a
+   * refused send changes nothing.
    */
-  bool announceFit() {
-    announcedFit_ = fit_;
-    return fit_;
-  }
+  void announceFit(bool fit) { announcedFit_ = fit; }
   // The reference's, as we know it: ours, or what it or a neighbour advertised.
   bool referenceFit() const { return referenceFit_; }
 
@@ -443,6 +443,28 @@ class Schedule {
    */
   void startEpoch(uint32_t nowMs);
   bool synced() const { return haveEpoch_; }
+
+  /**
+   * Pin the beacon clock to a GPS pulse's phase (review B6). A locked car sends
+   * on the pulse but the epoch it falls back to when PPS goes stale was never
+   * lined up with it: declared at boot or copied from a beacon, then drifting
+   * on the crystal. Called on every pass that reads the pulse.
+   */
+  void setPhase(uint32_t nowMs, uint32_t phaseMs) {
+    epochMs_ = nowMs - phaseMs % SCHEDULE_MS;
+    haveEpoch_ = true;
+  }
+
+  // Where [nowMs] falls in the ride's second on the beacon-recovered clock.
+  // False without an epoch. The test talker's delay reading uses it. Signed:
+  // a frame queued before setPhase moved the epoch is read before it, and an
+  // unsigned wrap is not a multiple of 1000 (1 ms before read as 295).
+  bool phaseAt(uint32_t nowMs, uint32_t& phaseMs) const {
+    if (!haveEpoch_) return false;
+    const int32_t sinceEpoch = (int32_t)(nowMs - epochMs_) % (int32_t)SCHEDULE_MS;
+    phaseMs = (uint32_t)(sinceEpoch < 0 ? sinceEpoch + (int32_t)SCHEDULE_MS : sinceEpoch);
+    return true;
+  }
 
   /**
    * Whether we may start a frame now, on the beacon-recovered clock.

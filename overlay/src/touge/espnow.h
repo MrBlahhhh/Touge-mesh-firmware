@@ -48,6 +48,9 @@ struct FastRx {
   // just before a hop were being filed under the channel the ride had moved
   // to, which is then counted as evidence that cars are already there.
   uint8_t chan = 0;
+  // rx_ctrl sig_mode (high byte) and rate (low byte), 0xFFFF on cores without
+  // them. Carried with the frame so only an authenticated frame of ours is reported.
+  uint16_t rate = 0xFFFF;
 };
 
 class FastRadio {
@@ -119,6 +122,12 @@ class FastRadio {
 
   /** The last error the driver gave, for the status line. */
   int lastSendError() const;
+
+  // From the send callback: frames that left, frames the driver reported failed
+  // after accepting them, and the wifi_phy_rate_t it last used (0xFF: none yet).
+  uint32_t sendsDone() const;
+  uint32_t sendsDoneFailed() const;
+  uint8_t lastTxRate() const;
 
  private:
   bool ready_ = false;

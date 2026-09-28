@@ -500,6 +500,19 @@ size_t formatDropStats(const LinkStats& s, char* out, size_t cap) {
   return (size_t)n;
 }
 
+size_t formatRadioStats(const LinkStats& s, char* out, size_t cap) {
+  if (out == nullptr || cap == 0) return 0;
+  int n = snprintf(out, cap,
+                   "{\"fr\":{\"fw\":%lu,\"fx\":%lu,\"lx\":%lu,\"vs\":%lu,\"vx\":%lu,\"ld\":%lu,\"sd\":%lu,"
+                   "\"sx\":%lu,\"tr\":%u,\"rr\":%u}}",
+                   (unsigned long)s.forwardsSent, (unsigned long)s.forwardsRefused,
+                   (unsigned long)s.leaseRefused, (unsigned long)s.voiceSent, (unsigned long)s.voiceRefused,
+                   (unsigned long)s.localDropped, (unsigned long)s.sendsDone,
+                   (unsigned long)s.sendsDoneFailed, (unsigned)s.txRate, (unsigned)s.rxRate);
+  if (n <= 0 || (size_t)n >= cap) return 0;
+  return (size_t)n;
+}
+
 size_t formatLaneDown(uint32_t build, LaneDown why, char* out, size_t cap) {
   if (out == nullptr || cap == 0) return 0;
   const char* reason = why == LaneDown::STARTING ? "boot" : why == LaneDown::NO_KEY ? "key" : "radio";

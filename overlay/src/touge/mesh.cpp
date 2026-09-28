@@ -210,12 +210,15 @@ Rider* Mesh::note(uint32_t src, const Position& p, uint8_t via, int16_t rssi, ui
   if (slot == nullptr) {
     // Full. Give the seat to the newcomer only if someone on it has gone
     // properly quiet, so a ninth car cannot bump a car you are driving behind.
-    uint32_t worstAt = nowMs;
+    // The oldest by age, not by stamp: a seat last heard before the millis()
+    // wrap is numerically ahead of nowMs and could never be picked.
+    uint32_t worstAge = 0;
     Rider* worst = nullptr;
     for (size_t i = 0; i < MAX_RIDERS; i++) {
-      if (riders_[i].used && (uint32_t)(nowMs - riders_[i].atMs) > RIDER_STALE_MS &&
-          riders_[i].atMs <= worstAt) {
-        worstAt = riders_[i].atMs;
+      if (!riders_[i].used) continue;
+      const uint32_t age = riderAgeMs(riders_[i], nowMs);
+      if (age > RIDER_STALE_MS && age >= worstAge) {
+        worstAge = age;
         worst = &riders_[i];
       }
     }
@@ -229,13 +232,22 @@ Rider* Mesh::note(uint32_t src, const Position& p, uint8_t via, int16_t rssi, ui
   char keep[sizeof(slot->pos.name)];
   memcpy(keep, slot->pos.name, sizeof(keep));
 
+  // A forward that beat a lost direct copy. The car is still in earshot, and
+  // the forwarder's signal says nothing about it, so keep hops and RSSI.
+  const bool heldDirect = hopsAway > 0 && via == HEARD_FAST && slot->used && slot->id == src &&
+                          slot->via == HEARD_FAST && slot->hopsAway == 0 &&
+                          (uint32_t)(nowMs - slot->directMs) < DIRECT_HOLD_MS;
+
   slot->id = src;
   slot->pos = p;
   if (p.name[0] == 0) memcpy(slot->pos.name, keep, sizeof(keep));
   slot->atMs = nowMs;
   slot->via = via;
-  slot->rssi = rssi;
-  slot->hopsAway = hopsAway;
+  if (!heldDirect) {
+    slot->rssi = rssi;
+    slot->hopsAway = hopsAway;
+  }
+  if (via == HEARD_FAST && hopsAway == 0) slot->directMs = nowMs;
   slot->chan = chan;
   slot->used = true;
   return slot;
