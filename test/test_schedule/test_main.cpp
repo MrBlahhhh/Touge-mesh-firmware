@@ -1389,6 +1389,30 @@ void test_a_lease_left_alone_says_so() {
   TEST_ASSERT_EQUAL_UINT32(1, s.losses());
 }
 
+void test_a_gps_locked_car_keeps_its_beacon_clock_on_the_pulse() {
+  // Review B6: a locked car's fallback clock was whatever it last copied, so
+  // the ride jumped when PPS went stale. Pinned to the pulse, the beacon clock
+  // puts the car in its slot at the same moment the pulse does.
+  Rider r[ROSTER] = {};
+  addLeased(r, 0, 100, 0, 1);
+  Schedule s;
+  const uint32_t now = join(s, 300, r, true);
+  TEST_ASSERT_TRUE(s.claimed());
+  s.syncTo(now - 377, 0); // an old epoch, 377 ms off the true second
+  const uint32_t truePhase = slotStartMs(s.slot()) + 2;
+  s.setPhase(now, truePhase);
+  TEST_ASSERT_TRUE(s.inSlotAtPhase(truePhase));
+  TEST_ASSERT_TRUE(s.inSlot(now));
+  uint32_t phase = 0;
+  TEST_ASSERT_TRUE(s.phaseAt(now + 1000, phase));
+  TEST_ASSERT_EQUAL_UINT32(truePhase, phase);
+  // A frame received just before the epoch was moved reads as the end of the
+  // second before, not wherever an unsigned wrap lands.
+  s.setPhase(now, 0);
+  TEST_ASSERT_TRUE(s.phaseAt(now - 1, phase));
+  TEST_ASSERT_EQUAL_UINT32(999, phase);
+}
+
 void test_a_claim_judged_a_millisecond_before_it_was_made_stands() {
   // Build 48 took a lease on a fresh millis() after a frame, then judged it on
   // the pass's earlier time: the age wrapped and the lease went as unheard.
@@ -1565,6 +1589,9 @@ struct Car {
   uint32_t sent = 0;
   uint32_t slotChanges = 0;
   uint8_t lastSlot = SLOT_NONE;
+  // Times the car it takes its clock from changed, since mark().
+  uint32_t parentChanges = 0;
+  uint32_t lastParent = 0;
   // How often the phone hands the radio a new fix. An extra beacon only goes
   // out when there is one it has not sent.
   uint32_t fixEveryMs = 250;
@@ -1595,6 +1622,8 @@ struct World {
   uint32_t lastUnsettled = 0;
   // Print every leased-slot collision, for chasing one down by hand.
   bool verbose = false;
+  // Mesh::note's direct hold (review B7); false is the roster before build 50.
+  bool holdDirect = true;
   // Direct receptions of each sender's frames since mark(), summed over all
   // receivers. And the age of each fix the first time a receiver hears it,
   // which is what a faster rate is for: repeats of an old fix do not count.
@@ -1679,10 +1708,15 @@ struct World {
           seat = &c.roster[k];
       if (seat == nullptr) return;
     }
+    // As Mesh::note: a forward that beat a lost direct copy keeps the car
+    // direct for DIRECT_HOLD_MS (review B7). holdDirect off is the old roster.
+    const bool heldDirect = holdDirect && hopsAway > 0 && seat->used && seat->id == src &&
+                            seat->hopsAway == 0 && (uint32_t)(at - seat->directMs) < DIRECT_HOLD_MS;
     seat->id = src;
     seat->pos = p;
     seat->atMs = at;
-    seat->hopsAway = hopsAway;
+    if (!heldDirect) seat->hopsAway = hopsAway;
+    if (hopsAway == 0) seat->directMs = at;
     seat->via = HEARD_FAST;
     seat->used = true;
   }
@@ -1731,7 +1765,9 @@ struct World {
     tx.pos.refId = c.sched.referenceId();
     tx.pos.refHops = c.sched.hopsToReference();
     tx.pos.refLocked = c.sched.referenceLocked();
-    tx.pos.fitToKeepTime = c.sched.announceFit();
+    tx.pos.fitToKeepTime = c.sched.fitToKeepTime();
+    // The sim's sends never fail, so every beacon it builds is announced.
+    c.sched.announceFit(tx.pos.fitToKeepTime);
     tx.pos.refFit = c.sched.referenceFit();
     c.sentFix = fixNow(c);
     c.lastSendAt = now;
@@ -1868,6 +1904,8 @@ struct World {
           if (!c.on) continue;
           if (c.sched.slot() != c.lastSlot) c.slotChanges++;
           c.lastSlot = c.sched.slot();
+          if (c.sched.parentId() != c.lastParent) c.parentChanges++;
+          c.lastParent = c.sched.parentId();
         }
       }
     }
@@ -1879,6 +1917,7 @@ struct World {
     leasedCollisions = otherCollisions = 0;
     for (Car& c : cars) {
       c.slotChanges = 0;
+      c.parentChanges = 0;
       c.sent = 0;
       c.extrasSent = 0;
     }
@@ -2539,6 +2578,54 @@ void test_sim_a_v3_joining_a_lossy_bench_keeps_its_young_lease() {
   TEST_ASSERT_EQUAL_UINT32(0, w.leasedCollisions);
 }
 
+// Review B7 on the same ride with and without the direct hold. At a 1 Hz phone
+// fix, which is what the phones feed: most sims run 4 Hz, whose extras hide it.
+struct DirectHoldRun {
+  uint32_t parentChanges = 0;
+  uint32_t losses = 0;
+  uint32_t leasedCollisions = 0;
+};
+
+static DirectHoldRun lossyRide(size_t cars, uint8_t lossPct, bool holdDirect, uint32_t fixMs,
+                               uint32_t seed) {
+  World w(cars, seed);
+  w.holdDirect = holdDirect;
+  for (sim::Car& c : w.cars) c.fixEveryMs = fixMs;
+  for (size_t a = 0; a < cars; a++)
+    for (size_t b = a + 1; b < cars; b++) w.setLoss(a, b, lossPct);
+  sim::bootAll(w, 0, cars);
+  w.run(20000);
+  uint32_t before = 0;
+  for (const sim::Car& c : w.cars) before += c.sched.losses();
+  w.mark();
+  w.run(120000);
+  DirectHoldRun r;
+  for (const sim::Car& c : w.cars) {
+    r.parentChanges += c.parentChanges;
+    r.losses += c.sched.losses();
+  }
+  r.losses -= before;
+  r.leasedCollisions = w.leasedCollisions;
+  return r;
+}
+
+void test_sim_a_neighbour_stays_direct_when_its_forward_arrives_first() {
+  for (size_t cars : {3, 10}) {
+    const DirectHoldRun old = lossyRide(cars, 40, false, 1000, 81);
+    const DirectHoldRun held = lossyRide(cars, 40, true, 1000, 81);
+    char line[200];
+    snprintf(line, sizeof(line),
+             "%u cars at 40 %% loss, 1 Hz fix, 2 min: parent changes %u -> %u, leases lost %u -> %u, "
+             "leased collisions %u -> %u",
+             (unsigned)cars, (unsigned)old.parentChanges, (unsigned)held.parentChanges,
+             (unsigned)old.losses, (unsigned)held.losses, (unsigned)old.leasedCollisions,
+             (unsigned)held.leasedCollisions);
+    TEST_MESSAGE(line);
+    TEST_ASSERT_TRUE(held.parentChanges <= old.parentChanges);
+    TEST_ASSERT_TRUE(held.losses <= old.losses + 1);
+  }
+}
+
 void test_sim_a_radio_whose_phone_has_gone_holds_no_slot() {
   // The 48 group ride: the moto left the ride and its phone stopped feeding the
   // radio, which went on claiming a slot on every frame it heard. None of its
@@ -2682,6 +2769,7 @@ int main(int, char**) {
   RUN_TEST(test_an_unheard_lease_says_so);
   RUN_TEST(test_an_outranked_lease_says_so);
   RUN_TEST(test_a_lease_left_alone_says_so);
+  RUN_TEST(test_a_gps_locked_car_keeps_its_beacon_clock_on_the_pulse);
   RUN_TEST(test_a_claim_judged_a_millisecond_before_it_was_made_stands);
   RUN_TEST(test_a_car_with_nothing_to_send_claims_no_slot);
   RUN_TEST(test_a_leased_car_that_goes_quiet_gives_its_slot_up_once);
@@ -2696,6 +2784,7 @@ int main(int, char**) {
   RUN_TEST(test_sim_a_weak_radio_keeps_to_a_free_slot_and_off_the_clock);
   RUN_TEST(test_sim_the_bench_three_radios_with_the_weak_one_lowest);
   RUN_TEST(test_sim_a_v3_joining_a_lossy_bench_keeps_its_young_lease);
+  RUN_TEST(test_sim_a_neighbour_stays_direct_when_its_forward_arrives_first);
   RUN_TEST(test_sim_a_radio_whose_phone_has_gone_holds_no_slot);
   RUN_TEST(test_sim_the_reference_holds_while_link_quality_jitters);
   return UNITY_END();

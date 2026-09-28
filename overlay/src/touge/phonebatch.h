@@ -10,11 +10,13 @@
 //
 // Private port payloads are told apart by their first byte:
 //   '{'  0x7B  JSON (fl, fs, fq, gf, profiles, invites)
-//   'T'  0x54  voice frame (VoicePacket.MAGIC, planned)
+//   'T'  0x54  voice packet (the app's VoicePacket.MAGIC)
 //   0xC1       position batch, radio to phone (this file)
 //   0xC2       phone hello, phone to its own radio (this file)
 //   0xC3       reach summary, radio to radio over LoRa (reach.h)
-// None of the three can start UTF-8 text, so no JSON document collides.
+//   0xC4       test talker command, phone to its own radio (voicetest.h)
+//   0xC5       test voice frame, radio to radio over 2.4 GHz (voicetest.h)
+// None of the binary ones can start UTF-8 text, so no JSON document collides.
 //
 // Platform-free like mesh.h: time comes in as an argument.
 
@@ -26,6 +28,7 @@
 
 namespace touge {
 
+static const uint8_t VOICE_PACKET_MAGIC = 0x54;
 static const uint8_t BATCH_MAGIC = 0xC1;
 // 2 from build 38: records carry the fix identity in place of the frame id.
 static const uint8_t BATCH_VERSION = 2;
@@ -339,6 +342,18 @@ struct LinkStats {
   uint16_t storePending = 0;
   uint32_t oldestQueuedMs = 0;  // oldest position waiting in our store or in flight
   uint32_t minFreeHeap = 0;
+  // Build 50, for the relay and voice work (and read only through the phone,
+  // since a serial capture resets a V3 and stalls a V4).
+  uint32_t forwardsSent = 0;     // forwards this board put on 2.4 GHz
+  uint32_t forwardsRefused = 0;  // forwards dropped for want of a held slot
+  uint32_t leaseRefused = 0;     // lease beacons the radio would not take
+  uint32_t voiceSent = 0;        // our voice frames on the air
+  uint32_t voiceRefused = 0;     // our voice frames the radio would not take
+  uint32_t localDropped = 0;     // phone writes to us that were neither hello nor voice
+  uint32_t sendsDone = 0;        // send callbacks: frames that left
+  uint32_t sendsDoneFailed = 0;  // send callbacks: accepted, then failed
+  uint8_t txRate = 0xFF;         // wifi_phy_rate_t of our last frame out
+  uint16_t rxRate = 0xFFFF;      // sig_mode << 8 | rate of the last frame in
 };
 
 // The counters go to the phone every five seconds as three JSON objects with
@@ -353,9 +368,14 @@ struct LinkStats {
 //   {"fd":{"sf","al","lo","dc","st","cr","cd","ce","ex","wl","wr"}}
 //     drops: store full, alloc, lost, disconnect, stale, core replaced, core
 //     dropped, core evicted, expired; phone writes lost, repeated
+//   {"fr":{"fw","fx","lx","vs","vx","ld","sd","sx","tr","rr"}}
+//     forwards sent, forwards refused, lease beacons refused, voice sent,
+//     voice refused, local writes dropped, sends done, sends failed after
+//     acceptance; the last TX rate and the last RX rate bits (build 50)
 size_t formatLaneStats(const LinkStats& s, char* out, size_t cap);
 size_t formatQueueStats(const LinkStats& s, char* out, size_t cap);
 size_t formatDropStats(const LinkStats& s, char* out, size_t cap);
+size_t formatRadioStats(const LinkStats& s, char* out, size_t cap);
 
 // Why the 2.4 GHz lane is not running, for the report the radio sends every
 // five seconds whether the lane runs or not. A Touge radio always says its

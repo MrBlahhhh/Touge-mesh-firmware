@@ -235,7 +235,20 @@ const uint32_t STATUS_EVERY_MS = 5000;
 //     the schedule never goes back in time. And a radio with no fix fed (the moto's, after its phone left the
 //     ride) claimed a slot on every frame it heard, never beaconed in it, was drowned and claimed again: 53
 //     losses in 6 minutes. It now gives its lease up once, as "quiet", and claims none until it speaks again.
-const uint32_t TOUGE_BUILD = 49;
+// 50: groundwork for voice, still wire-compatible with 49. A neighbour whose direct copy was lost while a
+//     forward got through stays direct for 1.5 s (review B7; host sim at 40 % loss and a 1 Hz fix: parent
+//     changes 77 -> 14 at 3 cars, 1115 -> 113 at 10). Our lease beacon goes before our held forwards, and
+//     a beacon the radio refuses is retried in the slot instead of lost and counted as sent. The V3 gets
+//     ~30 KB of heap back (core-patches/0018: 64 nodes, 16 warm, 64 cache) and a 16-deep receive queue,
+//     32 with PSRAM. A GPS-locked car keeps its beacon clock on the pulse (B6). Only 0x54 goes out as
+//     voice, and a key change never reseeds packet ids below one already sent. New {"fr"} report: forwards
+//     sent and refused, lease and voice refusals, send completions and the radio's real TX/RX rate. A test
+//     talker (touge/voicetest.h) sends voice-sized frames every 60 ms on the phone's command, and every
+//     radio meters them ({"vs"}, {"vt"}) instead of passing them to its phone. It stops when the phone
+//     goes or stops renewing it for 75 s. A 49 radio hands those frames to its phone, so flash every
+//     radio in earshot before running it. Only sent frames enter the dedupe table, and extras and the
+//     fit vote commit only once sent. The V3 keeps sending its NodeInfo to new nodes below 100.
+const uint32_t TOUGE_BUILD = 50;
 
 // How long a board hunts before giving up and waiting at home.
 //
@@ -549,6 +562,7 @@ void TougeFastModule::syncChannel()
 
     // The roster and the dedupe table are keyed to the old ride. Keeping them
     // across a channel change would leave cars from the last ride on the map.
+    const uint32_t lastIdSent = mesh_.lastId();
     mesh_.reset();
     schedule_.reset();
     schedule_.rebuild(nodeDB->getNodeNum(), rideClock.locked((uint64_t)esp_timer_get_time()),
@@ -557,7 +571,11 @@ void TougeFastModule::syncChannel()
     sentOnce_ = false;
     announcedSlot_ = SLOT_NONE;
     nextBeaconMs_ = 0;
-    mesh_.seedIds(idCeiling_ ? idCeiling_ - ID_BLOCK : nodeDB->getNodeNum());
+    // Never back below an id already sent. The saved floor trails the ids used
+    // since the last NVS write, and a ride that returns to an earlier key
+    // without a reboot would reuse their AES-CTR nonces.
+    const uint32_t savedFloor = idCeiling_ ? idCeiling_ - ID_BLOCK : nodeDB->getNodeNum();
+    mesh_.seedIds((int32_t)(lastIdSent - savedFloor) > 0 ? lastIdSent : savedFloor);
 
     // Every ride starts on channel 1, and a lost board goes home there too
     // (FAST_HOME_INDEX).
@@ -631,23 +649,26 @@ bool TougeFastModule::transmit(uint8_t type, const uint8_t *body, size_t len, ui
     size_t n = encodeFrame(f, wire, sizeof(wire));
     if (n == 0) return false;
 
-    // Our own traffic goes in the dedupe table too. Without it a frame we sent
-    // and a neighbour rebroadcast comes back and we forward our own packet.
-    mesh_.firstSight(f.src, f.id, millis());
     saveIdCounter();
     const bool sent = fastRadio.send(wire, n);
-    if (sent) stats_.fast.tx++;
-    return sent;
+    if (!sent) return false;
+    stats_.fast.tx++;
+    // Our own traffic goes in the dedupe table too. Without it a frame we sent
+    // and a neighbour rebroadcast comes back and we forward our own packet.
+    // Only once it is on its way: a refused id would take a seat in a table
+    // sized for real frames, and the lease retry refuses up to 5 a slot.
+    mesh_.firstSight(f.src, f.id, millis());
+    return true;
 }
 
-void TougeFastModule::beacon(uint32_t nowMs)
+bool TougeFastModule::beacon(uint32_t nowMs)
 {
-    if (!started_) return;
+    if (!started_) return false;
 
     // No fix, or none fed for OwnFix::STALE_MS (a board whose phone has gone),
     // means nothing worth sending. The other cars keep the last one they heard
     // and show it as ageing, which is more useful than a zero.
-    if (!ownFix_.fresh(nowMs)) return;
+    if (!ownFix_.fresh(nowMs)) return false;
     const Fix &fix = ownFix_.fix();
 
     // Two separate questions: is there anything worth saying, and is it our
@@ -656,7 +677,7 @@ void TougeFastModule::beacon(uint32_t nowMs)
 
     // Extra beacons use free slots of our row, never the lease slot, so the two
     // never compete for the same tick.
-    if (sendExtraBeacon(nowMs)) return;
+    if (sendExtraBeacon(nowMs)) return false;
 
     if (!wantBeacon_) {
         uint32_t moved = sentOnce_ ? distanceM(sentLat_, sentLon_, fix.lat, fix.lon) : GATE_METRES;
@@ -682,7 +703,7 @@ void TougeFastModule::beacon(uint32_t nowMs)
     // neighbours' slot maps to say nobody hears it and the clash check to give
     // it up.
     if (schedule_.claimed() && schedule_.slot() != announcedSlot_) wantBeacon_ = true;
-    if (!wantBeacon_) return;
+    if (!wantBeacon_) return false;
 
     // Our turn comes round once a cycle, so the wait is bounded by that and
     // the gate above decides everything else.
@@ -699,29 +720,23 @@ void TougeFastModule::beacon(uint32_t nowMs)
     uint32_t phase = 0;
     bool mine;
     if (rideClock.phaseMs((uint64_t)esp_timer_get_time(), CYCLE_MS, phase)) {
+        // Keep the beacon clock on the pulse too (review B6): when PPS goes stale
+        // this car falls back to it, and it may be the ride's reference.
+        schedule_.setPhase(millis(), phase);
         mine = schedule_.inSlotAtPhase(phase);
     } else {
-        mine = schedule_.inSlot(nowMs);
+        // Fresh time, not the pass's: drainRadio can take several ms, and a
+        // slot is 27. inSlot is const, so the schedule's clock still never
+        // goes back (build 49).
+        mine = schedule_.inSlot(millis());
     }
-    if (!mine) return;
-
-    wantBeacon_ = false;
-    lastBeaconMs_ = nowMs;
-    announcedSlot_ = schedule_.slot();
-    if (schedule_.claimed()) leaseBeacons_++;
-    // Move the 1 s deadline on only if it has passed. Advancing it on every
-    // send let each movement-triggered beacon push it a second later, and a
-    // run of them left a car that stopped silent for several seconds.
-    if (nextBeaconMs_ == 0) nextBeaconMs_ = nowMs;
-    nextBeaconMs_ = nextOnGrid(nextBeaconMs_, GATE_IDLE_MS, nowMs);
-    sentLat_ = fix.lat;
-    sentLon_ = fix.lon;
-    sentOnce_ = true;
+    if (!mine) return false;
 
     Position p;
     fillBeacon(p, nowMs);
 
-    if ((uint32_t)(nowMs - lastNameMs_) >= NAME_EVERY_MS) {
+    const bool named = (uint32_t)(nowMs - lastNameMs_) >= NAME_EVERY_MS;
+    if (named) {
         // The long name, because the frame has room for it.
         //
         // This sent short_name, which is four characters, and the receiving
@@ -734,12 +749,34 @@ void TougeFastModule::beacon(uint32_t nowMs)
         strncpy(p.name, owner.long_name[0] ? owner.long_name : owner.short_name,
                 sizeof(p.name) - 1);
         p.name[sizeof(p.name) - 1] = 0;
-        lastNameMs_ = nowMs;
     }
 
     uint8_t body[POSITION_MIN + sizeof(p.name)];
     size_t n = encodePosition(p, body, sizeof(body));
-    if (n > 0) transmit(FRAME_POSITION, body, n, FAST_HOPS);
+    // Only a beacon the radio took counts as sent. A V3 has 8 TX buffers, and a
+    // refusal used to lose the beacon for the second while lease= still counted
+    // it; wantBeacon_ stays set so the next pass inside the slot tries again.
+    if (n == 0 || !transmit(FRAME_POSITION, body, n, FAST_HOPS)) {
+        if (!schedule_.claimed()) return false;
+        stats_.leaseRefused++;
+        return true;
+    }
+
+    wantBeacon_ = false;
+    lastBeaconMs_ = nowMs;
+    announcedSlot_ = schedule_.slot();
+    schedule_.announceFit(p.fitToKeepTime);
+    if (named) lastNameMs_ = nowMs;
+    if (schedule_.claimed()) leaseBeacons_++;
+    // Move the 1 s deadline on only if it has passed. Advancing it on every
+    // send let each movement-triggered beacon push it a second later, and a
+    // run of them left a car that stopped silent for several seconds.
+    if (nextBeaconMs_ == 0) nextBeaconMs_ = nowMs;
+    nextBeaconMs_ = nextOnGrid(nextBeaconMs_, GATE_IDLE_MS, nowMs);
+    sentLat_ = fix.lat;
+    sentLon_ = fix.lon;
+    sentOnce_ = true;
+    return false;
 }
 
 bool TougeFastModule::sendExtraBeacon(uint32_t nowMs)
@@ -757,15 +794,12 @@ bool TougeFastModule::sendExtraBeacon(uint32_t nowMs)
     uint32_t phase = 0;
     bool mine;
     if (rideClock.phaseMs((uint64_t)esp_timer_get_time(), CYCLE_MS, phase)) {
+        schedule_.setPhase(millis(), phase);
         mine = schedule_.inExtraSlotAtPhase(phase);
     } else {
-        mine = schedule_.inExtraSlot(nowMs);
+        mine = schedule_.inExtraSlot(millis());
     }
     if (!mine) return false;
-
-    lastBeaconMs_ = nowMs;
-    sentLat_ = fix.lat;
-    sentLon_ = fix.lon;
 
     Position p;
     fillBeacon(p, nowMs);
@@ -775,7 +809,15 @@ bool TougeFastModule::sendExtraBeacon(uint32_t nowMs)
     // No hops: an extra is for the cars that hear us directly. Forwarding it
     // would multiply the flood by the extra rate; the tail still gets our
     // lease beacon, forwarded, once a second.
-    if (n > 0) transmit(FRAME_POSITION, body, n, 0);
+    // Committed only once the radio took it, so a refused extra is retried in
+    // the slot and the 20 m gate does not measure from a fix nobody got. True
+    // either way: the slot is an extra slot, not the lease's.
+    if (n > 0 && transmit(FRAME_POSITION, body, n, 0)) {
+        lastBeaconMs_ = nowMs;
+        sentLat_ = fix.lat;
+        sentLon_ = fix.lon;
+        schedule_.announceFit(p.fitToKeepTime);
+    }
     return true;
 }
 
@@ -821,7 +863,8 @@ void TougeFastModule::fillBeacon(Position &p, uint32_t nowMs)
     p.refHops = schedule_.hopsToReference();
     p.refLocked = schedule_.referenceLocked();
     // Whether we, and the reference, hear the ride well enough to keep time.
-    p.fitToKeepTime = schedule_.announceFit();
+    // Recorded as announced only when a lease beacon carrying it is sent.
+    p.fitToKeepTime = schedule_.fitToKeepTime();
     p.refFit = schedule_.referenceFit();
 
     uint8_t battery = powerStatus ? (uint8_t)powerStatus->getBatteryChargePercent() : 255;
@@ -1453,6 +1496,7 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
         // replay the header with a payload of their own. Recording that first
         // would let them silence the genuine frame behind it.
         if (bodyLen == 0) continue;
+        if (rx.rate != 0xFFFF) stats_.rxRate = rx.rate;
 
         // Authenticated, so it is genuinely one of ours. That makes it evidence
         // the channel works, which is what the hop decision is measuring.
@@ -1575,7 +1619,19 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
             }
         }
 
-        inject(f, body, bodyLen, rx.rssi);
+        // A test talker's frame is counted here and never reaches the phone; it is
+        // still forwarded below, since relaying it is what the test measures.
+        uint8_t testSession = 0;
+        uint32_t testSeq = 0;
+        uint16_t sentPhase = 0;
+        if (f.type == FRAME_VOICE && decodeTestVoice(body, bodyLen, testSession, testSeq, sentPhase)) {
+            uint32_t phase = 0;
+            const uint16_t heardPhase = schedule_.phaseAt(rx.rxMs, phase) ? (uint16_t)phase : TEST_VOICE_NO_PHASE;
+            const uint8_t hopsAway = f.hops < FAST_HOPS ? (uint8_t)(FAST_HOPS - f.hops) : 0;
+            voiceMeter_.heard(f.src, testSession, testSeq, hopsAway, sentPhase, heardPhase, nowMs);
+        } else {
+            inject(f, body, bodyLen, rx.rssi);
+        }
 
         // Forward for anyone who cannot hear the sender directly. The frame
         // keeps the original sender and id so every copy in flight is the same
@@ -1599,8 +1655,8 @@ void TougeFastModule::drainRadio(uint32_t nowMs)
             // counted, so the suppression below never got a chance to run.
             if (n > 0) {
                 const uint32_t spread = forwardSpreadMs(fastNeighbours(nowMs));
-                mesh_.defer(wire, n, f.src, f.id,
-                            nowMs + forwardDelayMs(rx.rssi, spread, esp_random()));
+                if (!mesh_.defer(wire, n, f.src, f.id, nowMs + forwardDelayMs(rx.rssi, spread, esp_random())))
+                    stats_.forwardsRefused++;
             }
         }
     }
@@ -1715,10 +1771,17 @@ int32_t TougeFastModule::runOnce()
     // belief, so two lost cars that land on the same candidate can find each
     // other with one.
     const bool lost = (uint32_t)(now - lastHeardMs_) >= LOST_MS;
-    if (!lost) sendDeferred(now);
+    // Our beacon before our held forwards: esp_now_send queues in order, and a
+    // beacon behind them left late for its slot, and children sync to it.
+    // A lease beacon the radio refused is retried next pass, 5 ms on; the held
+    // forwards and test voice wait so a freed TX buffer goes to it.
+    const bool beaconRetrying = beacon(now);
+    if (!lost && !beaconRetrying) {
+        sendDeferred(now);
+        sendTestVoice(now);
+    }
     trackPhoneLink(now);
     flushPhoneBatch(now);
-    beacon(now);
     reportSlotLoss();
     mesh_.age(now);
     hopKeeping(now);
@@ -2014,7 +2077,10 @@ void TougeFastModule::sendDeferred(uint32_t nowMs)
     // Bounded for the same reason drainRadio is. Everything left behind comes
     // due again five milliseconds from now.
     for (int budget = 0; budget < 4 && mesh_.nextDue(nowMs, f); budget++) {
-        if (fastRadio.send(f.wire, f.len)) stats_.fast.tx++;
+        if (fastRadio.send(f.wire, f.len)) {
+            stats_.fast.tx++;
+            stats_.forwardsSent++;
+        }
     }
 }
 
@@ -2123,6 +2189,28 @@ ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
         return ProcessMessage::STOP;
     }
 
+    // The test talker switched on or off from the phone. Local only.
+    TestTalkerCommand talker;
+    if (decodeTestTalker(mp.decoded.payload.bytes, mp.decoded.payload.size, talker)) {
+        if (!talker.on) {
+            stopTestTalker("off from the phone");
+            return ProcessMessage::STOP;
+        }
+        if (!testTalker_.on) {
+            // A new session each start, never the last one, so listeners count
+            // this run afresh; seq restarts at 1 under it.
+            testSession_ = (uint8_t)(testSession_ + 1 + esp_random() % 255);
+            testSeq_ = 1;
+            nextTestMs_ = 0;
+        }
+        if (!testTalker_.on || talker.bodyBytes != testTalker_.bodyBytes)
+            LOG_INFO("touge: test talker on, %u byte frames, session %u", (unsigned)talker.bodyBytes,
+                     (unsigned)testSession_);
+        testTalker_ = talker;
+        testTalkerAtMs_ = millis();
+        return ProcessMessage::STOP;
+    }
+
     if (!started_) {
         // Swallowed rather than passed on. Letting it fall through would put
         // speech on LoRa, and 12 kbps of audio would take the mesh down for
@@ -2131,8 +2219,68 @@ ProcessMessage TougeFastModule::handleReceived(const meshtastic_MeshPacket &mp)
         return ProcessMessage::STOP;
     }
 
-    transmit(FRAME_VOICE, mp.decoded.payload.bytes, mp.decoded.payload.size, FAST_HOPS);
+    // Only voice goes on the air as voice. Anything else written to us, such as
+    // a hello this build cannot read, used to go out as FRAME_VOICE with 2 hops.
+    const uint8_t *payload = mp.decoded.payload.bytes;
+    const size_t len = mp.decoded.payload.size;
+    if (len == 0 || payload[0] != VOICE_PACKET_MAGIC) {
+        stats_.localDropped++;
+        return ProcessMessage::STOP;
+    }
+    if (transmit(FRAME_VOICE, payload, len, FAST_HOPS)) stats_.voiceSent++;
+    else stats_.voiceRefused++;
     return ProcessMessage::STOP;
+}
+
+void TougeFastModule::sendTestVoice(uint32_t nowMs)
+{
+    if (!testTalker_.on) return;
+    // Signed: the command can land after this pass read its time.
+    if ((int32_t)(nowMs - testTalkerAtMs_) >= (int32_t)TEST_TALKER_LEASE_MS) {
+        stopTestTalker("not renewed by the phone");
+        return;
+    }
+    if (nextTestMs_ != 0 && (int32_t)(nowMs - nextTestMs_) < 0) return;
+    // A fixed 60 ms grid, as the audio clock runs, however late this pass is.
+    nextTestMs_ = nextOnGrid(nextTestMs_ != 0 ? nextTestMs_ : nowMs, TEST_VOICE_PERIOD_MS, nowMs);
+
+    // The phase at the send, not at the pass start, so the listeners' delay
+    // readings do not include this pass's drain.
+    uint32_t phase = 0;
+    const uint16_t phaseMs = schedule_.phaseAt(millis(), phase) ? (uint16_t)phase : TEST_VOICE_NO_PHASE;
+    const uint8_t bytes = testTalker_.bodyBytes > FRAME_MAX_BODY ? (uint8_t)FRAME_MAX_BODY : testTalker_.bodyBytes;
+    uint8_t body[FRAME_MAX_BODY];
+    const size_t n = encodeTestVoice(testSession_, testSeq_++, phaseMs, bytes, body, sizeof(body));
+    if (n > 0 && transmit(FRAME_VOICE, body, n, FAST_HOPS)) testSent_++;
+    else testRefused_++;
+}
+
+void TougeFastModule::stopTestTalker(const char *why)
+{
+    if (!testTalker_.on) return;
+    testTalker_.on = false;
+    testOffUnreported_ = true;
+    LOG_INFO("touge: test talker off, %s (%lu sent, %lu refused)", why, (unsigned long)testSent_,
+             (unsigned long)testRefused_);
+}
+
+void TougeFastModule::reportVoiceTest(uint32_t nowMs)
+{
+    // Diagnostics give way to positions: on a full queue sendToPhone evicts a
+    // queued position to make room (core-patches/0005), so skip a busy one.
+    if (service->toPhoneQueueUsed() >= MAX_RX_TOPHONE / 2) return;
+    char js[BATCH_MAX_PAYLOAD];
+    // While talking, and once more to say it stopped.
+    if (testTalker_.on || testOffUnreported_) {
+        queueJsonToPhone(js, formatTestTalker(testTalker_.on, testTalker_.bodyBytes, testSent_, testRefused_, js,
+                                              sizeof(js)));
+        testOffUnreported_ = false;
+    }
+    for (size_t i = 0; i < VoiceMeter::TALKERS; i++) {
+        const VoiceMeter::Talker &t = voiceMeter_.talkers()[i];
+        if (t.used && (int32_t)(nowMs - t.heardAtMs) < (int32_t)TEST_VOICE_REPORT_FRESH_MS)
+            queueJsonToPhone(js, formatVoiceMeter(t, nowMs, js, sizeof(js)));
+    }
 }
 
 // ---- Positions to the phone in batches (SCALE-PLAN step 3) ------------------
@@ -2334,6 +2482,8 @@ void TougeFastModule::trackPhoneLink(uint32_t nowMs)
     if (service->api_state == MeshService::STATE_DISCONNECTED) {
         if (helloSeen_) LOG_INFO("touge: phone gone, positions go one packet each until the next hello");
         helloSeen_ = false;
+        // The app states the switch again on its next connection.
+        stopTestTalker("phone gone");
         stats_.dropDisconnect += (uint32_t)phoneStore_.pending();
         phoneStore_.clear();
     }
@@ -2424,6 +2574,9 @@ void TougeFastModule::reportLinkStats(uint32_t nowMs, uint32_t windowMs)
     stats_.preloadRefused = c.offerRefused;
 #endif
     stats_.minFreeHeap = dramHeap().minFreeBytes;
+    stats_.sendsDone = fastRadio.sendsDone();
+    stats_.sendsDoneFailed = fastRadio.sendsDoneFailed();
+    stats_.txRate = fastRadio.lastTxRate();
 
     char line[320];
     if (formatBaseline(stats_, statsAtLastReport_, windowMs, line, sizeof(line)) > 0) {
@@ -2436,6 +2589,8 @@ void TougeFastModule::reportLinkStats(uint32_t nowMs, uint32_t windowMs)
         queueJsonToPhone(js, formatLaneStats(stats_, js, sizeof(js)));
         queueJsonToPhone(js, formatQueueStats(stats_, js, sizeof(js)));
         queueJsonToPhone(js, formatDropStats(stats_, js, sizeof(js)));
+        queueJsonToPhone(js, formatRadioStats(stats_, js, sizeof(js)));
+        reportVoiceTest(nowMs);
     }
     statsAtLastReport_ = stats_;
     // The high-water mark is per report, so a burst shows in the report after it.

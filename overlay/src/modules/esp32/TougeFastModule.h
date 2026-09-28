@@ -47,6 +47,7 @@
 #include "touge/relaypref.h"
 #include "touge/rideclock.h"
 #include "touge/schedule.h"
+#include "touge/voicetest.h"
 
 class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
   public:
@@ -77,7 +78,8 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     void status(uint32_t nowMs);
     // Free internal RAM now, its low-water mark and the largest block, to serial.
     void logHeap();
-    void beacon(uint32_t nowMs);
+    // True if our lease beacon was refused in its slot, to be retried next pass.
+    bool beacon(uint32_t nowMs);
     // A new fix in one of our extra slots (Schedule::extraSlots). True if sent.
     bool sendExtraBeacon(uint32_t nowMs);
     // Everything a beacon carries except the name, lease beacon or extra.
@@ -287,6 +289,21 @@ class TougeFastModule : public SinglePortModule, private concurrency::OSThread {
     touge::BatchesInFlight batchesInFlight_;
     touge::LinkStats stats_;
     touge::LinkStats statsAtLastReport_;
+
+    // Build 50's test talker (touge/voicetest.h): voice-sized frames every 60 ms
+    // on the phone's command, and what this radio heard of anyone's.
+    void sendTestVoice(uint32_t nowMs);
+    void stopTestTalker(const char *why);
+    void reportVoiceTest(uint32_t nowMs);
+    touge::TestTalkerCommand testTalker_;
+    uint32_t testTalkerAtMs_ = 0; // the last command, which renews the lease
+    uint8_t testSession_ = 0;
+    bool testOffUnreported_ = false;
+    uint32_t testSeq_ = 0;
+    uint32_t nextTestMs_ = 0;
+    uint32_t testSent_ = 0;
+    uint32_t testRefused_ = 0;
+    touge::VoiceMeter voiceMeter_;
     touge::PhoneHello hello_;
     bool helloSeen_ = false;
     // Why the lane is down while !started_; reported by reportLaneDown.

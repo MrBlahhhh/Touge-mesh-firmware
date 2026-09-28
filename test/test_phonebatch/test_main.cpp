@@ -840,6 +840,10 @@ static LinkStats maxed() {
   s.dropStoreFull = s.dropAlloc = s.dropLost = s.dropDisconnect = s.dropStale = m;
   s.coreReplaced = s.coreDropped = s.coreEvicted = s.dropExpired = s.writeDropped = s.writeDuplicate = m;
   s.preloadOffered = s.preloadRead = s.preloadRefused = s.minFreeHeap = s.oldestQueuedMs = m;
+  s.forwardsSent = s.forwardsRefused = s.leaseRefused = s.voiceSent = s.voiceRefused = m;
+  s.localDropped = s.sendsDone = s.sendsDoneFailed = m;
+  s.txRate = 0xFF;
+  s.rxRate = 0xFFFF;
   s.queueDepth = s.queueDepthMax = s.storePending = 0xFFFF;
   return s;
 }
@@ -851,6 +855,7 @@ void test_stats_fit_a_payload_at_their_worst() {
   TEST_ASSERT_TRUE(formatLaneStats(s, buf, sizeof(buf)) > 0);
   TEST_ASSERT_TRUE(formatQueueStats(s, buf, sizeof(buf)) > 0);
   TEST_ASSERT_TRUE(formatDropStats(s, buf, sizeof(buf)) > 0);
+  TEST_ASSERT_TRUE(formatRadioStats(s, buf, sizeof(buf)) > 0);
 }
 
 // Named keys, pinned: the app's RadioCounters reads exactly these.
@@ -897,6 +902,20 @@ void test_stats_format_as_the_app_reads_them() {
   TEST_ASSERT_EQUAL_STRING(
       "{\"fd\":{\"sf\":21,\"al\":22,\"lo\":23,\"dc\":24,\"st\":25,\"cr\":26,\"cd\":27,\"ce\":28,\"ex\":29,\"wl\":30,"
       "\"wr\":31}}",
+      buf);
+  s.forwardsSent = 41;
+  s.forwardsRefused = 42;
+  s.leaseRefused = 43;
+  s.voiceSent = 44;
+  s.voiceRefused = 45;
+  s.localDropped = 46;
+  s.sendsDone = 47;
+  s.sendsDoneFailed = 48;
+  s.txRate = 11;
+  s.rxRate = 0x0100 | 11;
+  formatRadioStats(s, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING(
+      "{\"fr\":{\"fw\":41,\"fx\":42,\"lx\":43,\"vs\":44,\"vx\":45,\"ld\":46,\"sd\":47,\"sx\":48,\"tr\":11,\"rr\":267}}",
       buf);
 }
 

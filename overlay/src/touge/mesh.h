@@ -188,7 +188,23 @@ struct Rider {
    */
   uint8_t chan = 0;
   bool used = false;
+  // When a copy straight from this car (hopsAway 0) was last heard on 2.4 GHz.
+  uint32_t directMs = 0;
 };
+
+// How long ago a rider was last heard, wrap-safe. A stamp later than `nowMs`
+// reads as just heard: a caller on an older time than the note, not a car gone
+// quiet. Mesh::note evicts by this, and fastrelay.cpp reads the roster by it.
+inline uint32_t riderAgeMs(const Rider& r, uint32_t nowMs) {
+  const int32_t age = (int32_t)(nowMs - r.atMs);
+  return age > 0 ? (uint32_t)age : 0;
+}
+
+// How long a car heard directly stays direct when only a forwarded copy of its
+// next frame gets through. Its direct copy is lost 35-50 % of the time on the
+// bench, and each loss used to make it a hop away for a second (review B7): not
+// a judge, not a parent, its slot map unread. The schedule's map window.
+static const uint32_t DIRECT_HOLD_MS = 1500;
 
 class Mesh {
  public:

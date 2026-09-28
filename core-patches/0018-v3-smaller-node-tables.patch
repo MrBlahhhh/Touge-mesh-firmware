@@ -1,0 +1,48 @@
+--- a/src/mesh/mesh-pb-constants.h
++++ b/src/mesh/mesh-pb-constants.h
+@@ -102,6 +102,29 @@
+ #endif // STM32WL
+ #endif // MESHTASTIC_EXCLUDE_STATUSDB
+ 
++// Touge (core-patches/0018): the same V3 as 0009. Stock sizes these tables for a 200-node mesh:
++// the hot store (~100 B a node), packet history (2x nodes, 20 B each), the warm store (150 x 40 B)
++// and the traffic cache (500 x 10 B), ~41 KB of internal heap at boot. A ride is at most ~30 cars
++// plus strangers in earshot, so 64 hot nodes (history 128), 16 warm and a 64-entry cache give back
++// ~30 KB, which pays for the fast lane's deeper receive queue. The warm tier stays above 0: at 0
++// the recency sort that picks which nodes survive an over-cap nodes.proto is compiled out.
++// NodeDB::isHalfEmpty keeps stock's 100: at half of 64 a V3 that kept 32 nodes from past rides
++// would stop sending its NodeInfo to new ones. NodeInfoModule's 30 min floor bounds the airtime.
++// The first boot after flashing keeps the old nodes.proto's vector capacity (up to 256 on load), so
++// read the heap line from the second boot on.
++#if defined(CONFIG_IDF_TARGET_ESP32S3) && !defined(BOARD_HAS_PSRAM) && !defined(MESHTASTIC_EXCLUDE_TOUGE_FAST)
++#ifndef MAX_NUM_NODES
++#define MAX_NUM_NODES 64
++#endif
++#define TOUGE_HALF_EMPTY_BELOW 100
++#ifndef WARM_NODE_COUNT
++#define WARM_NODE_COUNT 16
++#endif
++#ifndef TRAFFIC_MANAGEMENT_CACHE_SIZE
++#define TRAFFIC_MANAGEMENT_CACHE_SIZE 64
++#endif
++#endif
++
+ /// Max nodes in the hot store (full NodeInfoLite). Evicted nodes' identities
+ /// live in the warm tier (WARM_NODE_COUNT). nRF52840 caps at 120 to keep
+ /// nodes.proto inside the stock 28 KB LittleFS; flash-rich platforms (ESP32-S3,
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -4233,7 +4233,13 @@
+     // MAX_NUM_NODES is a runtime call on portduino, so read it once. Strictly more than half the
+     // slots must be free, and low heap disqualifies the store just as it does in isFull().
+     const size_t cap = (size_t)MAX_NUM_NODES;
++#ifdef TOUGE_HALF_EMPTY_BELOW
++    // Touge (core-patches/0018): the V3's hot store is 64, half-empty keeps stock's threshold.
++    (void)cap;
++    return ((size_t)numMeshNodes < TOUGE_HALF_EMPTY_BELOW) && (memGet.getFreeHeap() >= MINIMUM_SAFE_FREE_HEAP);
++#else
+     return ((size_t)numMeshNodes * 2 < cap) && (memGet.getFreeHeap() >= MINIMUM_SAFE_FREE_HEAP);
++#endif
+ }
+ 
+ uint32_t NodeDB::hotNodeLastHeard(NodeNum n) const

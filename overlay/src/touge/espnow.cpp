@@ -16,27 +16,30 @@ FastRadio fastRadio;
 
 namespace {
 
-// Eight frames is a little under a second of speech at three 20 ms codec
-// frames per packet. Deeper would only add delay to audio that is already
-// late; shallower drops packets when the module misses a scheduling slot.
-// Frames the WiFi callback can hand over before it starts dropping.
-//
-// Eight was a bench number. A burst from twenty-eight cars fills it in one
-// cycle and dropped climbs while every phone still reports a healthy lane,
-// because a frame refused at the queue was never heard as far as anything
-// above it is concerned.
-// Eight, not thirty-two. Each FastRx carries a full frame, so the queue is
-// RX_DEPTH * ~260 bytes of heap, allocated up front by xQueueCreate. Thirty-two
-// was 8 KB, and on a no-PSRAM V3 that 8 KB is exactly what NimBLE needed and
-// could not get - an unguarded `new` in BLE advertising setup then aborted the
-// device into a boot loop. Eight is ~2 KB and still a quarter-second of frames
-// at the fast-lane rate, which is all the drain loop can fall behind by.
-const int RX_DEPTH = 8;
+// Frames the Wi-Fi callback can hand over before it starts dropping. Each FastRx
+// holds a full frame, so the queue is RX_DEPTH * ~260 bytes of heap, allocated up
+// front by xQueueCreate. 32 (8 KB) on a no-PSRAM V3 once took the heap NimBLE
+// needed, and its unguarded `new` put the board in a boot loop (build 17), so
+// the V3 ran 8. Build 50: 16 on the V3 now that core-patches/0018 frees ~31 KB,
+// 32 with PSRAM. At 25 cars with a talker ~115 frames/s arrive, and 8 covered
+// 70 ms of the 95-140 ms loop stalls a V4 showed.
+#if TOUGE_LEAN_RAM
+const int RX_DEPTH = 16;
+#else
+const int RX_DEPTH = 32;
+#endif
 
 QueueHandle_t rxQueue = nullptr;
 volatile uint32_t dropCount = 0;
 volatile uint32_t sendFailCount = 0;
 volatile int lastSendErr = 0;
+
+// From the send callback, on the Wi-Fi task: counts and the last rate, nothing
+// else. A broadcast has no acknowledgement, so "done" means it left, not that
+// anyone heard it. The rate is what the driver used; nothing here sets one.
+volatile uint32_t txDoneCount = 0;
+volatile uint32_t txDoneFailCount = 0;
+volatile uint8_t txRateSeen = 0xFF;
 
 // Read by the receive callback, which has no handle on the FastRadio.
 volatile uint8_t currentChannel = 0;
@@ -58,10 +61,12 @@ const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 #if ESP_IDF_VERSION_MAJOR >= 5
 void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   int8_t rssi = (info && info->rx_ctrl) ? (int8_t)info->rx_ctrl->rssi : 0;
+  uint16_t rate = (info && info->rx_ctrl) ? (uint16_t)((info->rx_ctrl->sig_mode << 8) | info->rx_ctrl->rate) : 0xFFFF;
 #else
 void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
   (void)mac;
   int8_t rssi = 0;
+  uint16_t rate = 0xFFFF;
 #endif
   if (rxQueue == nullptr || len <= 0 || len > (int)FRAME_MAX) return;
 
@@ -70,11 +75,24 @@ void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
   rx.rssi = rssi;
   rx.rxMs = millis();
   rx.chan = currentChannel;
+  rx.rate = rate;
   memcpy(rx.data, data, (size_t)len);
 
   // This runs on the Wi-Fi task. Blocking here stalls the driver, so a full
   // queue drops the frame and says so rather than waiting for room.
   if (xQueueSend(rxQueue, &rx, 0) != pdTRUE) dropCount++;
+}
+
+// ESP-IDF 5.5 hands the send callback the TX info, with the rate; older 5.x a MAC.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+void onSent(const esp_now_send_info_t* info, esp_now_send_status_t status) {
+  if (info) txRateSeen = (uint8_t)info->rate;
+#else
+void onSent(const uint8_t* mac, esp_now_send_status_t status) {
+  (void)mac;
+#endif
+  if (status == ESP_NOW_SEND_SUCCESS) txDoneCount++;
+  else txDoneFailCount++;
 }
 
 bool startPeer() {
@@ -256,6 +274,8 @@ bool FastRadio::begin(const FastNet& net) {
     esp_now_deinit();
     return false;
   }
+  // Only counts and the rate, so a failure to register costs diagnostics, not the lane.
+  esp_now_register_send_cb(onSent);
   if (!startPeer()) {
     esp_now_deinit();
     return false;
@@ -335,6 +355,12 @@ int8_t FastRadio::txPowerDbm() const {
 uint32_t FastRadio::sendFailed() const { return sendFailCount; }
 
 int FastRadio::lastSendError() const { return lastSendErr; }
+
+uint32_t FastRadio::sendsDone() const { return txDoneCount; }
+
+uint32_t FastRadio::sendsDoneFailed() const { return txDoneFailCount; }
+
+uint8_t FastRadio::lastTxRate() const { return txRateSeen; }
 
 int FastRadio::beginError() const { return (int)initErr; }
 
